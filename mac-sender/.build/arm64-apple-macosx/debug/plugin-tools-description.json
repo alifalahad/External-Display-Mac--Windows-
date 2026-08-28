@@ -1,0 +1,308 @@
+{
+  "builtTestProducts" : [
+
+  ],
+  "copyCommands" : {
+
+  },
+  "explicitTargetDependencyImportCheckingMode" : {
+    "none" : {
+
+    }
+  },
+  "generatedSourceTargetSet" : [
+
+  ],
+  "pluginDescriptions" : [
+
+  ],
+  "swiftCommands" : {
+    "C.ExternalDisplay-arm64-apple-macosx-debug.module" : {
+      "executable" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "fileList" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources",
+      "importPath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules",
+      "inputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources"
+        }
+      ],
+      "isLibrary" : false,
+      "moduleName" : "ExternalDisplay",
+      "moduleOutputPath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule",
+      "objects" : [
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o"
+      ],
+      "otherArguments" : [
+        "-target",
+        "arm64-apple-macosx13.0",
+        "-incremental",
+        "-enable-batch-mode",
+        "-serialize-diagnostics",
+        "-index-store-path",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/index/store",
+        "-Onone",
+        "-enable-testing",
+        "-j8",
+        "-DSWIFT_PACKAGE",
+        "-DDEBUG",
+        "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+        "-module-cache-path",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ModuleCache",
+        "-parseable-output",
+        "-Xfrontend",
+        "-entry-point-function-name",
+        "-Xfrontend",
+        "ExternalDisplay_main",
+        "-swift-version",
+        "5",
+        "-plugin-path",
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+        "-sdk",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-F",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-I",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-L",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+        "-g",
+        "-Xcc",
+        "-isysroot",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        "-Xcc",
+        "-F",
+        "-Xcc",
+        "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+        "-Xcc",
+        "-fPIC",
+        "-Xcc",
+        "-g",
+        "-package-name",
+        "mac_sender"
+      ],
+      "outputFileMapPath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/output-file-map.json",
+      "outputs" : [
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule"
+        }
+      ],
+      "prepareForIndexing" : false,
+      "sources" : [
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift",
+        "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift"
+      ],
+      "tempsPath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build",
+      "wholeModuleOptimization" : false
+    }
+  },
+  "swiftFrontendCommands" : {
+
+  },
+  "swiftTargetScanArgs" : {
+    "ExternalDisplay" : [
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc",
+      "-module-name",
+      "ExternalDisplay",
+      "-package-name",
+      "mac_sender",
+      "-c",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift",
+      "-I",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules",
+      "-target",
+      "arm64-apple-macosx13.0",
+      "-incremental",
+      "-enable-batch-mode",
+      "-serialize-diagnostics",
+      "-index-store-path",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/index/store",
+      "-Onone",
+      "-enable-testing",
+      "-j8",
+      "-DSWIFT_PACKAGE",
+      "-DDEBUG",
+      "-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE",
+      "-module-cache-path",
+      "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ModuleCache",
+      "-parseable-output",
+      "-Xfrontend",
+      "-entry-point-function-name",
+      "-Xfrontend",
+      "ExternalDisplay_main",
+      "-swift-version",
+      "5",
+      "-plugin-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing",
+      "-sdk",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-F",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-I",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-L",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib",
+      "-g",
+      "-Xcc",
+      "-isysroot",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+      "-Xcc",
+      "-F",
+      "-Xcc",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks",
+      "-Xcc",
+      "-fPIC",
+      "-Xcc",
+      "-g",
+      "-package-name",
+      "mac_sender",
+      "-driver-use-frontend-path",
+      "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    ]
+  },
+  "targetDependencyMap" : {
+    "ExternalDisplay" : [
+
+    ]
+  },
+  "testDiscoveryCommands" : {
+
+  },
+  "testEntryPointCommands" : {
+
+  },
+  "traitConfiguration" : {
+    "default" : {
+
+    }
+  },
+  "writeCommands" : {
+    "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<entitlement-plist>"
+        },
+        {
+          "kind" : "virtual",
+          "name" : "<com.apple.security.get-task-allow>"
+        }
+      ],
+      "outputFilePath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist"
+    },
+    "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<sources-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift"
+        }
+      ],
+      "outputFilePath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources"
+    },
+    "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList" : {
+      "alwaysOutOfDate" : false,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<link-file-list>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o"
+        }
+      ],
+      "outputFilePath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList"
+    },
+    "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt" : {
+      "alwaysOutOfDate" : true,
+      "inputs" : [
+        {
+          "kind" : "virtual",
+          "name" : "<swift-get-version>"
+        },
+        {
+          "kind" : "file",
+          "name" : "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        }
+      ],
+      "outputFilePath" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+    }
+  }
+}

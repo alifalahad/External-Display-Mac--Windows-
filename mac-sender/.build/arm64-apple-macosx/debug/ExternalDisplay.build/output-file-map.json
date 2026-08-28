@@ -1,0 +1,33 @@
+{
+  "": {
+    "swift-dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/primary.swiftdeps"
+  },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift": {
+    "dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.d",
+    "object": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o",
+    "swiftmodule": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine~partial.swiftmodule",
+    "swift-dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swiftdeps",
+    "diagnostics": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.dia"
+  },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift": {
+    "dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.d",
+    "object": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o",
+    "swiftmodule": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView~partial.swiftmodule",
+    "swift-dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swiftdeps",
+    "diagnostics": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.dia"
+  },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift": {
+    "dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.d",
+    "object": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o",
+    "swiftmodule": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp~partial.swiftmodule",
+    "swift-dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swiftdeps",
+    "diagnostics": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.dia"
+  },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift": {
+    "dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.d",
+    "object": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o",
+    "swiftmodule": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats~partial.swiftmodule",
+    "swift-dependencies": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swiftdeps",
+    "diagnostics": "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.dia"
+  }
+}

@@ -1,0 +1,81 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "ExternalDisplay-arm64-apple-macosx-debug.exe": ["<ExternalDisplay-arm64-apple-macosx-debug.exe>"]
+  "ExternalDisplay-arm64-apple-macosx-debug.module": ["<ExternalDisplay-arm64-apple-macosx-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<ExternalDisplay-arm64-apple-macosx-debug.exe>","<ExternalDisplay-arm64-apple-macosx-debug.module>"]
+  "test": ["<ExternalDisplay-arm64-apple-macosx-debug.exe>","<ExternalDisplay-arm64-apple-macosx-debug.module>"]
+default: "main"
+nodes:
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay":
+    is-mutated: true
+commands:
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist":
+    tool: write-auxiliary-file
+    inputs: ["<entitlement-plist>","<com.apple.security.get-task-allow>"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist"]
+    description: "Write auxiliary file /Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist"
+
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources"]
+    description: "Write auxiliary file /Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources"
+
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList"
+
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<ExternalDisplay-arm64-apple-macosx-debug.exe>":
+    tool: phony
+    inputs: ["<ExternalDisplay-arm64-apple-macosx-debug.exe-CodeSigning>"]
+    outputs: ["<ExternalDisplay-arm64-apple-macosx-debug.exe>"]
+
+  "<ExternalDisplay-arm64-apple-macosx-debug.module>":
+    tool: phony
+    inputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule"]
+    outputs: ["<ExternalDisplay-arm64-apple-macosx-debug.module>"]
+
+  "C.ExternalDisplay-arm64-apple-macosx-debug.exe":
+    tool: shell
+    inputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay"]
+    description: "Linking ./.build/arm64-apple-macosx/debug/ExternalDisplay"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug","-o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay","-module-name","ExternalDisplay","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-alias","-Xlinker","_ExternalDisplay_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.product/Objects.LinkFileList","-Xlinker","-rpath","-Xlinker","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx","-target","arm64-apple-macosx13.0","-Xlinker","-add_ast_path","-Xlinker","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "C.ExternalDisplay-arm64-apple-macosx-debug.exe-entitlements":
+    tool: shell
+    inputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist"]
+    outputs: ["<ExternalDisplay-arm64-apple-macosx-debug.exe-CodeSigning>"]
+    description: "Applying debug entitlements to ./.build/arm64-apple-macosx/debug/ExternalDisplay"
+    args: ["codesign","--force","--sign","-","--entitlements","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay-entitlement.plist","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay"]
+
+  "C.ExternalDisplay-arm64-apple-macosx-debug.module":
+    tool: shell
+    inputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources"]
+    outputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ScreenCaptureEngine.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ContentView.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/ExternalDisplayApp.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/CaptureStats.swift.o","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule"]
+    description: "Compiling Swift Module 'ExternalDisplay' (4 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","ExternalDisplay","-emit-dependencies","-emit-module","-emit-module-path","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules/ExternalDisplay.swiftmodule","-output-file-map","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/output-file-map.json","-incremental","-c","@/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ExternalDisplay.build/sources","-I","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx13.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j8","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","ExternalDisplay_main","-swift-version","5","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","mac_sender"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/Package.swift","/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+
