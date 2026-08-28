@@ -53,8 +53,15 @@ struct ContentView: View {
 
             Spacer()
 
-            // Display picker
-            if !engine.availableDisplays.isEmpty {
+            // Display picker — always shown, disabled while loading or capturing
+            if engine.availableDisplays.isEmpty {
+                Text(engine.errorMessage != nil ? "No permission" : "Loading displays…")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+            } else {
                 Picker("Display:", selection: $engine.selectedDisplayIndex) {
                     ForEach(
                         Array(engine.availableDisplays.enumerated()),
@@ -80,7 +87,7 @@ struct ContentView: View {
             Divider()
                 .frame(height: 20)
 
-            // Start / Stop
+            // Start / Stop — disabled when no displays found
             Button {
                 Task {
                     if engine.isCapturing {
@@ -97,6 +104,7 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(engine.isCapturing ? .red : .accentColor)
+            .disabled(!engine.isCapturing && engine.availableDisplays.isEmpty)
         }
     }
 
@@ -113,24 +121,47 @@ struct ContentView: View {
                         height: geometry.size.height
                     )
             } else {
-                // Placeholder
                 Color(nsColor: .windowBackgroundColor)
                     .overlay {
-                        VStack(spacing: 12) {
-                            Image(systemName: "display.trianglebadge.exclamationmark")
-                                .font(.system(size: 48))
-                                .foregroundStyle(.tertiary)
+                        VStack(spacing: 16) {
+                            if engine.availableDisplays.isEmpty && engine.errorMessage != nil {
+                                // Permission denied state
+                                Image(systemName: "lock.shield")
+                                    .font(.system(size: 48))
+                                    .foregroundStyle(.orange)
 
-                            if let error = engine.errorMessage {
-                                Text(error)
-                                    .font(.caption)
-                                    .foregroundStyle(.red)
+                                Text("Screen Recording Permission Required")
+                                    .font(.headline)
+
+                                Text("Open System Settings → Privacy & Security → Screen Recording\nand enable access for this app, then click ↺ Refresh.")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
                                     .multilineTextAlignment(.center)
-                                    .frame(maxWidth: 400)
+                                    .frame(maxWidth: 420)
+
+                                Button("Open Privacy Settings") {
+                                    NSWorkspace.shared.open(
+                                        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
+                                    )
+                                }
+                                .buttonStyle(.borderedProminent)
+
+                            } else if engine.availableDisplays.isEmpty {
+                                Image(systemName: "display")
+                                    .font(.system(size: 48))
+                                    .foregroundStyle(.tertiary)
+                                Text("Looking for displays…")
+                                    .foregroundStyle(.secondary)
+
                             } else if engine.isCapturing {
+                                ProgressView()
                                 Text("Waiting for frames…")
                                     .foregroundStyle(.secondary)
+
                             } else {
+                                Image(systemName: "display.trianglebadge.exclamationmark")
+                                    .font(.system(size: 48))
+                                    .foregroundStyle(.tertiary)
                                 Text("Select a display and press Start Capture")
                                     .foregroundStyle(.secondary)
                             }
@@ -143,30 +174,53 @@ struct ContentView: View {
     // ── Stats Bar ───────────────────────────────────────────────────────────
 
     private var statsBar: some View {
-        HStack(spacing: 20) {
-            if engine.isCapturing {
-                // Capture indicator
-                Circle()
-                    .fill(.red)
-                    .frame(width: 8, height: 8)
+        VStack(spacing: 4) {
+            // Row 1: Capture stats
+            HStack(spacing: 16) {
+                if engine.isCapturing {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 8, height: 8)
 
-                statItem("FPS", String(format: "%.1f", engine.stats.fps))
-                statItem("Frame", String(format: "%.2f ms", engine.stats.avgFrameTimeMs))
-                statItem("Min/Max",
-                    String(format: "%.1f / %.1f ms",
-                           engine.stats.minFrameTimeMs,
-                           engine.stats.maxFrameTimeMs))
-                statItem("Resolution",
-                    "\(Int(engine.stats.resolution.width))×\(Int(engine.stats.resolution.height))")
-                statItem("Frames", "\(engine.stats.totalFrames)")
-                statItem("Uptime", String(format: "%.1fs", engine.stats.uptime))
-            } else {
-                Text("Idle")
-                    .foregroundStyle(.secondary)
-                    .font(.system(.body, design: .monospaced))
+                    statItem("FPS", String(format: "%.1f", engine.stats.fps))
+                    statItem("Frame", String(format: "%.2f ms", engine.stats.avgFrameTimeMs))
+                    statItem("Min/Max",
+                        String(format: "%.1f / %.1f ms",
+                               engine.stats.minFrameTimeMs,
+                               engine.stats.maxFrameTimeMs))
+                    statItem("Resolution",
+                        "\(Int(engine.stats.resolution.width))×\(Int(engine.stats.resolution.height))")
+                    statItem("Frames", "\(engine.stats.totalFrames)")
+                    statItem("Uptime", String(format: "%.1fs", engine.stats.uptime))
+                } else {
+                    Text("Idle")
+                        .foregroundStyle(.secondary)
+                        .font(.system(.caption, design: .monospaced))
+                }
+                Spacer()
             }
 
-            Spacer()
+            // Row 2: Encoder stats (when encoding)
+            if engine.isEncoding {
+                HStack(spacing: 16) {
+                    Image(systemName: "cpu")
+                        .foregroundStyle(engine.encoderStats.isHardwareAccelerated ? .green : .orange)
+                        .font(.caption)
+
+                    statItem("H.264",
+                        engine.encoderStats.isHardwareAccelerated ? "HW" : "SW")
+                    statItem("Enc Latency",
+                        String(format: "%.1f ms", engine.encoderStats.avgEncodingLatencyMs))
+                    statItem("Bitrate",
+                        String(format: "%.1f Mbps", engine.encoderStats.outputBitrateMbps))
+                    statItem("Encoded", "\(engine.encoderStats.encodedFrames)")
+                    statItem("Keyframes", "\(engine.encoderStats.keyframes)")
+                    statItem("Data",
+                        formatBytes(engine.encoderStats.encodedBytes))
+
+                    Spacer()
+                }
+            }
         }
     }
 
@@ -178,5 +232,11 @@ struct ContentView: View {
             Text(value)
                 .font(.system(.caption, design: .monospaced))
         }
+    }
+
+    private func formatBytes(_ bytes: UInt64) -> String {
+        if bytes < 1024 { return "\(bytes) B" }
+        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
+        return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
     }
 }

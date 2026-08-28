@@ -1,22 +1,22 @@
 // =============================================================================
-// ScreenCaptureEngine.swift — ScreenCaptureKit capture engine
+// ScreenCaptureEngine.swift — ScreenCaptureKit capture engine + H.264 encoder
 // =============================================================================
-// Wraps ScreenCaptureKit to capture a selected display at up to 60 FPS.
-// Produces CVPixelBuffer frames (GPU-backed via IOSurface) and converts
-// them to CGImage for local preview. Stats are tracked per-frame.
+// Captures a selected display at up to 60 FPS via ScreenCaptureKit, then
+// feeds CVPixelBuffer frames to:
+//   1. VideoToolbox H.264 hardware encoder (GPU→GPU, all frames)
+//   2. CIContext → CGImage preview (every 2nd frame, for UI)
 //
 // Key design decisions:
-// - CVPixelBuffer stays GPU-resident (IOSurface-backed) from ScreenCaptureKit
-// - CIContext.createCGImage is used for preview (involves GPU→CPU copy,
-//   acceptable for Phase 2; will be replaced by Metal in later phases)
-// - Frame processing runs on a dedicated high-priority queue
-// - UI updates dispatched to main thread
+// - CVPixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally
+// - Preview is throttled to ~30 FPS to reduce CPU load
+// - Encoder runs at full capture rate for smooth output
 // =============================================================================
 
 import Foundation
 import ScreenCaptureKit
 import CoreMedia
 import CoreImage
+import VideoToolbox
 import Combine
 
 final class ScreenCaptureEngine: NSObject, ObservableObject {
@@ -25,7 +25,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     @Published var capturedFrame: CGImage?
     @Published var stats = CaptureStats()
+    @Published var encoderStats = EncoderStats()
     @Published var isCapturing = false
+    @Published var isEncoding = false
     @Published var availableDisplays: [SCDisplay] = []
     @Published var selectedDisplayIndex: Int = 0
     @Published var errorMessage: String?
@@ -33,6 +35,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     // ── Internals ───────────────────────────────────────────────────────────
 
     private var stream: SCStream?
+    private var encoder: VideoEncoder?
+    private var frameCounter: UInt64 = 0
 
     /// Dedicated queue for frame processing — high priority, serial
     private let captureQueue = DispatchQueue(
@@ -48,10 +52,51 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     private let statsTracker = CaptureStatsTracker()
 
+    // ── Encoder Control ─────────────────────────────────────────────────────
+
+    /// Start the H.264 encoder with the given resolution
+    func startEncoder(width: Int, height: Int) {
+        stopEncoder()
+        do {
+            var config = EncoderConfig()
+            config.width = Int32(width)
+            config.height = Int32(height)
+            let enc = try VideoEncoder(config: config)
+
+            enc.onEncodedFrame = { [weak self] sampleBuffer, isKeyframe, latencyMs in
+                // Phase 3: just track stats. Phase 4+ will send over network.
+                _ = sampleBuffer
+                _ = isKeyframe
+            }
+
+            encoder = enc
+            DispatchQueue.main.async { [weak self] in
+                self?.isEncoding = true
+            }
+            print("[Engine] Encoder started")
+        } catch {
+            DispatchQueue.main.async { [weak self] in
+                self?.errorMessage = "Encoder error: \(error.localizedDescription)"
+            }
+            print("[Engine] Encoder error: \(error)")
+        }
+    }
+
+    /// Stop the H.264 encoder
+    func stopEncoder() {
+        encoder?.stop()
+        encoder = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.isEncoding = false
+            self?.encoderStats = EncoderStats()
+        }
+    }
+
     // ── Display Discovery ───────────────────────────────────────────────────
 
     /// Fetch available displays from ScreenCaptureKit.
     /// On first call, this triggers the screen recording permission prompt.
+    /// Auto-retries every 2 seconds if permission is not yet granted.
     func refreshDisplays() async {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(
@@ -66,14 +111,19 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
         } catch {
             await MainActor.run {
-                self.errorMessage = """
-                    Screen recording permission required.
-                    Go to System Settings → Privacy & Security → Screen Recording
-                    and grant access to this app (or Xcode/Terminal).
-                    
-                    Error: \(error.localizedDescription)
-                    """
+                // Keep availableDisplays empty so UI shows permission state
+                self.availableDisplays = []
+                // Store the error but simplify the message — full detail in logs
+                self.errorMessage = "Permission denied"
             }
+            print("[Capture] Permission error: \(error.localizedDescription)")
+
+            // Auto-retry after 2s so user doesn't need to click Refresh
+            // manually after granting permission in System Settings
+            guard !isCapturing else { return }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !isCapturing else { return }
+            await refreshDisplays()
         }
     }
 
@@ -137,11 +187,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
             self.stream = stream
             statsTracker.reset()
+            frameCounter = 0
 
             await MainActor.run {
                 self.isCapturing = true
                 self.errorMessage = nil
             }
+
+            // Auto-start encoder with capture resolution
+            startEncoder(width: display.width, height: display.height)
 
             print("[Capture] Started: \(display.width)×\(display.height) @ 60 FPS")
 
@@ -159,6 +213,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     func stopCapture() {
         guard let stream = stream else { return }
         self.stream = nil
+
+        // Stop encoder first
+        stopEncoder()
 
         Task {
             do {
@@ -224,26 +281,35 @@ extension ScreenCaptureEngine: SCStreamOutput {
         // ── Record timing ───────────────────────────────────────────────────
         let captureTime = CACurrentMediaTime()
         statsTracker.recordFrame(time: captureTime, width: width, height: height)
+        frameCounter += 1
 
-        // ── Preserve timestamp ──────────────────────────────────────────────
-        // The presentation timestamp from ScreenCaptureKit — will be used in
-        // Phase 3+ for encoder synchronization
-        let _ = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // ── Feed ALL frames to encoder (GPU→GPU, fast) ──────────────────────
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let duration = CMTime(value: 1, timescale: 60)
+        encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts, duration: duration)
 
-        // ── Convert to CGImage for preview ──────────────────────────────────
-        // GPU → CPU path via CIContext. Acceptable for Phase 2 local preview.
-        // In Phase 3+, the CVPixelBuffer will go directly to VideoToolbox
-        // encoder without this conversion.
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            return
-        }
-
-        // ── Update UI ───────────────────────────────────────────────────────
+        // ── Throttled preview (every 2nd frame = ~30 FPS) ───────────────────
+        // CGImage conversion is expensive (GPU→CPU). Encoder gets all frames;
+        // preview can afford to skip some for better overall performance.
         let currentStats = statsTracker.currentStats()
-        DispatchQueue.main.async { [weak self] in
-            self?.capturedFrame = cgImage
-            self?.stats = currentStats
+        let encStats = encoder?.currentStats()
+
+        if frameCounter % 2 == 0 {
+            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.capturedFrame = cgImage
+                self?.stats = currentStats
+                if let encStats { self?.encoderStats = encStats }
+            }
+        } else {
+            // Still update stats on non-preview frames
+            DispatchQueue.main.async { [weak self] in
+                self?.stats = currentStats
+                if let encStats { self?.encoderStats = encStats }
+            }
         }
     }
 }

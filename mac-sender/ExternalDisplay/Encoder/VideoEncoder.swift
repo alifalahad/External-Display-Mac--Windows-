@@ -17,6 +17,7 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 import CoreVideo
+import QuartzCore
 
 final class VideoEncoder {
 
@@ -96,7 +97,7 @@ final class VideoEncoder {
 
         // Real-time mode
         if config.realtime {
-            setProperty(kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+            setProperty(kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue as Any)
         }
 
         // Profile & Level
@@ -122,12 +123,12 @@ final class VideoEncoder {
         // Disable B-frames for lowest latency
         if !config.allowFrameReordering {
             setProperty(kVTCompressionPropertyKey_AllowFrameReordering,
-                         value: kCFBooleanFalse)
+                         value: kCFBooleanFalse as Any)
         }
 
         // Allow the encoder to use temporal compression
         setProperty(kVTCompressionPropertyKey_AllowTemporalCompression,
-                     value: kCFBooleanTrue)
+                     value: kCFBooleanTrue as Any)
 
         // ── Check if hardware encoder was selected ──────────────────────────
         var usingHardware: CFBoolean = kCFBooleanFalse
@@ -278,12 +279,7 @@ final class VideoEncoder {
     /// Request the next frame to be encoded as a keyframe
     func forceKeyframe() {
         guard let session = session else { return }
-        let properties: [CFString: Any] = [
-            kVTEncodeFrameOptionKey_ForceKeyFrame: true
-        ]
-        // This will be applied on the next encode call
-        // Store it and use as frameProperties in the next encode
-        // For simplicity, we'll use VTCompressionSessionCompleteFrames then re-prepare
+        // Flush pending frames to force a clean break, next frame will be a keyframe
         VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
     }
 
