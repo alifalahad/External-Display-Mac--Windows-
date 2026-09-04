@@ -330,6 +330,8 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     context_->RSSetViewports(1, &viewport);
 
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->IASetInputLayout(nullptr);  // No input layout needed
     if (hasVideoFrame_ && videoSRV_) {
         // Render decoded video frame
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);

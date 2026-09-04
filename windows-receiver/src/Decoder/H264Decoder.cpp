@@ -6,6 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <mfobjects.h>  // IMF2DBuffer
 
 // Helper to safely release COM objects
 template<typename T>
@@ -276,21 +277,53 @@ bool H264Decoder::processOutput() {
     }
 
     // Extract NV12 data and convert to BGRA
+    // Try IMF2DBuffer first to get the real stride, fallback to contiguous
     IMFMediaBuffer* resultBuffer = nullptr;
     hr = resultSample->ConvertToContiguousBuffer(&resultBuffer);
     if (SUCCEEDED(hr)) {
-        BYTE* nv12Data = nullptr;
-        DWORD nv12Len = 0;
-        hr = resultBuffer->Lock(&nv12Data, nullptr, &nv12Len);
-        if (SUCCEEDED(hr)) {
-            // NV12 stride is typically width aligned to 16/32 bytes
-            int stride = ((int)m_width + 15) & ~15;  // Align to 16
+        // Try to get 2D buffer for proper stride info
+        IMF2DBuffer* buffer2D = nullptr;
+        HRESULT hr2D = resultBuffer->QueryInterface(IID_PPV_ARGS(&buffer2D));
 
-            convertNV12toBGRA(nv12Data, stride,
+        BYTE* nv12Data = nullptr;
+        LONG nv12Stride = 0;
+        bool locked2D = false;
+
+        if (SUCCEEDED(hr2D) && buffer2D) {
+            hr = buffer2D->Lock2D(&nv12Data, &nv12Stride);
+            if (SUCCEEDED(hr)) {
+                locked2D = true;
+            }
+            buffer2D->Release();
+        }
+
+        if (!locked2D) {
+            // Fallback: use 1D lock with guessed stride
+            DWORD nv12Len = 0;
+            hr = resultBuffer->Lock(&nv12Data, nullptr, &nv12Len);
+            // MF typically aligns stride to 128 bytes for NV12
+            nv12Stride = ((LONG)m_width + 127) & ~127;
+            // Verify: if the buffer is too small for that stride, try 16-align
+            if (nv12Len < (DWORD)(nv12Stride * m_height * 3 / 2)) {
+                nv12Stride = ((LONG)m_width + 15) & ~15;
+            }
+        }
+
+        if (nv12Data && nv12Stride > 0) {
+            // Use even height for NV12 (UV plane is half-height)
+            int evenHeight = (m_height + 1) & ~1;
+
+            convertNV12toBGRA(nv12Data, nv12Stride,
                               m_bgraBuffer.data(), m_width * 4,
                               m_width, m_height);
 
-            resultBuffer->Unlock();
+            if (locked2D) {
+                IMF2DBuffer* buf2D = nullptr;
+                resultBuffer->QueryInterface(IID_PPV_ARGS(&buf2D));
+                if (buf2D) { buf2D->Unlock2D(); buf2D->Release(); }
+            } else {
+                resultBuffer->Unlock();
+            }
 
             // Deliver decoded frame
             if (m_callback) {
@@ -315,11 +348,13 @@ void H264Decoder::convertNV12toBGRA(const uint8_t* nv12, int nv12Stride,
                                      uint8_t* bgra, int bgraStride,
                                      int width, int height) {
     // NV12 layout:
-    //   Y plane:  height lines, each nv12Stride bytes
+    //   Y plane:  height lines (rounded up to even), each nv12Stride bytes
     //   UV plane: height/2 lines, each nv12Stride bytes (U,V interleaved)
 
     const uint8_t* yPlane = nv12;
-    const uint8_t* uvPlane = nv12 + nv12Stride * height;
+    // UV plane starts after Y plane — MF rounds height up to even for NV12
+    int evenHeight = (height + 1) & ~1;
+    const uint8_t* uvPlane = nv12 + nv12Stride * evenHeight;
 
     for (int y = 0; y < height; y++) {
         const uint8_t* yRow = yPlane + y * nv12Stride;
