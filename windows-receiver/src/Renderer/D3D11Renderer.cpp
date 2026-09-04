@@ -323,16 +323,34 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     // ── 2. Set up pipeline ──────────────────────────────────────────────────
     context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
 
+    // Clear to black (for letterbox/pillarbox bars)
+    float black[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    context_->ClearRenderTargetView(rtv_.Get(), black);
+
     D3D11_VIEWPORT viewport = {};
-    viewport.Width    = static_cast<float>(width_);
-    viewport.Height   = static_cast<float>(height_);
     viewport.MaxDepth = 1.0f;
-    context_->RSSetViewports(1, &viewport);
 
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context_->IASetInputLayout(nullptr);  // No input layout needed
+    context_->IASetInputLayout(nullptr);
     if (hasVideoFrame_ && ySRV_ && uvSRV_) {
+        // Calculate letterboxed viewport to maintain video aspect ratio
+        float videoAspect  = (float)nv12Width_ / (float)nv12Height_;
+        float windowAspect = (float)width_ / (float)height_;
+
+        if (windowAspect > videoAspect) {
+            // Window wider than video → pillarbox (black bars on sides)
+            viewport.Height = (float)height_;
+            viewport.Width  = (float)height_ * videoAspect;
+            viewport.TopLeftX = ((float)width_ - viewport.Width) / 2.0f;
+        } else {
+            // Window taller than video → letterbox (black bars top/bottom)
+            viewport.Width  = (float)width_;
+            viewport.Height = (float)width_ / videoAspect;
+            viewport.TopLeftY = ((float)height_ - viewport.Height) / 2.0f;
+        }
+        context_->RSSetViewports(1, &viewport);
+
         // Render NV12 video frame via GPU YUV→RGB shader
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
         context_->PSSetShader(nv12PixelShader_.Get(), nullptr, 0);
@@ -345,7 +363,11 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
         ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
         context_->PSSetShaderResources(0, 2, nullSRVs);
     } else {
-        // Render test pattern
+        // Render test pattern (full window)
+        viewport.Width  = (float)width_;
+        viewport.Height = (float)height_;
+        context_->RSSetViewports(1, &viewport);
+
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
         context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
         context_->PSSetConstantBuffers(0, 1, constantBuffer_.GetAddressOf());
@@ -594,8 +616,9 @@ void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
         width, evenHeight, width/2, evenHeight/2);
 }
 
-void D3D11Renderer::UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
-                                     uint32_t frameWidth, uint32_t frameHeight) {
+void D3D11Renderer::UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
+                                     int nv12Stride, uint32_t frameWidth,
+                                     uint32_t frameHeight) {
     EnsureNV12Textures(frameWidth, frameHeight);
     if (!yTexture_ || !uvTexture_) return;
 
@@ -608,15 +631,14 @@ void D3D11Renderer::UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
         for (uint32_t row = 0; row < frameHeight; row++) {
             memcpy(
                 static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
-                nv12Data + row * nv12Stride,
+                yData + row * nv12Stride,
                 frameWidth
             );
         }
         context_->Unmap(yTexture_.Get(), 0);
     }
 
-    // Upload UV plane (starts after Y plane in NV12 layout)
-    const uint8_t* uvData = nv12Data + nv12Stride * evenHeight;
+    // Upload UV plane (pointer provided directly by decoder — no offset guessing)
     hr = context_->Map(uvTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
         uint32_t uvHeight = evenHeight / 2;
@@ -624,7 +646,7 @@ void D3D11Renderer::UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
             memcpy(
                 static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
                 uvData + row * nv12Stride,
-                frameWidth  // UV row is same width in bytes (U0V0 U1V1 ...)
+                frameWidth  // UV row = width bytes (U0V0 U1V1 ...)
             );
         }
         context_->Unmap(uvTexture_.Get(), 0);

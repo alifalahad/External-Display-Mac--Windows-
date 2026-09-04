@@ -30,9 +30,9 @@ public:
     // Get GPU adapter name
     std::wstring GetAdapterName() const { return adapterName_; }
 
-    // Upload raw NV12 data for GPU-side YUV→RGB conversion
-    void UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
-                         uint32_t frameWidth, uint32_t frameHeight);
+    // Upload raw NV12 Y and UV planes for GPU-side YUV→RGB conversion
+    void UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
+                         int nv12Stride, uint32_t frameWidth, uint32_t frameHeight);
 
     // Whether we have a video frame to display
     bool HasVideoFrame() const { return hasVideoFrame_; }

@@ -26,25 +26,21 @@
 class H264Decoder {
 public:
     /// Called when raw NV12 data is ready for GPU upload.
-    /// Parameters: (nv12Data, stride, width, height)
-    using RawNV12Callback = std::function<void(const uint8_t*, int, uint32_t, uint32_t)>;
+    /// Parameters: (yData, uvData, stride, width, height)
+    /// yData  = pointer to Y plane (luma, full resolution)
+    /// uvData = pointer to UV plane (chroma, half width/height, interleaved U0V0U1V1...)
+    /// stride = bytes per row for both Y and UV planes
+    using RawNV12Callback = std::function<void(
+        const uint8_t* yData, const uint8_t* uvData,
+        int stride, uint32_t width, uint32_t height)>;
 
     H264Decoder();
     ~H264Decoder();
 
-    /// Initialize the decoder for the given resolution
     bool initialize(uint32_t width, uint32_t height);
-
-    /// Feed H.264 Annex B data to the decoder
     bool decode(const uint8_t* h264Data, size_t dataLen);
-
-    /// Set callback for raw NV12 output (for GPU conversion)
     void setRawNV12Callback(RawNV12Callback cb) { m_rawCallback = std::move(cb); }
-
-    /// Flush any pending frames
     void flush();
-
-    /// Shutdown the decoder
     void shutdown();
 
     struct Stats {
