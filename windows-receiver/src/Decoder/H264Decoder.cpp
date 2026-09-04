@@ -145,6 +145,39 @@ bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
     return true;
 }
 
+// ── Helper: determine NV12 layout from buffer length ────────────────────────
+// NV12 total bytes = stride × alignedHeight × 3/2
+// Returns true if a valid layout was found.
+static bool DetermineNV12Layout(DWORD bufLen, uint32_t width, uint32_t height,
+                                 int& outStride, uint32_t& outAlignedH) {
+    if (bufLen == 0 || bufLen % 3 != 0) return false;
+
+    // stride × alignedH = bufLen × 2/3
+    size_t product = (size_t)bufLen * 2 / 3;
+
+    // Try common stride values (GPU alignment)
+    int strideCandidates[] = {
+        (int)width,                        // 1920 (no padding)
+        ((int)width + 63)  & ~63,          // 1920 (64-aligned)
+        ((int)width + 127) & ~127,         // 1920 (128-aligned)
+        ((int)width + 255) & ~255,         // 2048 (256-aligned)
+        ((int)width + 511) & ~511,         // 2048 (512-aligned)
+    };
+
+    for (int s : strideCandidates) {
+        if (s < (int)width) continue;
+        if (product % s != 0) continue;
+
+        uint32_t h = (uint32_t)(product / s);
+        if (h >= height && (h & 1) == 0 && h <= height + 256) {
+            outStride = s;
+            outAlignedH = h;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool H264Decoder::processOutput() {
     if (!m_decoder) return false;
 
@@ -191,51 +224,57 @@ bool H264Decoder::processOutput() {
         return false;
     }
 
-    // ── Extract NV12 planes using ConvertToContiguousBuffer ─────────────────
-    // This creates a safe system-memory copy that works with all decoder types
-    // (both DXVA hardware and software decoders).
+    // ── Extract NV12 planes ─────────────────────────────────────────────────
     IMFMediaBuffer* contiguous = nullptr;
     hr = resultSample->ConvertToContiguousBuffer(&contiguous);
     if (SUCCEEDED(hr) && m_rawCallback) {
         BYTE* data = nullptr;
         DWORD dataLen = 0;
         hr = contiguous->Lock(&data, nullptr, &dataLen);
-        if (SUCCEEDED(hr) && data) {
-            // Determine stride from buffer length.
-            // NV12 total = stride × Y_rows + stride × UV_rows
-            // For contiguous buffers:
-            //   Y_rows  = height (actual, not padded)
-            //   UV_rows = ceil(height / 2) = (height + 1) / 2
-            //   total   = stride × (height + (height + 1) / 2)
-            uint32_t uvRows = (m_height + 1) / 2;
-            uint32_t totalRows = m_height + uvRows;
+        if (SUCCEEDED(hr) && data && dataLen > 0) {
+            // Determine stride and aligned height from actual buffer size
+            int stride = 0;
+            uint32_t alignedH = 0;
 
-            int stride = (int)(dataLen / totalRows);
-            // Validate: stride should be >= width
-            if (stride < (int)m_width) stride = (int)m_width;
-
-            // Y plane starts at offset 0, UV plane starts after Y
-            const uint8_t* yData  = data;
-            const uint8_t* uvData = data + (size_t)stride * m_height;
-
-            // Debug: log once on first frame
-            static bool loggedOnce = false;
-            if (!loggedOnce) {
-                printf("[Decoder] NV12 buffer: %u bytes, stride=%d, "
-                       "Y=%ux%u, UV=%ux%u, uvOffset=%zu\n",
-                       dataLen, stride, m_width, m_height,
-                       m_width/2, uvRows,
-                       (size_t)stride * m_height);
-                loggedOnce = true;
+            if (!DetermineNV12Layout(dataLen, m_width, m_height, stride, alignedH)) {
+                // Fallback: assume stride = width, even-aligned height
+                stride = (int)m_width;
+                alignedH = (m_height + 1) & ~1;
             }
 
-            m_rawCallback(yData, uvData, stride, m_width, m_height);
+            // Y plane: offset 0, height rows of actual data
+            // UV plane: offset stride * alignedH (after ALL Y rows including padding)
+            const uint8_t* yData  = data;
+            const uint8_t* uvData = data + (size_t)stride * alignedH;
+
+            // Safety: verify UV data is within buffer
+            size_t uvPlaneSize = (size_t)stride * (alignedH / 2);
+            size_t uvEnd = (size_t)stride * alignedH + uvPlaneSize;
+            if (uvEnd <= dataLen) {
+                // Debug: log on first frame
+                static bool logged = false;
+                if (!logged) {
+                    printf("[Decoder] NV12 layout: %u bytes, stride=%d, "
+                           "alignedH=%u (actual %u), uvOffset=%zu\n",
+                           dataLen, stride, alignedH, m_height,
+                           (size_t)stride * alignedH);
+                    fflush(stdout);
+                    logged = true;
+                }
+
+                m_rawCallback(yData, uvData, stride, m_width, m_height);
+            } else {
+                printf("[Decoder] ERROR: UV plane out of bounds! "
+                       "bufLen=%u, stride=%d, alignedH=%u, uvEnd=%zu\n",
+                       dataLen, stride, alignedH, uvEnd);
+                fflush(stdout);
+            }
+
             contiguous->Unlock();
         }
         contiguous->Release();
     }
 
-    // Cleanup
     if (outputData.pSample != outputSample) {
         outputData.pSample->Release();
     }
