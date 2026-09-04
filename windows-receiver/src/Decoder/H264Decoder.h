@@ -1,12 +1,10 @@
 // =============================================================================
 // H264Decoder.h — Media Foundation H.264 hardware decoder
 // =============================================================================
-// Decodes H.264 Annex B bitstream to BGRA pixel data using Media Foundation.
+// Decodes H.264 Annex B bitstream using Media Foundation (DXVA).
+// Outputs raw NV12 data for GPU-side YUV→RGB conversion.
 //
-// Pipeline: H.264 NALUs → MF H.264 Decoder (DXVA) → NV12 → CPU Convert → BGRA
-//
-// Note: Initial version does CPU-side NV12→BGRA conversion for simplicity.
-// A later optimization can use D3D11 Video Processor for GPU conversion.
+// Pipeline: H.264 NALUs → MF H.264 Decoder (DXVA) → NV12 → GPU shader
 // =============================================================================
 
 #pragma once
@@ -27,9 +25,9 @@
 
 class H264Decoder {
 public:
-    /// Called when a decoded BGRA frame is ready.
-    /// Parameters: (bgraData, width, height, stride)
-    using DecodedFrameCallback = std::function<void(const uint8_t*, uint32_t, uint32_t, uint32_t)>;
+    /// Called when raw NV12 data is ready for GPU upload.
+    /// Parameters: (nv12Data, stride, width, height)
+    using RawNV12Callback = std::function<void(const uint8_t*, int, uint32_t, uint32_t)>;
 
     H264Decoder();
     ~H264Decoder();
@@ -40,8 +38,8 @@ public:
     /// Feed H.264 Annex B data to the decoder
     bool decode(const uint8_t* h264Data, size_t dataLen);
 
-    /// Set callback for decoded frames
-    void setDecodedFrameCallback(DecodedFrameCallback cb) { m_callback = std::move(cb); }
+    /// Set callback for raw NV12 output (for GPU conversion)
+    void setRawNV12Callback(RawNV12Callback cb) { m_rawCallback = std::move(cb); }
 
     /// Flush any pending frames
     void flush();
@@ -62,18 +60,12 @@ private:
     bool configureInput();
     bool configureOutput();
     bool processOutput();
-    void convertNV12toBGRA(const uint8_t* nv12, int nv12Stride,
-                           uint8_t* bgra, int bgraStride,
-                           int width, int height);
 
     IMFTransform* m_decoder = nullptr;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     bool m_initialized = false;
 
-    // Output buffer
-    std::vector<uint8_t> m_bgraBuffer;
-
-    DecodedFrameCallback m_callback;
+    RawNV12Callback m_rawCallback;
     Stats m_stats;
 };

@@ -39,7 +39,7 @@ D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height)
     CompileShaders();
     CreateConstantBuffer();
     CreateD2DResources();
-    CreateVideoResources();
+    CreateNV12Resources();
 }
 
 // =============================================================================
@@ -332,17 +332,18 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->IASetInputLayout(nullptr);  // No input layout needed
-    if (hasVideoFrame_ && videoSRV_) {
-        // Render decoded video frame
+    if (hasVideoFrame_ && ySRV_ && uvSRV_) {
+        // Render NV12 video frame via GPU YUV→RGB shader
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
-        context_->PSSetShader(videoPixelShader_.Get(), nullptr, 0);
-        context_->PSSetShaderResources(0, 1, videoSRV_.GetAddressOf());
+        context_->PSSetShader(nv12PixelShader_.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = { ySRV_.Get(), uvSRV_.Get() };
+        context_->PSSetShaderResources(0, 2, srvs);
         context_->PSSetSamplers(0, 1, videoSampler_.GetAddressOf());
         context_->Draw(3, 0);
 
-        // Unbind SRV
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        context_->PSSetShaderResources(0, 1, &nullSRV);
+        // Unbind SRVs
+        ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+        context_->PSSetShaderResources(0, 2, nullSRVs);
     } else {
         // Render test pattern
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
@@ -474,11 +475,11 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
 }
 
 // =============================================================================
-// Video Frame Rendering
+// NV12 GPU Video Rendering
 // =============================================================================
 
-void D3D11Renderer::CreateVideoResources() {
-    // Create sampler for video texture (bilinear filtering)
+void D3D11Renderer::CreateNV12Resources() {
+    // Bilinear sampler for Y and UV textures
     D3D11_SAMPLER_DESC samplerDesc = {};
     samplerDesc.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -486,10 +487,11 @@ void D3D11Renderer::CreateVideoResources() {
     samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samplerDesc, &videoSampler_);
 
-    // Compile a simple texture-sampling pixel shader
-    const char* videoPS = R"(
-        Texture2D videoTex : register(t0);
-        SamplerState videoSampler : register(s0);
+    // BT.709 YUV→RGB pixel shader (limited range)
+    const char* nv12PS = R"(
+        Texture2D    yTex  : register(t0);
+        Texture2D    uvTex : register(t1);
+        SamplerState samp  : register(s0);
 
         struct PSInput {
             float4 pos : SV_Position;
@@ -497,12 +499,31 @@ void D3D11Renderer::CreateVideoResources() {
         };
 
         float4 main(PSInput input) : SV_Target {
-            return videoTex.Sample(videoSampler, input.uv);
+            float y  = yTex.Sample(samp, input.uv).r;
+            float2 uv_val = uvTex.Sample(samp, input.uv).rg;
+
+            // NV12: .r = Cb (U), .g = Cr (V)
+            float cb = uv_val.r;
+            float cr = uv_val.g;
+
+            // BT.709 limited-range YCbCr → RGB
+            // Y  : [16/255, 235/255] → [0, 1]
+            // CbCr: [16/255, 240/255] → [-0.5, 0.5]
+            float Y  = (y  - 16.0 / 255.0) * (255.0 / 219.0);
+            float Cb = (cb - 128.0 / 255.0) * (255.0 / 224.0);
+            float Cr = (cr - 128.0 / 255.0) * (255.0 / 224.0);
+
+            // BT.709 matrix
+            float R = Y + 1.5748 * Cr;
+            float G = Y - 0.1873 * Cb - 0.4681 * Cr;
+            float B = Y + 1.8556 * Cb;
+
+            return float4(saturate(float3(R, G, B)), 1.0);
         }
     )";
 
     ComPtr<ID3DBlob> psBlob, errBlob;
-    HRESULT hr = D3DCompile(videoPS, strlen(videoPS), "videoPS",
+    HRESULT hr = D3DCompile(nv12PS, strlen(nv12PS), "nv12PS",
         nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
     if (FAILED(hr)) {
         if (errBlob) {
@@ -513,61 +534,101 @@ void D3D11Renderer::CreateVideoResources() {
 
     device_->CreatePixelShader(
         psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
-        nullptr, &videoPixelShader_
+        nullptr, &nv12PixelShader_
     );
 }
 
-void D3D11Renderer::EnsureVideoTexture(uint32_t width, uint32_t height) {
-    if (videoWidth_ == width && videoHeight_ == height && videoTexture_) {
-        return;  // Already correct size
+void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
+    if (nv12Width_ == width && nv12Height_ == height && yTexture_) {
+        return;
     }
 
-    videoTexture_.Reset();
-    videoSRV_.Reset();
+    yTexture_.Reset();
+    uvTexture_.Reset();
+    ySRV_.Reset();
+    uvSRV_.Reset();
 
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width  = width;
-    texDesc.Height = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DYNAMIC;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    uint32_t evenHeight = (height + 1) & ~1;  // NV12 needs even height
 
-    HRESULT hr = device_->CreateTexture2D(&texDesc, nullptr, &videoTexture_);
+    // Y plane: full resolution, R8_UNORM (one byte per pixel)
+    D3D11_TEXTURE2D_DESC yDesc = {};
+    yDesc.Width  = width;
+    yDesc.Height = evenHeight;
+    yDesc.MipLevels = 1;
+    yDesc.ArraySize = 1;
+    yDesc.Format = DXGI_FORMAT_R8_UNORM;
+    yDesc.SampleDesc.Count = 1;
+    yDesc.Usage = D3D11_USAGE_DYNAMIC;
+    yDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    yDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    HRESULT hr = device_->CreateTexture2D(&yDesc, nullptr, &yTexture_);
     if (FAILED(hr)) return;
 
+    // UV plane: half width, half height, R8G8_UNORM (U+V interleaved)
+    D3D11_TEXTURE2D_DESC uvDesc = yDesc;
+    uvDesc.Width  = width / 2;
+    uvDesc.Height = evenHeight / 2;
+    uvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+
+    hr = device_->CreateTexture2D(&uvDesc, nullptr, &uvTexture_);
+    if (FAILED(hr)) return;
+
+    // Create SRVs
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = texDesc.Format;
     srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = 1;
 
-    hr = device_->CreateShaderResourceView(videoTexture_.Get(), &srvDesc, &videoSRV_);
+    srvDesc.Format = DXGI_FORMAT_R8_UNORM;
+    hr = device_->CreateShaderResourceView(yTexture_.Get(), &srvDesc, &ySRV_);
     if (FAILED(hr)) return;
 
-    videoWidth_ = width;
-    videoHeight_ = height;
+    srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
+    hr = device_->CreateShaderResourceView(uvTexture_.Get(), &srvDesc, &uvSRV_);
+    if (FAILED(hr)) return;
+
+    nv12Width_ = width;
+    nv12Height_ = height;
+
+    printf("[Renderer] NV12 textures: Y=%ux%u, UV=%ux%u\n",
+        width, evenHeight, width/2, evenHeight/2);
 }
 
-void D3D11Renderer::UpdateFrame(const uint8_t* bgraData, uint32_t frameWidth,
-                                 uint32_t frameHeight, uint32_t stride) {
-    EnsureVideoTexture(frameWidth, frameHeight);
-    if (!videoTexture_) return;
+void D3D11Renderer::UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
+                                     uint32_t frameWidth, uint32_t frameHeight) {
+    EnsureNV12Textures(frameWidth, frameHeight);
+    if (!yTexture_ || !uvTexture_) return;
 
+    uint32_t evenHeight = (frameHeight + 1) & ~1;
+
+    // Upload Y plane
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = context_->Map(videoTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    HRESULT hr = context_->Map(yTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
-        // Copy row by row (source and dest strides may differ)
-        for (uint32_t y = 0; y < frameHeight; y++) {
+        for (uint32_t row = 0; row < frameHeight; row++) {
             memcpy(
-                static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
-                bgraData + y * stride,
-                frameWidth * 4
+                static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                nv12Data + row * nv12Stride,
+                frameWidth
             );
         }
-        context_->Unmap(videoTexture_.Get(), 0);
-        hasVideoFrame_ = true;
+        context_->Unmap(yTexture_.Get(), 0);
     }
+
+    // Upload UV plane (starts after Y plane in NV12 layout)
+    const uint8_t* uvData = nv12Data + nv12Stride * evenHeight;
+    hr = context_->Map(uvTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        uint32_t uvHeight = evenHeight / 2;
+        for (uint32_t row = 0; row < uvHeight; row++) {
+            memcpy(
+                static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                uvData + row * nv12Stride,
+                frameWidth  // UV row is same width in bytes (U0V0 U1V1 ...)
+            );
+        }
+        context_->Unmap(uvTexture_.Get(), 0);
+    }
+
+    hasVideoFrame_ = true;
 }

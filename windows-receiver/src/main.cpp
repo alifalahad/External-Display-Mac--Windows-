@@ -26,18 +26,16 @@
 #include <memory>
 #include <string>
 #include <mutex>
-#include <queue>
+#include <deque>
 
-// Console helpers for debug output
+// Console helpers
 static FILE* gConsoleFile = nullptr;
 
 static void InitConsole() {
     if (AllocConsole()) {
         freopen_s(&gConsoleFile, "CONOUT$", "w", stdout);
         freopen_s(&gConsoleFile, "CONOUT$", "w", stderr);
-
         SetConsoleTitleW(L"External Display Receiver - Stats");
-
         HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
         SMALL_RECT rect = { 0, 0, 99, 30 };
         SetConsoleWindowInfo(hOut, TRUE, &rect);
@@ -45,199 +43,209 @@ static void InitConsole() {
 }
 
 static void CleanupConsole() {
-    if (gConsoleFile) {
-        fclose(gConsoleFile);
-        gConsoleFile = nullptr;
-    }
+    if (gConsoleFile) { fclose(gConsoleFile); gConsoleFile = nullptr; }
     FreeConsole();
 }
 
-// ── Decoded Frame Queue (thread-safe) ───────────────────────────────────────
+// ── NV12 Frame Queue (thread-safe, latest-frame-wins) ───────────────────────
 
-struct DecodedFrame {
-    std::vector<uint8_t> bgraData;
+struct NV12Frame {
+    std::vector<uint8_t> data;
+    int stride;
     uint32_t width;
     uint32_t height;
-    uint32_t stride;
 };
 
-static std::mutex gFrameQueueMutex;
-static std::queue<DecodedFrame> gFrameQueue;
-static const size_t MAX_QUEUED_FRAMES = 3;  // Keep queue small for low latency
+static std::mutex gNV12Mutex;
+static NV12Frame gLatestNV12;
+static bool gHasNewNV12 = false;
 
-static void QueueDecodedFrame(const uint8_t* data, uint32_t w, uint32_t h, uint32_t stride) {
-    std::lock_guard<std::mutex> lock(gFrameQueueMutex);
+static void QueueNV12Frame(const uint8_t* nv12Data, int stride,
+                            uint32_t width, uint32_t height) {
+    uint32_t evenHeight = (height + 1) & ~1;
+    size_t dataSize = (size_t)stride * evenHeight * 3 / 2;  // Y + UV
 
-    // Drop oldest frames if queue is full (fresh > old)
-    while (gFrameQueue.size() >= MAX_QUEUED_FRAMES) {
-        gFrameQueue.pop();
+    std::lock_guard<std::mutex> lock(gNV12Mutex);
+    // Reuse buffer if same size to avoid realloc
+    if (gLatestNV12.data.size() != dataSize) {
+        gLatestNV12.data.resize(dataSize);
     }
-
-    DecodedFrame frame;
-    frame.width = w;
-    frame.height = h;
-    frame.stride = stride;
-    frame.bgraData.assign(data, data + h * stride);
-    gFrameQueue.push(std::move(frame));
+    memcpy(gLatestNV12.data.data(), nv12Data, dataSize);
+    gLatestNV12.stride = stride;
+    gLatestNV12.width = width;
+    gLatestNV12.height = height;
+    gHasNewNV12 = true;
 }
 
-static bool DequeueFrame(DecodedFrame& frame) {
-    std::lock_guard<std::mutex> lock(gFrameQueueMutex);
-    if (gFrameQueue.empty()) return false;
+// ── H.264 Input Frame Queue (for main-thread decode with frame dropping) ────
 
-    // Take the newest frame, drop all older ones (low latency)
-    while (gFrameQueue.size() > 1) {
-        gFrameQueue.pop();
+struct H264InputFrame {
+    std::vector<uint8_t> data;
+    bool isKeyframe;
+};
+
+static std::mutex gInputMutex;
+static std::deque<H264InputFrame> gInputQueue;
+static const size_t MAX_INPUT_QUEUE = 4;  // Max queued H.264 frames
+
+static void QueueH264Frame(const uint8_t* data, size_t len, bool keyframe) {
+    std::lock_guard<std::mutex> lock(gInputMutex);
+
+    // If queue is too deep, skip to keep low latency
+    if (gInputQueue.size() >= MAX_INPUT_QUEUE) {
+        // Find latest keyframe in queue to keep decode stream valid
+        int lastKey = -1;
+        for (int i = (int)gInputQueue.size() - 1; i >= 0; i--) {
+            if (gInputQueue[i].isKeyframe) { lastKey = i; break; }
+        }
+        if (lastKey > 0) {
+            // Drop everything before the latest keyframe
+            gInputQueue.erase(gInputQueue.begin(),
+                              gInputQueue.begin() + lastKey);
+        } else if (gInputQueue.size() >= MAX_INPUT_QUEUE * 2) {
+            // No keyframe in queue and very deep — drop old frames anyway
+            gInputQueue.erase(gInputQueue.begin(),
+                              gInputQueue.end() - MAX_INPUT_QUEUE);
+        }
     }
-    frame = std::move(gFrameQueue.front());
-    gFrameQueue.pop();
-    return true;
+
+    gInputQueue.push_back({std::vector<uint8_t>(data, data + len), keyframe});
 }
 
 // =============================================================================
-// WinMain — Application entry point
+// WinMain
 // =============================================================================
 
 int WINAPI WinMain(
-    _In_ HINSTANCE /*hInstance*/,
-    _In_opt_ HINSTANCE /*hPrevInstance*/,
-    _In_ LPSTR lpCmdLine,
-    _In_ int /*nShowCmd*/)
+    _In_ HINSTANCE, _In_opt_ HINSTANCE,
+    _In_ LPSTR lpCmdLine, _In_ int)
 {
-    // ── Initialize console for stats output ─────────────────────────────────
     InitConsole();
 
-    // ── Parse command line for Mac IP address ───────────────────────────────
     std::string macIP;
     if (lpCmdLine && strlen(lpCmdLine) > 0) {
         macIP = lpCmdLine;
-        // Trim whitespace
         while (!macIP.empty() && macIP.back() == ' ') macIP.pop_back();
         while (!macIP.empty() && macIP.front() == ' ') macIP.erase(macIP.begin());
     }
-
     bool networkMode = !macIP.empty();
 
     try {
-        // ── Print startup banner ────────────────────────────────────────────
-        wprintf(L"╔══════════════════════════════════════════════════╗\n");
+        wprintf(L"\xE2\x95\x94\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x97\n");
         if (networkMode) {
-            wprintf(L"║   External Display Receiver — Streaming Mode     ║\n");
+            printf("  External Display Receiver - Streaming Mode\n");
+            printf("  Connecting to Mac sender at: %s\n", macIP.c_str());
         } else {
-            wprintf(L"║   External Display Receiver — Test Pattern Mode   ║\n");
+            wprintf(L"  External Display Receiver - Test Pattern Mode\n");
+            wprintf(L"  Tip: Pass Mac IP as argument to connect\n");
         }
-        wprintf(L"╠══════════════════════════════════════════════════╣\n");
-        wprintf(L"║   ESC   = Exit                                   ║\n");
-        wprintf(L"║   F11   = Toggle Fullscreen / Windowed           ║\n");
-        wprintf(L"╚══════════════════════════════════════════════════╝\n\n");
+        wprintf(L"\xE2\x95\x9A\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x90\xE2\x95\x9D\n\n");
 
-        if (networkMode) {
-            printf("Connecting to Mac sender at: %s\n\n", macIP.c_str());
-        } else {
-            wprintf(L"Tip: Pass Mac IP as argument to connect:\n");
-            wprintf(L"  ExternalDisplayReceiver.exe 192.168.1.x\n\n");
-        }
-
-        // ── Create window (fullscreen borderless) ───────────────────────────
+        // ── Create window ───────────────────────────────────────────────────
         Window window(L"External Display Receiver", true);
         wprintf(L"Window: %d x %d (%s)\n",
             window.GetWidth(), window.GetHeight(),
             window.IsFullscreen() ? L"Fullscreen" : L"Windowed");
 
-        // ── Create D3D11 renderer ───────────────────────────────────────────
+        // ── Create renderer ─────────────────────────────────────────────────
         D3D11Renderer renderer(
-            window.GetHandle(),
-            window.GetWidth(),
-            window.GetHeight()
-        );
+            window.GetHandle(), window.GetWidth(), window.GetHeight());
         wprintf(L"GPU:    %s\n", renderer.GetAdapterName().c_str());
         wprintf(L"VSync:  Enabled (60 Hz target)\n\n");
 
-        // ── Create decoder and network receiver (if streaming) ──────────────
+        // ── Create decoder and network receiver ─────────────────────────────
         std::unique_ptr<StreamReceiver> receiver;
         std::unique_ptr<H264Decoder> decoder;
 
         if (networkMode) {
-            // Initialize COM for Media Foundation
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
             decoder = std::make_unique<H264Decoder>();
             receiver = std::make_unique<StreamReceiver>();
 
             // When stream info arrives, initialize the decoder
-            receiver->setStreamInfoCallback([&decoder](uint32_t w, uint32_t h, uint32_t fps) {
-                printf("[Main] Stream: %ux%u @ %u FPS — initializing decoder\n", w, h, fps);
-                decoder->initialize(w, h);
-            });
-
-            // When H.264 frames arrive, feed to decoder
-            receiver->setFrameCallback([&decoder](const uint8_t* data, size_t len, bool key) {
-                if (decoder) {
-                    decoder->decode(data, len);
+            receiver->setStreamInfoCallback(
+                [&decoder](uint32_t w, uint32_t h, uint32_t fps) {
+                    printf("[Main] Stream: %ux%u @ %u FPS\n", w, h, fps);
+                    decoder->initialize(w, h);
                 }
-            });
+            );
 
-            // When decoder produces BGRA frames, queue them for rendering
-            decoder->setDecodedFrameCallback([](const uint8_t* data, uint32_t w, uint32_t h, uint32_t stride) {
-                QueueDecodedFrame(data, w, h, stride);
-            });
+            // Network thread: queue H.264 frames (don't decode here)
+            receiver->setFrameCallback(
+                [](const uint8_t* data, size_t len, bool key) {
+                    QueueH264Frame(data, len, key);
+                }
+            );
 
-            // Connect to Mac sender
+            // Decoder: output raw NV12 for GPU upload
+            decoder->setRawNV12Callback(
+                [](const uint8_t* nv12, int stride, uint32_t w, uint32_t h) {
+                    QueueNV12Frame(nv12, stride, w, h);
+                }
+            );
+
             if (!receiver->connect(macIP)) {
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());
             }
         }
 
-        // ── Create frame stats tracker ──────────────────────────────────────
-        FrameStats stats(60.0f);
-
         // ── Main loop ───────────────────────────────────────────────────────
+        FrameStats stats(60.0f);
         auto startTime = std::chrono::high_resolution_clock::now();
         auto lastStatsPrint = startTime;
         uint64_t frameCounter = 0;
 
         while (window.ProcessMessages()) {
-            // Handle resize
             if (window.WasResized()) {
                 renderer.Resize(window.GetWidth(), window.GetHeight());
                 window.ClearResizedFlag();
-                wprintf(L"\n[Resize] %d x %d\n\n",
-                    window.GetWidth(), window.GetHeight());
             }
 
-            // Dequeue decoded video frame (if any)
-            if (networkMode) {
-                DecodedFrame frame;
-                if (DequeueFrame(frame)) {
-                    renderer.UpdateFrame(
-                        frame.bgraData.data(),
-                        frame.width,
-                        frame.height,
-                        frame.stride
-                    );
+            // ── Decode H.264 frames on main thread ──────────────────────────
+            if (networkMode && decoder) {
+                // Drain input queue — decode up to 2 frames per vsync
+                std::lock_guard<std::mutex> lock(gInputMutex);
+                int decoded = 0;
+                while (!gInputQueue.empty() && decoded < 2) {
+                    auto& frame = gInputQueue.front();
+                    decoder->decode(frame.data.data(), frame.data.size());
+                    gInputQueue.pop_front();
+                    decoded++;
                 }
             }
 
-            // Calculate elapsed time
+            // ── Upload latest NV12 frame to GPU ─────────────────────────────
+            if (networkMode) {
+                std::lock_guard<std::mutex> lock(gNV12Mutex);
+                if (gHasNewNV12) {
+                    renderer.UpdateFrameNV12(
+                        gLatestNV12.data.data(),
+                        gLatestNV12.stride,
+                        gLatestNV12.width,
+                        gLatestNV12.height
+                    );
+                    gHasNewNV12 = false;
+                }
+            }
+
+            // ── Render ──────────────────────────────────────────────────────
             auto now = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(now - startTime).count();
 
-            // Render frame
             stats.BeginFrame();
             renderer.Render(elapsed, static_cast<float>(frameCounter), &stats);
             stats.EndFrame();
             frameCounter++;
 
-            // Print stats to console every 2 seconds
+            // ── Print stats every 2 seconds ─────────────────────────────────
             float sincePrint = std::chrono::duration<float>(now - lastStatsPrint).count();
             if (sincePrint >= 2.0f) {
                 wprintf(L"%s", stats.FormatStats().c_str());
 
-                // Print network + decoder stats
                 if (networkMode && receiver) {
                     auto ns = receiver->getStats();
                     auto state = receiver->getState();
-
                     const char* stateStr = "Unknown";
                     switch (state) {
                         case StreamReceiver::State::Disconnected: stateStr = "Disconnected"; break;
@@ -246,43 +254,40 @@ int WINAPI WinMain(
                         case StreamReceiver::State::Streaming:    stateStr = "Streaming"; break;
                         case StreamReceiver::State::Error:        stateStr = "Error"; break;
                     }
-
                     printf("  Net: %s | Recv: %llu bytes, %llu pkts, %llu frames (%llu dropped)\n",
                         stateStr, ns.bytesReceived, ns.packetsReceived,
                         ns.framesReceived, ns.framesDropped);
 
                     if (decoder) {
                         auto ds = decoder->getStats();
-                        printf("  Decoder: %llu frames | Latency: %.1f ms\n",
+                        printf("  Decoder: %llu frames | Latency: %.1f ms",
                             ds.framesDecoded, ds.avgDecodeLatencyMs);
+
+                        // Show input queue depth (indicates backlog)
+                        size_t queueDepth;
+                        { std::lock_guard<std::mutex> lock(gInputMutex);
+                          queueDepth = gInputQueue.size(); }
+                        printf(" | Queue: %zu", queueDepth);
                     }
                 }
-
-                wprintf(L"\n");
+                wprintf(L"\n\n");
                 lastStatsPrint = now;
             }
         }
 
-        // ── Cleanup ────────────────────────────────────────────────────────
+        // ── Cleanup ─────────────────────────────────────────────────────────
         if (receiver) receiver->disconnect();
         if (decoder) decoder->shutdown();
 
-        // ── Print final stats ───────────────────────────────────────────────
-        wprintf(L"\n════════════════════════════════════════════════════\n");
-        wprintf(L"Final: %s\n", stats.FormatStats().c_str());
-        wprintf(L"════════════════════════════════════════════════════\n");
+        wprintf(L"\nFinal: %s\n", stats.FormatStats().c_str());
 
-        if (networkMode) {
-            CoUninitialize();
-        }
+        if (networkMode) CoUninitialize();
 
     } catch (const std::exception& e) {
         fprintf(stderr, "FATAL ERROR: %s\n", e.what());
-
         int len = MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, nullptr, 0);
         std::wstring wideMsg(static_cast<size_t>(len), L'\0');
         MultiByteToWideChar(CP_UTF8, 0, e.what(), -1, wideMsg.data(), len);
-
         MessageBoxW(nullptr, wideMsg.c_str(),
             L"External Display Receiver - Error", MB_ICONERROR | MB_OK);
     }

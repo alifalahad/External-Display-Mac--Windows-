@@ -1,5 +1,5 @@
 // =============================================================================
-// H264Decoder.cpp — Media Foundation H.264 decoder implementation
+// H264Decoder.cpp — Media Foundation H.264 decoder (NV12 output)
 // =============================================================================
 
 #include "H264Decoder.h"
@@ -28,7 +28,6 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
 
     m_width = width;
     m_height = height;
-    m_bgraBuffer.resize(width * height * 4);
 
     // Initialize Media Foundation
     HRESULT hr = MFStartup(MF_VERSION);
@@ -43,14 +42,7 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
 
     // Send stream start messages
     hr = m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    if (FAILED(hr)) {
-        std::cerr << "[Decoder] BEGIN_STREAMING failed" << std::endl;
-    }
-
     hr = m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    if (FAILED(hr)) {
-        std::cerr << "[Decoder] START_OF_STREAM failed" << std::endl;
-    }
 
     m_initialized = true;
     std::cout << "[Decoder] Initialized: " << width << "x" << height << std::endl;
@@ -58,18 +50,15 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
 }
 
 bool H264Decoder::createDecoder() {
-    // Find H.264 decoder MFT
     MFT_REGISTER_TYPE_INFO inputType = { MFMediaType_Video, MFVideoFormat_H264 };
 
     IMFActivate** activateArr = nullptr;
     UINT32 count = 0;
     HRESULT hr = MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-        &inputType,
-        nullptr,
-        &activateArr,
-        &count
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+        &inputType, nullptr, &activateArr, &count
     );
 
     if (FAILED(hr) || count == 0) {
@@ -77,17 +66,12 @@ bool H264Decoder::createDecoder() {
         return false;
     }
 
-    // Activate the first (best) decoder
     hr = activateArr[0]->ActivateObject(IID_PPV_ARGS(&m_decoder));
-
-    // Release all activations
-    for (UINT32 i = 0; i < count; i++) {
-        activateArr[i]->Release();
-    }
+    for (UINT32 i = 0; i < count; i++) activateArr[i]->Release();
     CoTaskMemFree(activateArr);
 
     if (FAILED(hr)) {
-        std::cerr << "[Decoder] Failed to activate decoder: 0x" << std::hex << hr << std::endl;
+        std::cerr << "[Decoder] Failed to activate decoder" << std::endl;
         return false;
     }
 
@@ -121,12 +105,11 @@ bool H264Decoder::configureInput() {
         std::cerr << "[Decoder] SetInputType failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
-
     return true;
 }
 
 bool H264Decoder::configureOutput() {
-    // Enumerate available output types and pick NV12
+    // Pick NV12 output (preferred for hardware decoders)
     IMFMediaType* outputType = nullptr;
     bool foundNV12 = false;
 
@@ -138,15 +121,13 @@ bool H264Decoder::configureOutput() {
         outputType->GetGUID(MF_MT_SUBTYPE, &subtype);
 
         if (subtype == MFVideoFormat_NV12) {
-            // Set this as output type
             hr = m_decoder->SetOutputType(0, outputType, 0);
-            if (SUCCEEDED(hr)) {
-                foundNV12 = true;
-                outputType->Release();
-                break;
-            }
+            if (SUCCEEDED(hr)) foundNV12 = true;
+            outputType->Release();
+            if (foundNV12) break;
+        } else {
+            outputType->Release();
         }
-        outputType->Release();
     }
 
     if (!foundNV12) {
@@ -179,10 +160,7 @@ bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
     buffer->SetCurrentLength((DWORD)dataLen);
 
     hr = MFCreateSample(&sample);
-    if (FAILED(hr)) {
-        buffer->Release();
-        return false;
-    }
+    if (FAILED(hr)) { buffer->Release(); return false; }
     sample->AddBuffer(buffer);
 
     // Feed to decoder
@@ -192,15 +170,12 @@ bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
 
     if (FAILED(hr)) {
         if (hr == MF_E_NOTACCEPTING) {
-            // Decoder has output pending — drain it first
             while (processOutput()) {}
-            // Retry input
-            // (Need to recreate sample — simplified: just skip this frame)
         }
         return false;
     }
 
-    // Try to get output
+    // Pull output
     bool gotOutput = false;
     while (processOutput()) {
         gotOutput = true;
@@ -209,10 +184,8 @@ bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
     if (gotOutput) {
         auto endTime = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(endTime - startTime).count();
-
-        // Update stats with simple moving average
         m_stats.framesDecoded++;
-        double alpha = 0.05; // Smoothing factor
+        double alpha = 0.05;
         m_stats.avgDecodeLatencyMs = m_stats.avgDecodeLatencyMs * (1.0 - alpha) + ms * alpha;
     }
 
@@ -225,7 +198,6 @@ bool H264Decoder::processOutput() {
     MFT_OUTPUT_DATA_BUFFER outputData{};
     DWORD status = 0;
 
-    // Check if decoder allocates its own samples
     MFT_OUTPUT_STREAM_INFO streamInfo{};
     m_decoder->GetOutputStreamInfo(0, &streamInfo);
 
@@ -233,15 +205,11 @@ bool H264Decoder::processOutput() {
     IMFMediaBuffer* outputBuffer = nullptr;
 
     if (!(streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-        // We need to provide the output buffer
         HRESULT hr = MFCreateMemoryBuffer(streamInfo.cbSize, &outputBuffer);
         if (FAILED(hr)) return false;
 
         hr = MFCreateSample(&outputSample);
-        if (FAILED(hr)) {
-            outputBuffer->Release();
-            return false;
-        }
+        if (FAILED(hr)) { outputBuffer->Release(); return false; }
         outputSample->AddBuffer(outputBuffer);
         outputData.pSample = outputSample;
     }
@@ -255,7 +223,6 @@ bool H264Decoder::processOutput() {
     }
 
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-        // Output format changed — reconfigure
         configureOutput();
         SafeRelease(&outputSample);
         SafeRelease(&outputBuffer);
@@ -268,7 +235,6 @@ bool H264Decoder::processOutput() {
         return false;
     }
 
-    // Get the sample (either ours or decoder-provided)
     IMFSample* resultSample = outputData.pSample;
     if (!resultSample) {
         SafeRelease(&outputSample);
@@ -276,12 +242,11 @@ bool H264Decoder::processOutput() {
         return false;
     }
 
-    // Extract NV12 data and convert to BGRA
-    // Try IMF2DBuffer first to get the real stride, fallback to contiguous
+    // ── Deliver raw NV12 data to callback ───────────────────────────────────
     IMFMediaBuffer* resultBuffer = nullptr;
     hr = resultSample->ConvertToContiguousBuffer(&resultBuffer);
-    if (SUCCEEDED(hr)) {
-        // Try to get 2D buffer for proper stride info
+    if (SUCCEEDED(hr) && m_rawCallback) {
+        // Try IMF2DBuffer for proper stride
         IMF2DBuffer* buffer2D = nullptr;
         HRESULT hr2D = resultBuffer->QueryInterface(IID_PPV_ARGS(&buffer2D));
 
@@ -291,92 +256,45 @@ bool H264Decoder::processOutput() {
 
         if (SUCCEEDED(hr2D) && buffer2D) {
             hr = buffer2D->Lock2D(&nv12Data, &nv12Stride);
-            if (SUCCEEDED(hr)) {
-                locked2D = true;
-            }
+            if (SUCCEEDED(hr)) locked2D = true;
             buffer2D->Release();
         }
 
         if (!locked2D) {
-            // Fallback: use 1D lock with guessed stride
             DWORD nv12Len = 0;
             hr = resultBuffer->Lock(&nv12Data, nullptr, &nv12Len);
-            // MF typically aligns stride to 128 bytes for NV12
+            // Guess stride: try 128-byte alignment, fallback to 16
             nv12Stride = ((LONG)m_width + 127) & ~127;
-            // Verify: if the buffer is too small for that stride, try 16-align
-            if (nv12Len < (DWORD)(nv12Stride * m_height * 3 / 2)) {
+            uint32_t evenH = (m_height + 1) & ~1;
+            if (nv12Len < (DWORD)(nv12Stride * evenH * 3 / 2)) {
                 nv12Stride = ((LONG)m_width + 15) & ~15;
             }
         }
 
         if (nv12Data && nv12Stride > 0) {
-            // Use even height for NV12 (UV plane is half-height)
-            int evenHeight = (m_height + 1) & ~1;
-
-            convertNV12toBGRA(nv12Data, nv12Stride,
-                              m_bgraBuffer.data(), m_width * 4,
-                              m_width, m_height);
-
-            if (locked2D) {
-                IMF2DBuffer* buf2D = nullptr;
-                resultBuffer->QueryInterface(IID_PPV_ARGS(&buf2D));
-                if (buf2D) { buf2D->Unlock2D(); buf2D->Release(); }
-            } else {
-                resultBuffer->Unlock();
-            }
-
-            // Deliver decoded frame
-            if (m_callback) {
-                m_callback(m_bgraBuffer.data(), m_width, m_height, m_width * 4);
-            }
+            // Deliver raw NV12 — let the GPU do YUV→RGB conversion
+            m_rawCallback(nv12Data, nv12Stride, m_width, m_height);
         }
+
+        if (locked2D) {
+            IMF2DBuffer* buf2D = nullptr;
+            resultBuffer->QueryInterface(IID_PPV_ARGS(&buf2D));
+            if (buf2D) { buf2D->Unlock2D(); buf2D->Release(); }
+        } else {
+            resultBuffer->Unlock();
+        }
+
         resultBuffer->Release();
     }
 
     // Clean up
     if (outputData.pSample != outputSample) {
-        // Decoder provided its own sample — release it
         outputData.pSample->Release();
     }
     SafeRelease(&outputSample);
     SafeRelease(&outputBuffer);
 
     return true;
-}
-
-void H264Decoder::convertNV12toBGRA(const uint8_t* nv12, int nv12Stride,
-                                     uint8_t* bgra, int bgraStride,
-                                     int width, int height) {
-    // NV12 layout:
-    //   Y plane:  height lines (rounded up to even), each nv12Stride bytes
-    //   UV plane: height/2 lines, each nv12Stride bytes (U,V interleaved)
-
-    const uint8_t* yPlane = nv12;
-    // UV plane starts after Y plane — MF rounds height up to even for NV12
-    int evenHeight = (height + 1) & ~1;
-    const uint8_t* uvPlane = nv12 + nv12Stride * evenHeight;
-
-    for (int y = 0; y < height; y++) {
-        const uint8_t* yRow = yPlane + y * nv12Stride;
-        const uint8_t* uvRow = uvPlane + (y / 2) * nv12Stride;
-        uint8_t* bgraRow = bgra + y * bgraStride;
-
-        for (int x = 0; x < width; x++) {
-            int Y = yRow[x];
-            int U = uvRow[(x & ~1)] - 128;
-            int V = uvRow[(x & ~1) + 1] - 128;
-
-            // BT.601 conversion
-            int R = Y + ((351 * V) >> 8);
-            int G = Y - ((179 * V + 86 * U) >> 8);
-            int B = Y + ((443 * U) >> 8);
-
-            bgraRow[x * 4 + 0] = (uint8_t)std::clamp(B, 0, 255);  // B
-            bgraRow[x * 4 + 1] = (uint8_t)std::clamp(G, 0, 255);  // G
-            bgraRow[x * 4 + 2] = (uint8_t)std::clamp(R, 0, 255);  // R
-            bgraRow[x * 4 + 3] = 255;                               // A
-        }
-    }
 }
 
 void H264Decoder::flush() {
@@ -389,13 +307,9 @@ void H264Decoder::shutdown() {
     if (m_decoder) {
         m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         m_decoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-
-        // Drain remaining output
         while (processOutput()) {}
-
         SafeRelease(&m_decoder);
     }
-
     m_initialized = false;
     MFShutdown();
     std::cout << "[Decoder] Shutdown. Decoded " << m_stats.framesDecoded << " frames" << std::endl;

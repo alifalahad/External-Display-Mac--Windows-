@@ -30,9 +30,9 @@ public:
     // Get GPU adapter name
     std::wstring GetAdapterName() const { return adapterName_; }
 
-    // Upload a decoded BGRA frame for rendering instead of the test pattern
-    void UpdateFrame(const uint8_t* bgraData, uint32_t frameWidth,
-                     uint32_t frameHeight, uint32_t stride);
+    // Upload raw NV12 data for GPU-side YUV→RGB conversion
+    void UpdateFrameNV12(const uint8_t* nv12Data, int nv12Stride,
+                         uint32_t frameWidth, uint32_t frameHeight);
 
     // Whether we have a video frame to display
     bool HasVideoFrame() const { return hasVideoFrame_; }
@@ -73,16 +73,18 @@ private:
     int  height_ = 0;
     std::wstring adapterName_;
 
-    // ── Video frame texture ──
-    ComPtr<ID3D11Texture2D>          videoTexture_;
-    ComPtr<ID3D11ShaderResourceView> videoSRV_;
+    // ── NV12 GPU video rendering ──
+    ComPtr<ID3D11Texture2D>          yTexture_;      // Y plane (R8_UNORM)
+    ComPtr<ID3D11Texture2D>          uvTexture_;     // UV plane (R8G8_UNORM, half-res)
+    ComPtr<ID3D11ShaderResourceView> ySRV_;
+    ComPtr<ID3D11ShaderResourceView> uvSRV_;
     ComPtr<ID3D11SamplerState>       videoSampler_;
-    ComPtr<ID3D11PixelShader>        videoPixelShader_;
-    uint32_t videoWidth_  = 0;
-    uint32_t videoHeight_ = 0;
+    ComPtr<ID3D11PixelShader>        nv12PixelShader_;
+    uint32_t nv12Width_  = 0;
+    uint32_t nv12Height_ = 0;
     bool hasVideoFrame_ = false;
-    void CreateVideoResources();
-    void EnsureVideoTexture(uint32_t width, uint32_t height);
+    void CreateNV12Resources();
+    void EnsureNV12Textures(uint32_t width, uint32_t height);
 
     // Shader constant buffer layout (must be 16-byte aligned)
     struct alignas(16) ShaderConstants {
