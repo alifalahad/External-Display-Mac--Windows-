@@ -39,6 +39,7 @@ D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height)
     CompileShaders();
     CreateConstantBuffer();
     CreateD2DResources();
+    CreateVideoResources();
 }
 
 // =============================================================================
@@ -328,15 +329,25 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     viewport.MaxDepth = 1.0f;
     context_->RSSetViewports(1, &viewport);
 
-    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context_->IASetInputLayout(nullptr);  // No input layout needed
-
-    context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
-    context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->PSSetConstantBuffers(0, 1, constantBuffer_.GetAddressOf());
-
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
-    context_->Draw(3, 0);
+    if (hasVideoFrame_ && videoSRV_) {
+        // Render decoded video frame
+        context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
+        context_->PSSetShader(videoPixelShader_.Get(), nullptr, 0);
+        context_->PSSetShaderResources(0, 1, videoSRV_.GetAddressOf());
+        context_->PSSetSamplers(0, 1, videoSampler_.GetAddressOf());
+        context_->Draw(3, 0);
+
+        // Unbind SRV
+        ID3D11ShaderResourceView* nullSRV = nullptr;
+        context_->PSSetShaderResources(0, 1, &nullSRV);
+    } else {
+        // Render test pattern
+        context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
+        context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
+        context_->PSSetConstantBuffers(0, 1, constantBuffer_.GetAddressOf());
+        context_->Draw(3, 0);
+    }
 
     // ── 4. D2D stats overlay ────────────────────────────────────────────────
     if (stats && d2dContext_) {
@@ -458,4 +469,103 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
 
     // ── 5. Present (VSync) ──────────────────────────────────────────────────
     swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
+}
+
+// =============================================================================
+// Video Frame Rendering
+// =============================================================================
+
+void D3D11Renderer::CreateVideoResources() {
+    // Create sampler for video texture (bilinear filtering)
+    D3D11_SAMPLER_DESC samplerDesc = {};
+    samplerDesc.Filter   = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    device_->CreateSamplerState(&samplerDesc, &videoSampler_);
+
+    // Compile a simple texture-sampling pixel shader
+    const char* videoPS = R"(
+        Texture2D videoTex : register(t0);
+        SamplerState videoSampler : register(s0);
+
+        struct PSInput {
+            float4 pos : SV_Position;
+            float2 uv  : TEXCOORD0;
+        };
+
+        float4 main(PSInput input) : SV_Target {
+            return videoTex.Sample(videoSampler, input.uv);
+        }
+    )";
+
+    ComPtr<ID3DBlob> psBlob, errBlob;
+    HRESULT hr = D3DCompile(videoPS, strlen(videoPS), "videoPS",
+        nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        if (errBlob) {
+            OutputDebugStringA((char*)errBlob->GetBufferPointer());
+        }
+        return;
+    }
+
+    device_->CreatePixelShader(
+        psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+        nullptr, &videoPixelShader_
+    );
+}
+
+void D3D11Renderer::EnsureVideoTexture(uint32_t width, uint32_t height) {
+    if (videoWidth_ == width && videoHeight_ == height && videoTexture_) {
+        return;  // Already correct size
+    }
+
+    videoTexture_.Reset();
+    videoSRV_.Reset();
+
+    D3D11_TEXTURE2D_DESC texDesc = {};
+    texDesc.Width  = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_DYNAMIC;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    HRESULT hr = device_->CreateTexture2D(&texDesc, nullptr, &videoTexture_);
+    if (FAILED(hr)) return;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    hr = device_->CreateShaderResourceView(videoTexture_.Get(), &srvDesc, &videoSRV_);
+    if (FAILED(hr)) return;
+
+    videoWidth_ = width;
+    videoHeight_ = height;
+}
+
+void D3D11Renderer::UpdateFrame(const uint8_t* bgraData, uint32_t frameWidth,
+                                 uint32_t frameHeight, uint32_t stride) {
+    EnsureVideoTexture(frameWidth, frameHeight);
+    if (!videoTexture_) return;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = context_->Map(videoTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        // Copy row by row (source and dest strides may differ)
+        for (uint32_t y = 0; y < frameHeight; y++) {
+            memcpy(
+                static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
+                bgraData + y * stride,
+                frameWidth * 4
+            );
+        }
+        context_->Unmap(videoTexture_.Get(), 0);
+        hasVideoFrame_ = true;
+    }
 }

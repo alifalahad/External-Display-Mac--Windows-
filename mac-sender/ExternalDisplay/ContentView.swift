@@ -221,6 +221,27 @@ struct ContentView: View {
                     Spacer()
                 }
             }
+
+            // Row 3: Network status
+            if engine.isCapturing {
+                HStack(spacing: 16) {
+                    let senderState = engine.sender.state
+                    Image(systemName: senderState.isStreaming ? "wifi" : "wifi.slash")
+                        .foregroundStyle(senderState.isStreaming ? .green : .secondary)
+                        .font(.caption)
+
+                    statItem("Net", senderState.displayText)
+
+                    if senderState.isStreaming {
+                        let ns = engine.sender.networkStats
+                        statItem("Sent", formatBytes(ns.bytesSent))
+                        statItem("Packets", "\(ns.packetsSent)")
+                        statItem("Frames", "\(ns.framesSent)")
+                    }
+
+                    Spacer()
+                }
+            }
         }
     }
 

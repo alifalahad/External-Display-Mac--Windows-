@@ -10,6 +10,8 @@ add_executable(${PROJECT_NAME} WIN32
     src/App/Window.cpp
     src/Renderer/D3D11Renderer.cpp
     src/Performance/FrameStats.cpp
+    src/Network/StreamReceiver.cpp
+    src/Decoder/H264Decoder.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -23,6 +25,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     d3dcompiler
     d2d1
     dwrite
+    ws2_32
+    mfplat
+    mfuuid
+    ole32
 )
 
 # Enable UNICODE

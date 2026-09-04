@@ -30,6 +30,13 @@ public:
     // Get GPU adapter name
     std::wstring GetAdapterName() const { return adapterName_; }
 
+    // Upload a decoded BGRA frame for rendering instead of the test pattern
+    void UpdateFrame(const uint8_t* bgraData, uint32_t frameWidth,
+                     uint32_t frameHeight, uint32_t stride);
+
+    // Whether we have a video frame to display
+    bool HasVideoFrame() const { return hasVideoFrame_; }
+
 private:
     template<typename T>
     using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -65,6 +72,17 @@ private:
     int  width_  = 0;
     int  height_ = 0;
     std::wstring adapterName_;
+
+    // ── Video frame texture ──
+    ComPtr<ID3D11Texture2D>          videoTexture_;
+    ComPtr<ID3D11ShaderResourceView> videoSRV_;
+    ComPtr<ID3D11SamplerState>       videoSampler_;
+    ComPtr<ID3D11PixelShader>        videoPixelShader_;
+    uint32_t videoWidth_  = 0;
+    uint32_t videoHeight_ = 0;
+    bool hasVideoFrame_ = false;
+    void CreateVideoResources();
+    void EnsureVideoTexture(uint32_t width, uint32_t height);
 
     // Shader constant buffer layout (must be 16-byte aligned)
     struct alignas(16) ShaderConstants {

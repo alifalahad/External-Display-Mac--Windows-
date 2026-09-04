@@ -32,6 +32,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     @Published var selectedDisplayIndex: Int = 0
     @Published var errorMessage: String?
 
+    /// Network sender — published so ContentView can observe connection state
+    let sender = StreamSender()
+
     // ── Internals ───────────────────────────────────────────────────────────
 
     private var stream: SCStream?
@@ -64,10 +67,16 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             let enc = try VideoEncoder(config: config)
 
             enc.onEncodedFrame = { [weak self] sampleBuffer, isKeyframe, latencyMs in
-                // Phase 3: just track stats. Phase 4+ will send over network.
-                _ = sampleBuffer
-                _ = isKeyframe
+                // Convert AVCC → Annex B and send over network
+                guard let self = self, self.sender.state.isStreaming else { return }
+                if let annexB = H264Converter.annexBData(from: sampleBuffer, isKeyframe: isKeyframe) {
+                    self.sender.sendVideoFrame(annexBData: annexB, isKeyframe: isKeyframe)
+                }
             }
+
+            // Configure sender with stream parameters
+            sender.streamWidth = UInt32(width)
+            sender.streamHeight = UInt32(height)
 
             encoder = enc
             DispatchQueue.main.async { [weak self] in
@@ -197,6 +206,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Auto-start encoder with capture resolution
             startEncoder(width: display.width, height: display.height)
 
+            // Start network listener (Windows receiver will connect here)
+            sender.startListening()
+
+            // Watch for connection state changes — auto-start streaming
+            setupSenderObserver()
+
             print("[Capture] Started: \(display.width)×\(display.height) @ 60 FPS")
 
         } catch {
@@ -214,8 +229,10 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         guard let stream = stream else { return }
         self.stream = nil
 
-        // Stop encoder first
+        // Stop network sender and encoder
+        sender.stop()
         stopEncoder()
+        senderCancellable = nil
 
         Task {
             do {
@@ -229,6 +246,22 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
             print("[Capture] Stopped. Total frames: \(statsTracker.totalFrames)")
         }
+    }
+
+    // ── Sender State Observer ───────────────────────────────────────────────
+
+    private var senderCancellable: AnyCancellable?
+
+    /// Watch sender state — auto-start streaming when a peer connects
+    private func setupSenderObserver() {
+        senderCancellable = sender.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] newState in
+                if case .connected = newState {
+                    // Peer connected — begin streaming
+                    self?.sender.startStreaming()
+                }
+            }
     }
 }
 
