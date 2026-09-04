@@ -6,7 +6,7 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
-#include <mfobjects.h>  // IMF2DBuffer
+#include <mfobjects.h>
 
 template<typename T>
 void SafeRelease(T** pp) {
@@ -57,10 +57,8 @@ bool H264Decoder::createDecoder() {
     hr = activateArr[0]->ActivateObject(IID_PPV_ARGS(&m_decoder));
     for (UINT32 i = 0; i < count; i++) activateArr[i]->Release();
     CoTaskMemFree(activateArr);
-
     if (FAILED(hr)) return false;
 
-    // Low latency mode
     IMFAttributes* attrs = nullptr;
     hr = m_decoder->GetAttributes(&attrs);
     if (SUCCEEDED(hr) && attrs) {
@@ -193,53 +191,48 @@ bool H264Decoder::processOutput() {
         return false;
     }
 
-    // ── Extract NV12 Y and UV planes ────────────────────────────────────────
-    // KEY: Get the ORIGINAL buffer (not ConvertToContiguousBuffer) so we can
-    //      use IMF2DBuffer::Lock2D for the correct stride and UV plane offset.
-    IMFMediaBuffer* resultBuffer = nullptr;
-    hr = resultSample->GetBufferByIndex(0, &resultBuffer);
+    // ── Extract NV12 planes using ConvertToContiguousBuffer ─────────────────
+    // This creates a safe system-memory copy that works with all decoder types
+    // (both DXVA hardware and software decoders).
+    IMFMediaBuffer* contiguous = nullptr;
+    hr = resultSample->ConvertToContiguousBuffer(&contiguous);
     if (SUCCEEDED(hr) && m_rawCallback) {
-        bool delivered = false;
+        BYTE* data = nullptr;
+        DWORD dataLen = 0;
+        hr = contiguous->Lock(&data, nullptr, &dataLen);
+        if (SUCCEEDED(hr) && data) {
+            // Determine stride from buffer length.
+            // NV12 total = stride × Y_rows + stride × UV_rows
+            // For contiguous buffers:
+            //   Y_rows  = height (actual, not padded)
+            //   UV_rows = ceil(height / 2) = (height + 1) / 2
+            //   total   = stride × (height + (height + 1) / 2)
+            uint32_t uvRows = (m_height + 1) / 2;
+            uint32_t totalRows = m_height + uvRows;
 
-        // Try IMF2DBuffer for proper 2D access (works with DXVA surfaces)
-        IMF2DBuffer* buffer2D = nullptr;
-        if (SUCCEEDED(resultBuffer->QueryInterface(IID_PPV_ARGS(&buffer2D)))) {
-            BYTE* scanline0 = nullptr;
-            LONG pitch = 0;
-            if (SUCCEEDED(buffer2D->Lock2D(&scanline0, &pitch))) {
-                // NV12: UV plane follows Y plane.
-                // For 2D buffers, UV is at: base + pitch * aligned_height
-                uint32_t alignedH = (m_height + 1) & ~1;
-                const uint8_t* yData  = scanline0;
-                const uint8_t* uvData = scanline0 + pitch * alignedH;
+            int stride = (int)(dataLen / totalRows);
+            // Validate: stride should be >= width
+            if (stride < (int)m_width) stride = (int)m_width;
 
-                m_rawCallback(yData, uvData, (int)pitch, m_width, m_height);
-                delivered = true;
+            // Y plane starts at offset 0, UV plane starts after Y
+            const uint8_t* yData  = data;
+            const uint8_t* uvData = data + (size_t)stride * m_height;
 
-                buffer2D->Unlock2D();
+            // Debug: log once on first frame
+            static bool loggedOnce = false;
+            if (!loggedOnce) {
+                printf("[Decoder] NV12 buffer: %u bytes, stride=%d, "
+                       "Y=%ux%u, UV=%ux%u, uvOffset=%zu\n",
+                       dataLen, stride, m_width, m_height,
+                       m_width/2, uvRows,
+                       (size_t)stride * m_height);
+                loggedOnce = true;
             }
-            buffer2D->Release();
+
+            m_rawCallback(yData, uvData, stride, m_width, m_height);
+            contiguous->Unlock();
         }
-
-        // Fallback: 1D lock (for software decoders)
-        if (!delivered) {
-            BYTE* data = nullptr;
-            DWORD dataLen = 0;
-            if (SUCCEEDED(resultBuffer->Lock(&data, nullptr, &dataLen))) {
-                uint32_t alignedH = (m_height + 1) & ~1;
-                // Compute stride from buffer size: total = stride * alignedH * 3/2
-                int stride = (int)(dataLen * 2 / (alignedH * 3));
-                if (stride < (int)m_width) stride = (int)m_width;
-
-                const uint8_t* yData  = data;
-                const uint8_t* uvData = data + stride * alignedH;
-
-                m_rawCallback(yData, uvData, stride, m_width, m_height);
-                resultBuffer->Unlock();
-            }
-        }
-
-        resultBuffer->Release();
+        contiguous->Release();
     }
 
     // Cleanup
