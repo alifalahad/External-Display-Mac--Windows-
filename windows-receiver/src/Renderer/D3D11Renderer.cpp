@@ -509,7 +509,7 @@ void D3D11Renderer::CreateNV12Resources() {
     samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samplerDesc, &videoSampler_);
 
-    // BT.709 YUV→RGB pixel shader (limited range)
+    // BT.709 YUV→RGB pixel shader (FULL range — macOS VideoToolbox default)
     const char* nv12PS = R"(
         Texture2D    yTex  : register(t0);
         Texture2D    uvTex : register(t1);
@@ -525,20 +525,14 @@ void D3D11Renderer::CreateNV12Resources() {
             float2 uv_val = uvTex.Sample(samp, input.uv).rg;
 
             // NV12: .r = Cb (U), .g = Cr (V)
-            float cb = uv_val.r;
-            float cr = uv_val.g;
+            // Full-range BT.709: Y [0,1], CbCr centered at 0.5
+            float Cb = uv_val.r - 0.5;
+            float Cr = uv_val.g - 0.5;
 
-            // BT.709 limited-range YCbCr → RGB
-            // Y  : [16/255, 235/255] → [0, 1]
-            // CbCr: [16/255, 240/255] → [-0.5, 0.5]
-            float Y  = (y  - 16.0 / 255.0) * (255.0 / 219.0);
-            float Cb = (cb - 128.0 / 255.0) * (255.0 / 224.0);
-            float Cr = (cr - 128.0 / 255.0) * (255.0 / 224.0);
-
-            // BT.709 matrix
-            float R = Y + 1.5748 * Cr;
-            float G = Y - 0.1873 * Cb - 0.4681 * Cr;
-            float B = Y + 1.8556 * Cb;
+            // BT.709 full-range matrix
+            float R = y + 1.5748 * Cr;
+            float G = y - 0.1873 * Cb - 0.4681 * Cr;
+            float B = y + 1.8556 * Cb;
 
             return float4(saturate(float3(R, G, B)), 1.0);
         }
@@ -635,18 +629,33 @@ void D3D11Renderer::UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
                 frameWidth
             );
         }
+        // Fill padding rows with black (Y=0 for full-range) to avoid green line
+        for (uint32_t row = frameHeight; row < evenHeight; row++) {
+            memset(
+                static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                0, frameWidth
+            );
+        }
         context_->Unmap(yTexture_.Get(), 0);
     }
 
-    // Upload UV plane (pointer provided directly by decoder — no offset guessing)
+    // Upload UV plane
     hr = context_->Map(uvTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
         uint32_t uvHeight = evenHeight / 2;
-        for (uint32_t row = 0; row < uvHeight; row++) {
+        uint32_t uvDataRows = (frameHeight + 1) / 2;  // Actual UV rows with data
+        for (uint32_t row = 0; row < uvDataRows; row++) {
             memcpy(
                 static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
                 uvData + row * nv12Stride,
-                frameWidth  // UV row = width bytes (U0V0 U1V1 ...)
+                frameWidth
+            );
+        }
+        // Fill UV padding rows with neutral chroma (128=0.5 → no color)
+        for (uint32_t row = uvDataRows; row < uvHeight; row++) {
+            memset(
+                static_cast<uint8_t*>(mapped.pData) + row * mapped.RowPitch,
+                128, frameWidth
             );
         }
         context_->Unmap(uvTexture_.Get(), 0);
