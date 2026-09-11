@@ -34,8 +34,8 @@ struct EncoderConfig {
     /// Target frame rate
     var fps: Double = 60.0
 
-    /// Average bitrate in bits per second (default: 15 Mbps)
-    var bitrateBps: Int = 15_000_000
+    /// Average bitrate in bits per second (default: 50 Mbps for crystal clear text)
+    var bitrateBps: Int = 50_000_000
 
     /// Maximum keyframe interval in frames (1 second at 60 FPS)
     var keyframeInterval: Int = 60
@@ -60,9 +60,9 @@ struct EncoderConfig {
         set { bitrateBps = Int(newValue * 1_000_000.0) }
     }
 
-    /// Data rate limit (peak bitrate = 1.5× average) as [bytes/sec, seconds]
+    /// Data rate limit (peak bitrate = 2× average) as [bytes/sec, seconds]
     var dataRateLimit: [CFNumber] {
-        let peakBytesPerSec = Int(Double(bitrateBps) * 1.5 / 8.0)
+        let peakBytesPerSec = Int(Double(bitrateBps) * 2.0 / 8.0)
         return [
             peakBytesPerSec as CFNumber,
             1 as CFNumber  // over 1 second window
