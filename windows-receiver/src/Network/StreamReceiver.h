@@ -36,6 +36,7 @@ public:
         Connecting,
         Connected,       // TCP connected, waiting for START_STREAM
         Streaming,       // Receiving video data
+        Reconnecting,    // Connection lost, retrying
         Error
     };
 
@@ -66,6 +67,9 @@ public:
 
     /// Set callback for stream info
     void setStreamInfoCallback(StreamInfoCallback cb) { m_streamInfoCallback = std::move(cb); }
+
+    /// Enable/disable auto-reconnect on connection loss (default: enabled)
+    void enableAutoReconnect(bool enable) { m_autoReconnect.store(enable); }
 
     // ── Stats ───────────────────────────────────────────────────────────────
 
@@ -112,6 +116,7 @@ private:
 
     std::atomic<State> m_state{State::Disconnected};
     std::atomic<bool> m_running{false};
+    std::atomic<bool> m_autoReconnect{true};
 
     SOCKET m_tcpSocket = INVALID_SOCKET;
     SOCKET m_udpSocket = INVALID_SOCKET;

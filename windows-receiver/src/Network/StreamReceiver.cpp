@@ -48,69 +48,95 @@ void StreamReceiver::disconnect() {
     if (m_udpThread.joinable()) m_udpThread.join();
 }
 
-// ── Network Thread ──────────────────────────────────────────────────────────
-
 void StreamReceiver::networkThread(const std::string& hostIP) {
-    std::cout << "[Net] Connecting to " << hostIP << ":" << exdp::TCP_PORT << std::endl;
-
-    // Step 1: Connect TCP
-    if (!tcpConnect(hostIP)) {
-        m_state.store(State::Error);
-        return;
-    }
-    std::cout << "[Net] TCP connected" << std::endl;
-
-    // Step 2: Bind UDP socket
-    if (!udpBind()) {
-        m_state.store(State::Error);
-        return;
-    }
-    std::cout << "[Net] UDP bound on port " << exdp::UDP_PORT << std::endl;
-
-    // Step 3: Send HELLO
-    exdp::HelloPayload hello{};
-    strncpy_s(hello.receiverName, "Windows Receiver", sizeof(hello.receiverName) - 1);
-    hello.udpPort = exdp::UDP_PORT;
-    tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
-    std::cout << "[Net] HELLO sent" << std::endl;
-
-    m_state.store(State::Connected);
-
-    // Step 4: Start UDP receive thread
-    m_udpThread = std::thread(&StreamReceiver::udpReceiveLoop, this);
-
-    // Step 5: TCP receive loop (control messages)
     while (m_running.load()) {
-        exdp::ProtocolHeader header;
-        std::vector<uint8_t> payload;
+        std::cout << "[Net] Connecting to " << hostIP << ":" << exdp::TCP_PORT << std::endl;
+        m_state.store(State::Connecting);
 
-        if (!tcpReceiveMessage(header, payload)) {
-            std::cout << "[Net] TCP connection lost" << std::endl;
-            break;
+        // Step 1: Connect TCP
+        if (!tcpConnect(hostIP)) {
+            if (!m_running.load() || !m_autoReconnect.load()) {
+                m_state.store(State::Error);
+                return;
+            }
+            std::cout << "[Net] Connection failed, retrying in 3s..." << std::endl;
+            m_state.store(State::Reconnecting);
+            for (int i = 0; i < 30 && m_running.load(); i++)
+                Sleep(100);  // 3s in 100ms chunks (interruptible)
+            continue;
         }
+        std::cout << "[Net] TCP connected" << std::endl;
 
-        auto type = static_cast<exdp::MessageType>(header.type);
-        switch (type) {
-            case exdp::MessageType::Welcome:
-                handleWelcome(payload);
-                break;
-            case exdp::MessageType::StartStream:
-                handleStartStream(payload);
-                break;
-            case exdp::MessageType::StopStream:
-                handleStopStream();
-                break;
-            case exdp::MessageType::Ping: {
-                // Reply with PONG
-                tcpSendMessage(exdp::MessageType::Pong, nullptr, 0);
+        // Step 2: Bind UDP socket
+        if (!udpBind()) {
+            m_state.store(State::Error);
+            return;
+        }
+        std::cout << "[Net] UDP bound on port " << exdp::UDP_PORT << std::endl;
+
+        // Step 3: Send HELLO
+        exdp::HelloPayload hello{};
+        strncpy_s(hello.receiverName, "Windows Receiver", sizeof(hello.receiverName) - 1);
+        hello.udpPort = exdp::UDP_PORT;
+        tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
+        std::cout << "[Net] HELLO sent" << std::endl;
+
+        m_state.store(State::Connected);
+
+        // Step 4: Start UDP receive thread
+        m_udpThread = std::thread(&StreamReceiver::udpReceiveLoop, this);
+
+        // Step 5: TCP receive loop (control messages)
+        while (m_running.load()) {
+            exdp::ProtocolHeader header;
+            std::vector<uint8_t> payload;
+
+            if (!tcpReceiveMessage(header, payload)) {
+                std::cout << "[Net] TCP connection lost" << std::endl;
                 break;
             }
-            case exdp::MessageType::Disconnect:
-                std::cout << "[Net] Disconnect received" << std::endl;
-                m_running.store(false);
-                break;
-            default:
-                break;
+
+            auto type = static_cast<exdp::MessageType>(header.type);
+            switch (type) {
+                case exdp::MessageType::Welcome:
+                    handleWelcome(payload);
+                    break;
+                case exdp::MessageType::StartStream:
+                    handleStartStream(payload);
+                    break;
+                case exdp::MessageType::StopStream:
+                    handleStopStream();
+                    break;
+                case exdp::MessageType::Ping: {
+                    tcpSendMessage(exdp::MessageType::Pong, nullptr, 0);
+                    break;
+                }
+                case exdp::MessageType::Disconnect:
+                    std::cout << "[Net] Disconnect received" << std::endl;
+                    m_running.store(false);
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        // Cleanup sockets for potential reconnect
+        if (m_tcpSocket != INVALID_SOCKET) {
+            closesocket(m_tcpSocket);
+            m_tcpSocket = INVALID_SOCKET;
+        }
+        if (m_udpSocket != INVALID_SOCKET) {
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+        }
+        if (m_udpThread.joinable()) m_udpThread.join();
+
+        // Auto-reconnect if enabled
+        if (m_running.load() && m_autoReconnect.load()) {
+            std::cout << "[Net] Reconnecting in 3s..." << std::endl;
+            m_state.store(State::Reconnecting);
+            for (int i = 0; i < 30 && m_running.load(); i++)
+                Sleep(100);
         }
     }
 

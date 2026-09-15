@@ -4,7 +4,9 @@
 // =============================================================================
 // Creates a borderless popup window covering the entire primary monitor.
 // Supports F11 to toggle between fullscreen and windowed mode.
-// ESC to exit. Communicates resize events via a flag.
+// F2 to toggle stats overlay. ESC to exit.
+// Aspect ratio locking: when a video aspect ratio is set, window resize
+// is constrained to maintain that ratio.
 // =============================================================================
 
 #include <Windows.h>
@@ -26,6 +28,14 @@ public:
     // Toggle between fullscreen and windowed mode
     void ToggleFullscreen();
 
+    // ── Aspect Ratio Lock ───────────────────────────────────────────────────
+    // Set to lock resize to video's aspect ratio. Set to 0 to unlock.
+    void SetVideoAspectRatio(float ratio) { videoAspect_ = ratio; }
+    float GetVideoAspectRatio() const     { return videoAspect_; }
+
+    // ── Stats Toggle ────────────────────────────────────────────────────────
+    bool ShowStats() const { return showStats_; }
+
     // ── Accessors ───────────────────────────────────────────────────────────
     HWND GetHandle() const       { return hwnd_; }
     int  GetWidth() const        { return width_; }
@@ -46,6 +56,10 @@ private:
     int  height_     = 0;
     bool fullscreen_ = true;
     bool resized_    = false;
+    bool showStats_  = true;
+
+    // Video aspect ratio for resize constraint (0 = unconstrained)
+    float videoAspect_ = 0.0f;
 
     // Saved windowed position for toggle
     RECT savedWindowRect_ = {};

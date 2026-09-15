@@ -181,6 +181,69 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    // ── Aspect ratio lock during resize ─────────────────────────────────
+    case WM_SIZING:
+        if (self && self->videoAspect_ > 0.0f && !self->fullscreen_) {
+            auto* rect = reinterpret_cast<RECT*>(lp);
+
+            // Get window frame size (difference between window and client area)
+            RECT clientRect;
+            GetClientRect(hwnd, &clientRect);
+            RECT windowRect;
+            GetWindowRect(hwnd, &windowRect);
+            int frameW = (windowRect.right - windowRect.left) - (clientRect.right - clientRect.left);
+            int frameH = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
+
+            // Current client size from the proposed rect
+            int clientW = (rect->right - rect->left) - frameW;
+            int clientH = (rect->bottom - rect->top) - frameH;
+            if (clientW < 1) clientW = 1;
+            if (clientH < 1) clientH = 1;
+
+            float aspect = self->videoAspect_;
+
+            // Adjust based on which edge is being dragged
+            switch (wp) {
+            case WMSZ_LEFT:
+            case WMSZ_RIGHT:
+                // Horizontal drag → adjust height to match
+                clientH = (int)(clientW / aspect + 0.5f);
+                rect->bottom = rect->top + clientH + frameH;
+                break;
+            case WMSZ_TOP:
+            case WMSZ_BOTTOM:
+                // Vertical drag → adjust width to match
+                clientW = (int)(clientH * aspect + 0.5f);
+                rect->right = rect->left + clientW + frameW;
+                break;
+            case WMSZ_TOPLEFT:
+            case WMSZ_TOPRIGHT:
+            case WMSZ_BOTTOMLEFT:
+            case WMSZ_BOTTOMRIGHT:
+            default:
+                // Corner drag → use the larger dimension as anchor
+                if ((float)clientW / (float)clientH > aspect) {
+                    clientH = (int)(clientW / aspect + 0.5f);
+                } else {
+                    clientW = (int)(clientH * aspect + 0.5f);
+                }
+                // Adjust the appropriate edges
+                if (wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT) {
+                    rect->left = rect->right - clientW - frameW;
+                } else {
+                    rect->right = rect->left + clientW + frameW;
+                }
+                if (wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT) {
+                    rect->top = rect->bottom - clientH - frameH;
+                } else {
+                    rect->bottom = rect->top + clientH + frameH;
+                }
+                break;
+            }
+            return TRUE;
+        }
+        break;
+
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -188,6 +251,10 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == VK_F11 && self) {
             self->ToggleFullscreen();
+            return 0;
+        }
+        if (wp == VK_F2 && self) {
+            self->showStats_ = !self->showStats_;
             return 0;
         }
         break;

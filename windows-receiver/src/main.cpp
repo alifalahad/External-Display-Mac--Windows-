@@ -12,6 +12,7 @@
 // Controls:
 //   ESC  — Exit
 //   F11  — Toggle fullscreen / windowed
+//   F2   — Toggle stats overlay
 // =============================================================================
 
 #include "App/Window.h"
@@ -143,9 +144,13 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             receiver = std::make_unique<StreamReceiver>();
 
             receiver->setStreamInfoCallback(
-                [&decoder](uint32_t w, uint32_t h, uint32_t fps) {
+                [&decoder, &window](uint32_t w, uint32_t h, uint32_t fps) {
                     printf("[Main] Stream: %ux%u @ %u FPS\n", w, h, fps);
                     decoder->initialize(w, h);
+                    // Lock window aspect ratio to match video
+                    float aspect = (float)w / (float)h;
+                    window.SetVideoAspectRatio(aspect);
+                    printf("[Main] Aspect ratio locked: %.4f\n", aspect);
                 });
 
             // Network thread: queue H.264 frames (don't decode here)
@@ -207,7 +212,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             auto now = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(now - startTime).count();
             stats.BeginFrame();
-            renderer.Render(elapsed, (float)frameCounter, &stats);
+            renderer.Render(elapsed, (float)frameCounter, window.ShowStats() ? &stats : nullptr);
             stats.EndFrame();
             frameCounter++;
 
@@ -224,6 +229,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         case StreamReceiver::State::Connecting:   stateStr = "Connecting"; break;
                         case StreamReceiver::State::Connected:    stateStr = "Connected"; break;
                         case StreamReceiver::State::Streaming:    stateStr = "Streaming"; break;
+                        case StreamReceiver::State::Reconnecting: stateStr = "Reconnecting"; break;
                         case StreamReceiver::State::Error:        stateStr = "Error"; break;
                     }
                     printf("  Net: %s | Recv: %llu bytes, %llu pkts, %llu frames (%llu dropped)\n",
