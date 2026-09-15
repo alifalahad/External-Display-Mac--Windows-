@@ -136,13 +136,36 @@ final class StreamSender: ObservableObject {
         }
     }
 
-    /// Stop everything
+    /// Stop streaming and disconnect client, but keep listener alive for reconnects
     func stop() {
         stopStreaming()
         tcpConnection?.cancel()
         tcpConnection = nil
         udpConnection?.cancel()
         udpConnection = nil
+        remoteHost = nil
+        sequenceNumber = 0
+        frameSequenceNumber = 0
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            // Go back to listening if listener is still active
+            if self.tcpListener != nil {
+                self.state = .listening
+            } else {
+                self.state = .idle
+            }
+            self.networkStats = NetworkStats()
+        }
+    }
+
+    /// Full shutdown — stop everything including the listener
+    func shutdown() {
+        stopStreaming()
+        tcpConnection?.cancel()
+        tcpConnection = nil
+        udpConnection?.cancel()
+        udpConnection = nil
+        remoteHost = nil
         tcpListener?.cancel()
         tcpListener = nil
         sequenceNumber = 0
@@ -171,10 +194,12 @@ final class StreamSender: ObservableObject {
                 self?.receiveTCPMessages()
             case .failed(let error):
                 print("[Net] TCP connection failed: \(error)")
-                self?.handleDisconnect()
+                self?.handleDisconnect(for: connection)
             case .cancelled:
                 print("[Net] TCP connection cancelled")
-                self?.handleDisconnect()
+                // Don't call handleDisconnect for manual cancels (stop())
+                // stop() already cleans up. Only handle unexpected disconnects.
+                break
             default:
                 break
             }
@@ -195,18 +220,18 @@ final class StreamSender: ObservableObject {
 
             if let error = error {
                 print("[Net] TCP receive error: \(error)")
-                self.handleDisconnect()
+                self.handleDisconnect(for: connection)
                 return
             }
 
             if isComplete {
                 print("[Net] TCP connection closed by peer")
-                self.handleDisconnect()
+                self.handleDisconnect(for: connection)
                 return
             }
 
             if let data = data, !data.isEmpty {
-                self.handleTCPData(data)
+                self.handleTCPData(data, connection: connection)
             }
 
             // Continue receiving
@@ -214,7 +239,7 @@ final class StreamSender: ObservableObject {
         }
     }
 
-    private func handleTCPData(_ data: Data) {
+    private func handleTCPData(_ data: Data, connection: NWConnection) {
         guard let header = ProtocolHeader.deserialize(from: data) else {
             print("[Net] Invalid header received")
             return
@@ -238,7 +263,7 @@ final class StreamSender: ObservableObject {
             print("[Net] Keyframe requested")
             // TODO: Signal encoder to force keyframe
         case .disconnect:
-            handleDisconnect()
+            handleDisconnect(for: connection)
         default:
             print("[Net] Unhandled message type: \(msgType)")
         }
@@ -262,7 +287,14 @@ final class StreamSender: ObservableObject {
         }
     }
 
-    private func handleDisconnect() {
+    /// Handle client disconnect — only if the disconnected connection is still current
+    private func handleDisconnect(for connection: NWConnection) {
+        // Guard: only clean up if this is still the active connection
+        // Prevents a stale callback from killing a new reconnection
+        guard tcpConnection === connection else {
+            print("[Net] Ignoring stale disconnect callback")
+            return
+        }
         stopStreaming()
         tcpConnection?.cancel()
         tcpConnection = nil
