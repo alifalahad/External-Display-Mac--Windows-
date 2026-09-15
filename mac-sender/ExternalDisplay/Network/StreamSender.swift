@@ -81,6 +81,9 @@ final class StreamSender: ObservableObject {
     var streamFPS: UInt32 = 60
     var streamBitrate: UInt32 = 15_000_000
 
+    /// Called when a quality report is received from the Windows receiver
+    var onQualityReport: ((QualityReportPayload) -> Void)?
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Start listening for incoming connections
@@ -262,11 +265,21 @@ final class StreamSender: ObservableObject {
         case .keyframeReq:
             print("[Net] Keyframe requested")
             // TODO: Signal encoder to force keyframe
+        case .qualityReport:
+            handleQualityReport(payload)
         case .disconnect:
             handleDisconnect(for: connection)
         default:
             print("[Net] Unhandled message type: \(msgType)")
         }
+    }
+
+    private func handleQualityReport(_ payload: Data) {
+        guard let report = QualityReportPayload.deserialize(from: payload) else {
+            print("[Net] Invalid QualityReport payload")
+            return
+        }
+        onQualityReport?(report)
     }
 
     private func handleHello(_ payload: Data) {

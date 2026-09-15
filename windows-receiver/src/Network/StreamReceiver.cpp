@@ -82,6 +82,10 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         std::cout << "[Net] HELLO sent" << std::endl;
 
         m_state.store(State::Connected);
+        m_lastQualityReport = std::chrono::steady_clock::now();
+        m_prevFramesReceived = 0;
+        m_prevFramesDropped = 0;
+        m_prevPacketsReceived = 0;
 
         // Step 4: Start UDP receive thread
         m_udpThread = std::thread(&StreamReceiver::udpReceiveLoop, this);
@@ -117,6 +121,16 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                     break;
                 default:
                     break;
+            }
+
+            // Periodically send quality reports while streaming
+            if (m_state.load() == State::Streaming) {
+                auto now = std::chrono::steady_clock::now();
+                float elapsed = std::chrono::duration<float>(now - m_lastQualityReport).count();
+                if (elapsed >= QUALITY_REPORT_INTERVAL) {
+                    sendQualityReport();
+                    m_lastQualityReport = now;
+                }
             }
         }
 
@@ -411,4 +425,45 @@ void StreamReceiver::cleanupOldFrames(uint32_t currentFrameSeq) {
         std::lock_guard<std::mutex> lock(m_statsMutex);
         m_stats.framesDropped++;
     }
+}
+
+// ── Quality Reporting ───────────────────────────────────────────────────────
+
+void StreamReceiver::sendQualityReport() {
+    Stats currentStats;
+    {
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        currentStats = m_stats;
+    }
+
+    // Calculate packet loss since last report
+    uint64_t newFrames = currentStats.framesReceived - m_prevFramesReceived;
+    uint64_t newDropped = currentStats.framesDropped - m_prevFramesDropped;
+    uint64_t totalExpected = newFrames + newDropped;
+
+    uint32_t lossPercent100 = 0;  // × 100 for precision
+    if (totalExpected > 0) {
+        lossPercent100 = (uint32_t)((newDropped * 10000) / totalExpected);
+    }
+
+    // Queue depth from fragment reassembly
+    uint32_t queueDepth = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_fragmentMutex);
+        queueDepth = (uint32_t)m_pendingFrames.size();
+    }
+
+    // Build and send quality report
+    exdp::QualityReportPayload report;
+    report.packetLossPercent = lossPercent100;
+    report.rttMs = 0;  // TODO: measure from Ping/Pong
+    report.framesDropped = (uint32_t)newDropped;
+    report.queueDepth = queueDepth;
+
+    tcpSendMessage(exdp::MessageType::QualityReport, &report, sizeof(report));
+
+    // Update prev counters
+    m_prevFramesReceived = currentStats.framesReceived;
+    m_prevFramesDropped = currentStats.framesDropped;
+    m_prevPacketsReceived = currentStats.packetsReceived;
 }

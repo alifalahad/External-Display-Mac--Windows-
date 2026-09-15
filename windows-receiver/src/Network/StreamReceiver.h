@@ -148,4 +148,16 @@ private:
 
     mutable std::mutex m_statsMutex;
     Stats m_stats;
+
+    // ── Quality Reporting ───────────────────────────────────────────────────
+
+    /// Send quality report to Mac every N seconds
+    void sendQualityReport();
+
+    // Tracking for quality reports
+    uint64_t m_prevFramesReceived = 0;
+    uint64_t m_prevFramesDropped = 0;
+    uint64_t m_prevPacketsReceived = 0;
+    std::chrono::steady_clock::time_point m_lastQualityReport;
+    static constexpr float QUALITY_REPORT_INTERVAL = 2.0f;  // seconds
 };

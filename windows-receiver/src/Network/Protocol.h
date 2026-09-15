@@ -39,6 +39,7 @@ enum class MessageType : uint8_t {
     Ping          = 0x20,
     Pong          = 0x21,
     KeyframeReq   = 0x30,
+    QualityReport = 0x50,
     Disconnect    = 0xFF,
 
     // Data (UDP)
@@ -92,6 +93,16 @@ struct StartStreamPayload {
     uint32_t fps     = 60;
     uint32_t bitrate = 15000000;
     uint32_t codec   = 1;  // 1 = H.264
+};
+
+// ── QUALITY_REPORT payload (20 bytes, Windows → Mac) ───────────────────────────
+
+struct QualityReportPayload {
+    uint32_t packetLossPercent = 0;  // Loss × 100 (e.g. 350 = 3.50%)
+    uint32_t rttMs = 0;              // Round-trip time in milliseconds
+    uint32_t framesDropped = 0;      // Frames dropped since last report
+    uint32_t queueDepth = 0;         // Current decode queue depth
+    uint32_t reserved = 0;
 };
 #pragma pack(pop)
 

@@ -153,6 +153,30 @@ final class VideoEncoder {
             + "HW: \(isHardwareAccelerated)")
     }
 
+    // ── Runtime Bitrate Update ──────────────────────────────────────────────
+
+    /// Dynamically change the encoder bitrate (VT supports this without restart)
+    func updateBitrate(_ newBps: Int) {
+        guard let session = session else { return }
+
+        // Update average bitrate
+        VTSessionSetProperty(session,
+            key: kVTCompressionPropertyKey_AverageBitRate,
+            value: newBps as CFNumber)
+
+        // Update peak bitrate (2× average, over 1 second window)
+        let peakBytesPerSec = Int(Double(newBps) * 2.0 / 8.0)
+        let dataRateLimit: [CFNumber] = [
+            peakBytesPerSec as CFNumber,
+            1 as CFNumber
+        ]
+        VTSessionSetProperty(session,
+            key: kVTCompressionPropertyKey_DataRateLimits,
+            value: dataRateLimit as CFArray)
+
+        print("[Encoder] Bitrate updated: \(newBps / 1_000_000) Mbps")
+    }
+
     // ── Encode a Frame ──────────────────────────────────────────────────────
 
     /// Feed a CVPixelBuffer to the encoder. Called from the capture queue.

@@ -55,6 +55,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     private let statsTracker = CaptureStatsTracker()
 
+    /// Adaptive quality controller — adjusts bitrate based on receiver feedback
+    private var qualityController: AdaptiveQualityController?
+
     // ── Encoder Control ─────────────────────────────────────────────────────
 
     /// Start the H.264 encoder with the given resolution
@@ -78,11 +81,28 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             sender.streamWidth = UInt32(width)
             sender.streamHeight = UInt32(height)
 
+            // Set up adaptive quality controller
+            let controller = AdaptiveQualityController()
+            controller.onBitrateChange = { [weak enc] newBps in
+                enc?.updateBitrate(newBps)
+            }
+            qualityController = controller
+
+            // Wire up quality reports from receiver → controller
+            sender.onQualityReport = { [weak controller] report in
+                controller?.processReport(
+                    packetLossPercent100: report.packetLossPercent,
+                    rttMs: report.rttMs,
+                    framesDropped: report.framesDropped,
+                    queueDepth: report.queueDepth
+                )
+            }
+
             encoder = enc
             DispatchQueue.main.async { [weak self] in
                 self?.isEncoding = true
             }
-            print("[Engine] Encoder started")
+            print("[Engine] Encoder started with adaptive quality")
         } catch {
             DispatchQueue.main.async { [weak self] in
                 self?.errorMessage = "Encoder error: \(error.localizedDescription)"
@@ -95,6 +115,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     func stopEncoder() {
         encoder?.stop()
         encoder = nil
+        qualityController = nil
+        sender.onQualityReport = nil
         DispatchQueue.main.async { [weak self] in
             self?.isEncoding = false
             self?.encoderStats = EncoderStats()

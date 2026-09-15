@@ -36,6 +36,7 @@ enum MessageType: UInt8 {
     case ping           = 0x20   // Both: latency probe
     case pong           = 0x21   // Both: latency reply
     case keyframeReq    = 0x30   // Win → Mac: request I-frame
+    case qualityReport  = 0x50   // Win → Mac: network health report
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)
@@ -180,6 +181,26 @@ struct StartStreamPayload {
         s.bitrate = data.readLE(at: &offset)
         s.codec = data.readLE(at: &offset)
         return s
+    }
+}
+/// QUALITY_REPORT payload (Windows → Mac, 20 bytes)
+struct QualityReportPayload {
+    var packetLossPercent: UInt32 = 0   // Loss × 100 (e.g. 350 = 3.50%)
+    var rttMs: UInt32 = 0               // Round-trip time in ms
+    var framesDropped: UInt32 = 0       // Frames dropped since last report
+    var queueDepth: UInt32 = 0          // Current decode queue depth
+    var reserved: UInt32 = 0
+
+    static func deserialize(from data: Data) -> QualityReportPayload? {
+        guard data.count >= 20 else { return nil }
+        var q = QualityReportPayload()
+        var offset = 0
+        q.packetLossPercent = data.readLE(at: &offset)
+        q.rttMs = data.readLE(at: &offset)
+        q.framesDropped = data.readLE(at: &offset)
+        q.queueDepth = data.readLE(at: &offset)
+        q.reserved = data.readLE(at: &offset)
+        return q
     }
 }
 
