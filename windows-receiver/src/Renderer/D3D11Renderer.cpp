@@ -509,7 +509,7 @@ void D3D11Renderer::CreateNV12Resources() {
     samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samplerDesc, &videoSampler_);
 
-    // BT.709 YUV→RGB pixel shader (FULL range) with CAS sharpening for crisp text
+    // BT.709 YUV→RGB pixel shader (FULL range — macOS VideoToolbox default)
     const char* nv12PS = R"(
         Texture2D    yTex  : register(t0);
         Texture2D    uvTex : register(t1);
@@ -520,46 +520,19 @@ void D3D11Renderer::CreateNV12Resources() {
             float2 uv  : TEXCOORD0;
         };
 
-        // Convert NV12 YCbCr to RGB at given UV coordinate
-        float3 YUVtoRGB(float2 tc) {
-            float y  = yTex.Sample(samp, tc).r;
-            float2 uv_val = uvTex.Sample(samp, tc).rg;
+        float4 main(PSInput input) : SV_Target {
+            float y  = yTex.Sample(samp, input.uv).r;
+            float2 uv_val = uvTex.Sample(samp, input.uv).rg;
+
+            // Full-range BT.709: Y [0,1], CbCr centered at 0.5
             float Cb = uv_val.r - 0.5;
             float Cr = uv_val.g - 0.5;
+
             float R = y + 1.5748 * Cr;
             float G = y - 0.1873 * Cb - 0.4681 * Cr;
             float B = y + 1.8556 * Cb;
-            return saturate(float3(R, G, B));
-        }
 
-        float4 main(PSInput input) : SV_Target {
-            // Get Y texture dimensions for texel size
-            float tw, th;
-            yTex.GetDimensions(tw, th);
-            float2 texelSize = 1.0 / float2(tw, th);
-
-            // Sample center + 4 neighbors (cross pattern)
-            float3 center = YUVtoRGB(input.uv);
-            float3 top    = YUVtoRGB(input.uv + float2(0, -texelSize.y));
-            float3 bottom = YUVtoRGB(input.uv + float2(0,  texelSize.y));
-            float3 left   = YUVtoRGB(input.uv + float2(-texelSize.x, 0));
-            float3 right  = YUVtoRGB(input.uv + float2( texelSize.x, 0));
-
-            // CAS: Contrast Adaptive Sharpening
-            // Find min/max of the cross neighborhood
-            float3 minC = min(center, min(min(top, bottom), min(left, right)));
-            float3 maxC = max(center, max(max(top, bottom), max(left, right)));
-
-            // Adaptive sharpening weight: stronger where contrast is lower
-            // This avoids over-sharpening high-contrast edges (halos)
-            float3 contrast = maxC - minC;
-            float3 w = saturate(1.0 - contrast * 3.0) * 0.4;  // 0.4 = sharpening strength
-
-            // Apply unsharp mask with adaptive weight
-            float3 neighbors = (top + bottom + left + right) * 0.25;
-            float3 sharpened = center + (center - neighbors) * w;
-
-            return float4(saturate(sharpened), 1.0);
+            return float4(saturate(float3(R, G, B)), 1.0);
         }
     )";
 
