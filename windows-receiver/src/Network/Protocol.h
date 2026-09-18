@@ -118,11 +118,11 @@ enum class InputEventType : uint8_t {
 };
 
 enum InputModifiers : uint32_t {
-    MOD_NONE    = 0,
-    MOD_SHIFT   = 1 << 0,
-    MOD_CTRL    = 1 << 1,   // Maps to Cmd on Mac
-    MOD_ALT     = 1 << 2,   // Maps to Option on Mac
-    MOD_WIN     = 1 << 3,   // Maps to Ctrl on Mac
+    INPUT_MOD_NONE    = 0,
+    INPUT_MOD_SHIFT   = 1 << 0,
+    INPUT_MOD_CTRL    = 1 << 1,   // Maps to Cmd on Mac
+    INPUT_MOD_ALT     = 1 << 2,   // Maps to Option on Mac
+    INPUT_MOD_WIN     = 1 << 3,   // Maps to Ctrl on Mac
 };
 
 struct InputEventPayload {

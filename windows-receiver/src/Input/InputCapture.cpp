@@ -2,8 +2,12 @@
 // InputCapture.cpp — Input capture implementation
 // =============================================================================
 
-#include "Input/InputCapture.h"
+// Windows.h must be included first to avoid macro conflicts
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <Windows.h>
+
+#include "Input/InputCapture.h"
 
 void InputCapture::normalizeCoords(int wx, int wy, int ww, int wh,
                                     float& outX, float& outY) {
@@ -16,11 +20,11 @@ void InputCapture::normalizeCoords(int wx, int wy, int ww, int wh,
 }
 
 uint32_t InputCapture::getModifiers() const {
-    uint32_t mods = exdp::MOD_NONE;
-    if (m_shiftDown) mods |= exdp::MOD_SHIFT;
-    if (m_ctrlDown)  mods |= exdp::MOD_CTRL;
-    if (m_altDown)   mods |= exdp::MOD_ALT;
-    if (m_winDown)   mods |= exdp::MOD_WIN;
+    uint32_t mods = exdp::INPUT_MOD_NONE;
+    if (m_shiftDown) mods |= exdp::INPUT_MOD_SHIFT;
+    if (m_ctrlDown)  mods |= exdp::INPUT_MOD_CTRL;
+    if (m_altDown)   mods |= exdp::INPUT_MOD_ALT;
+    if (m_winDown)   mods |= exdp::INPUT_MOD_WIN;
     return mods;
 }
 
