@@ -12,6 +12,8 @@
 #include <Windows.h>
 #include <cstdint>
 
+class InputCapture;  // Forward declaration
+
 class Window {
 public:
     // Creates the window. If fullscreen=true, covers the primary monitor.
@@ -35,6 +37,9 @@ public:
 
     // ── Stats Toggle ────────────────────────────────────────────────────────
     bool ShowStats() const { return showStats_; }
+
+    // ── Input Capture ──────────────────────────────────────────────────────────
+    void SetInputCapture(InputCapture* ic) { inputCapture_ = ic; }
 
     // ── Accessors ───────────────────────────────────────────────────────────
     HWND GetHandle() const       { return hwnd_; }
@@ -60,6 +65,9 @@ private:
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;
+
+    // Input capture (non-owning)
+    InputCapture* inputCapture_ = nullptr;
 
     // Saved windowed position for toggle
     RECT savedWindowRect_ = {};

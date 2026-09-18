@@ -86,6 +86,15 @@ public:
         return m_stats;
     }
 
+    // ── Input Forwarding ────────────────────────────────────────────────────
+
+    /// Send an input event to the Mac sender
+    void sendInputEvent(const exdp::InputEventPayload& evt) {
+        if (m_state.load() == State::Streaming) {
+            tcpSendMessage(exdp::MessageType::InputEvent, &evt, sizeof(evt));
+        }
+    }
+
 private:
     // ── Network Thread ──────────────────────────────────────────────────────
 

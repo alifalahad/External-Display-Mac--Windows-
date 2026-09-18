@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "App/Window.h"
+#include "Input/InputCapture.h"
 #include <stdexcept>
 
 Window::Window(const wchar_t* title, bool fullscreen)
@@ -256,6 +257,92 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_F2 && self) {
             self->showStats_ = !self->showStats_;
             return 0;
+        }
+        if (wp == VK_F3 && self && self->inputCapture_) {
+            bool newState = !self->inputCapture_->isEnabled();
+            self->inputCapture_->setEnabled(newState);
+            printf("[Input] %s\n", newState ? "ENABLED (F3)" : "DISABLED (F3)");
+            if (newState) {
+                // Hide cursor when input capture is active
+                ShowCursor(FALSE);
+            } else {
+                ShowCursor(TRUE);
+            }
+            return 0;
+        }
+        // Forward to input capture
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onKeyDown((uint16_t)wp);
+        }
+        break;
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onKeyUp((uint16_t)wp);
+        }
+        break;
+
+    // ── Mouse input forwarding ────────────────────────────────────────────
+    case WM_MOUSEMOVE:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseMove(
+                LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseDown(
+                0, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseUp(
+                0, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_RBUTTONDOWN:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseDown(
+                1, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_RBUTTONUP:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseUp(
+                1, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_MBUTTONDOWN:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseDown(
+                2, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_MBUTTONUP:
+        if (self && self->inputCapture_) {
+            self->inputCapture_->onMouseUp(
+                2, LOWORD(lp), HIWORD(lp), self->width_, self->height_);
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (self && self->inputCapture_) {
+            float delta = (float)GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
+            POINT pt = { LOWORD(lp), HIWORD(lp) };
+            ScreenToClient(hwnd, &pt);
+            self->inputCapture_->onMouseWheel(
+                0, delta, pt.x, pt.y, self->width_, self->height_);
+        }
+        break;
+    case WM_MOUSEHWHEEL:
+        if (self && self->inputCapture_) {
+            float delta = (float)GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
+            POINT pt = { LOWORD(lp), HIWORD(lp) };
+            ScreenToClient(hwnd, &pt);
+            self->inputCapture_->onMouseWheel(
+                delta, 0, pt.x, pt.y, self->width_, self->height_);
         }
         break;
 

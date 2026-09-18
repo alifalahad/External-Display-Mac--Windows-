@@ -58,6 +58,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Adaptive quality controller — adjusts bitrate based on receiver feedback
     private var qualityController: AdaptiveQualityController?
 
+    /// Input injector — forwards mouse/keyboard from Windows to Mac
+    private var inputInjector: InputInjector?
+
     // ── Encoder Control ─────────────────────────────────────────────────────
 
     /// Start the H.264 encoder with the given resolution
@@ -98,11 +101,22 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 )
             }
 
+            // Set up input injector
+            let injector = InputInjector()
+            injector.displayWidth = CGFloat(width)
+            injector.displayHeight = CGFloat(height)
+            inputInjector = injector
+
+            // Wire up input events from receiver → injector
+            sender.onInputEvent = { [weak injector] event in
+                injector?.processEvent(event)
+            }
+
             encoder = enc
             DispatchQueue.main.async { [weak self] in
                 self?.isEncoding = true
             }
-            print("[Engine] Encoder started with adaptive quality")
+            print("[Engine] Encoder started with adaptive quality + input forwarding")
         } catch {
             DispatchQueue.main.async { [weak self] in
                 self?.errorMessage = "Encoder error: \(error.localizedDescription)"
@@ -116,7 +130,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         encoder?.stop()
         encoder = nil
         qualityController = nil
+        inputInjector = nil
         sender.onQualityReport = nil
+        sender.onInputEvent = nil
         DispatchQueue.main.async { [weak self] in
             self?.isEncoding = false
             self?.encoderStats = EncoderStats()

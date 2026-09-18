@@ -20,6 +20,7 @@
 #include "Performance/FrameStats.h"
 #include "Network/StreamReceiver.h"
 #include "Decoder/H264Decoder.h"
+#include "Input/InputCapture.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -175,6 +176,15 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
 
             if (!receiver->connect(macIP))
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());
+
+            // Set up input capture
+            auto inputCapture = std::make_unique<InputCapture>();
+            inputCapture->setSendCallback(
+                [&receiver](const exdp::InputEventPayload& evt) {
+                    if (receiver) receiver->sendInputEvent(evt);
+                });
+            window.SetInputCapture(inputCapture.get());
+            printf("Controls: ESC=quit, F11=fullscreen, F2=stats, F3=toggle input\n\n");
         }
 
         // ── Main loop ───────────────────────────────────────────────────────

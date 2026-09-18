@@ -37,6 +37,7 @@ enum MessageType: UInt8 {
     case pong           = 0x21   // Both: latency reply
     case keyframeReq    = 0x30   // Win → Mac: request I-frame
     case qualityReport  = 0x50   // Win → Mac: network health report
+    case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)
@@ -201,6 +202,57 @@ struct QualityReportPayload {
         q.queueDepth = data.readLE(at: &offset)
         q.reserved = data.readLE(at: &offset)
         return q
+    }
+}
+
+/// INPUT_EVENT types
+enum InputEventType: UInt8 {
+    case mouseMove  = 1
+    case mouseDown  = 2
+    case mouseUp    = 3
+    case scroll     = 4
+    case keyDown    = 5
+    case keyUp      = 6
+}
+
+/// INPUT_EVENT modifier flags
+struct InputModifiers: OptionSet {
+    let rawValue: UInt32
+    static let shift = InputModifiers(rawValue: 1 << 0)
+    static let ctrl  = InputModifiers(rawValue: 1 << 1)  // Maps to Cmd on Mac
+    static let alt   = InputModifiers(rawValue: 1 << 2)  // Maps to Option on Mac
+    static let win   = InputModifiers(rawValue: 1 << 3)  // Maps to Ctrl on Mac
+}
+
+/// INPUT_EVENT payload (Windows → Mac, 24 bytes)
+struct InputEventPayload {
+    var eventType: UInt8 = 0     // InputEventType
+    var button: UInt8 = 0        // 0=Left, 1=Right, 2=Middle
+    var keyCode: UInt16 = 0      // Windows virtual key code
+    var modifiers: UInt32 = 0    // InputModifiers bitmask
+    var x: Float = 0             // Normalized X (0.0–1.0)
+    var y: Float = 0             // Normalized Y (0.0–1.0)
+    var scrollDeltaX: Float = 0
+    var scrollDeltaY: Float = 0
+
+    static func deserialize(from data: Data) -> InputEventPayload? {
+        guard data.count >= 24 else { return nil }
+        var p = InputEventPayload()
+        p.eventType = data[0]
+        p.button = data[1]
+        var offset = 2
+        p.keyCode = data.readLE(at: &offset)
+        p.modifiers = data.readLE(at: &offset)
+        // Read floats as UInt32 bit patterns
+        let xBits: UInt32 = data.readLE(at: &offset)
+        let yBits: UInt32 = data.readLE(at: &offset)
+        let sxBits: UInt32 = data.readLE(at: &offset)
+        let syBits: UInt32 = data.readLE(at: &offset)
+        p.x = Float(bitPattern: xBits)
+        p.y = Float(bitPattern: yBits)
+        p.scrollDeltaX = Float(bitPattern: sxBits)
+        p.scrollDeltaY = Float(bitPattern: syBits)
+        return p
     }
 }
 

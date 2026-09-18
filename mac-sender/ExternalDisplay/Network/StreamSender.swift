@@ -84,6 +84,9 @@ final class StreamSender: ObservableObject {
     /// Called when a quality report is received from the Windows receiver
     var onQualityReport: ((QualityReportPayload) -> Void)?
 
+    /// Called when an input event is received from the Windows receiver
+    var onInputEvent: ((InputEventPayload) -> Void)?
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Start listening for incoming connections
@@ -267,11 +270,20 @@ final class StreamSender: ObservableObject {
             // TODO: Signal encoder to force keyframe
         case .qualityReport:
             handleQualityReport(payload)
+        case .inputEvent:
+            handleInputEvent(payload)
         case .disconnect:
             handleDisconnect(for: connection)
         default:
             print("[Net] Unhandled message type: \(msgType)")
         }
+    }
+
+    private func handleInputEvent(_ payload: Data) {
+        guard let event = InputEventPayload.deserialize(from: payload) else {
+            return  // Silent fail — input events are high frequency
+        }
+        onInputEvent?(event)
     }
 
     private func handleQualityReport(_ payload: Data) {

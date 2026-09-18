@@ -40,6 +40,7 @@ enum class MessageType : uint8_t {
     Pong          = 0x21,
     KeyframeReq   = 0x30,
     QualityReport = 0x50,
+    InputEvent    = 0x60,
     Disconnect    = 0xFF,
 
     // Data (UDP)
@@ -104,6 +105,38 @@ struct QualityReportPayload {
     uint32_t queueDepth = 0;         // Current decode queue depth
     uint32_t reserved = 0;
 };
+
+// ── INPUT_EVENT payload (24 bytes, Windows → Mac) ─────────────────────────────
+
+enum class InputEventType : uint8_t {
+    MouseMove  = 1,
+    MouseDown  = 2,
+    MouseUp    = 3,
+    Scroll     = 4,
+    KeyDown    = 5,
+    KeyUp      = 6,
+};
+
+enum InputModifiers : uint32_t {
+    MOD_NONE    = 0,
+    MOD_SHIFT   = 1 << 0,
+    MOD_CTRL    = 1 << 1,   // Maps to Cmd on Mac
+    MOD_ALT     = 1 << 2,   // Maps to Option on Mac
+    MOD_WIN     = 1 << 3,   // Maps to Ctrl on Mac
+};
+
+struct InputEventPayload {
+    uint8_t  eventType  = 0;   // InputEventType
+    uint8_t  button     = 0;   // 0=Left, 1=Right, 2=Middle
+    uint16_t keyCode    = 0;   // Windows virtual key code
+    uint32_t modifiers  = 0;   // InputModifiers bitmask
+    float    x          = 0;   // Normalized X (0.0–1.0)
+    float    y          = 0;   // Normalized Y (0.0–1.0)
+    float    scrollDeltaX = 0; // Horizontal scroll
+    float    scrollDeltaY = 0; // Vertical scroll
+};
+static_assert(sizeof(InputEventPayload) == 24, "InputEventPayload must be 24 bytes");
+
 #pragma pack(pop)
 
 // ── CRC32 ───────────────────────────────────────────────────────────────────
