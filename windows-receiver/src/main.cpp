@@ -144,6 +144,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
 
         std::unique_ptr<StreamReceiver> receiver;
         std::unique_ptr<H264Decoder> decoder;
+        std::unique_ptr<InputCapture> inputCapture;
 
         if (networkMode) {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -177,8 +178,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (!receiver->connect(macIP))
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());
 
-            // Set up input capture
-            auto inputCapture = std::make_unique<InputCapture>();
+            // Set up input capture (must outlive the main loop — declared above)
+            inputCapture = std::make_unique<InputCapture>();
             inputCapture->setSendCallback(
                 [&receiver](const exdp::InputEventPayload& evt) {
                     if (receiver) receiver->sendInputEvent(evt);
