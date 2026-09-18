@@ -102,6 +102,12 @@ static void QueueH264Frame(const uint8_t* data, size_t len, bool keyframe) {
     gInputQueue.push_back({std::vector<uint8_t>(data, data + len), keyframe});
 }
 
+// ── Pending stream restart (set by network thread, handled by main thread) ──
+
+static std::mutex gStreamInfoMutex;
+static bool gPendingStreamRestart = false;
+static uint32_t gPendingWidth = 0, gPendingHeight = 0, gPendingFPS = 0;
+
 // =============================================================================
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
@@ -143,14 +149,15 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             decoder = std::make_unique<H264Decoder>();
             receiver = std::make_unique<StreamReceiver>();
 
+            // Queue stream info change — main thread will reinitialize decoder
             receiver->setStreamInfoCallback(
-                [&decoder, &window](uint32_t w, uint32_t h, uint32_t fps) {
-                    printf("[Main] Stream: %ux%u @ %u FPS\n", w, h, fps);
-                    decoder->initialize(w, h);
-                    // Lock window aspect ratio to match video
-                    float aspect = (float)w / (float)h;
-                    window.SetVideoAspectRatio(aspect);
-                    printf("[Main] Aspect ratio locked: %.4f\n", aspect);
+                [&window](uint32_t w, uint32_t h, uint32_t fps) {
+                    std::lock_guard<std::mutex> lock(gStreamInfoMutex);
+                    gPendingWidth = w;
+                    gPendingHeight = h;
+                    gPendingFPS = fps;
+                    gPendingStreamRestart = true;
+                    printf("[Net] Stream info queued: %ux%u @ %u FPS\n", w, h, fps);
                 });
 
             // Network thread: queue H.264 frames (don't decode here)
@@ -180,6 +187,34 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (window.WasResized()) {
                 renderer.Resize(window.GetWidth(), window.GetHeight());
                 window.ClearResizedFlag();
+            }
+
+            // Handle pending stream restart on main thread (thread-safe)
+            if (networkMode && decoder) {
+                std::lock_guard<std::mutex> lock(gStreamInfoMutex);
+                if (gPendingStreamRestart) {
+                    printf("[Main] Reinitializing decoder: %ux%u @ %u FPS\n",
+                        gPendingWidth, gPendingHeight, gPendingFPS);
+
+                    // Flush old input queue to prevent stale frames
+                    {
+                        std::lock_guard<std::mutex> iq(gInputMutex);
+                        gInputQueue.clear();
+                    }
+                    {
+                        std::lock_guard<std::mutex> nv(gNV12Mutex);
+                        gHasNewNV12 = false;
+                    }
+
+                    decoder->shutdown();
+                    decoder->initialize(gPendingWidth, gPendingHeight);
+
+                    float aspect = (float)gPendingWidth / (float)gPendingHeight;
+                    window.SetVideoAspectRatio(aspect);
+                    printf("[Main] Aspect ratio locked: %.4f\n", aspect);
+
+                    gPendingStreamRestart = false;
+                }
             }
 
             // Decode H.264 on main thread (up to 2 per vsync)

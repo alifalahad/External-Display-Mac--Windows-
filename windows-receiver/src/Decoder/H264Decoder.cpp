@@ -289,9 +289,9 @@ void H264Decoder::flush() {
 
 void H264Decoder::shutdown() {
     if (m_decoder) {
+        // Flush first to clear any pending input/output
+        m_decoder->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        m_decoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-        while (processOutput()) {}
         SafeRelease(&m_decoder);
     }
     m_initialized = false;
