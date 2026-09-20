@@ -63,7 +63,7 @@ struct ContentView: View {
     private var virtualDisplayBar: some View {
         HStack(spacing: 12) {
             Image(systemName: engine.virtualDisplayManager.isActive
-                  ? "display.2" : "plus.display")
+                  ? "display.2" : "rectangle.badge.plus")
                 .font(.title3)
                 .foregroundStyle(engine.virtualDisplayManager.isActive ? .green : .secondary)
 
@@ -122,7 +122,7 @@ struct ContentView: View {
                         }
                     }
                 } label: {
-                    Label("Create Virtual Display", systemImage: "plus.display")
+                    Label("Create Virtual Display", systemImage: "rectangle.badge.plus")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(engine.isCapturing)

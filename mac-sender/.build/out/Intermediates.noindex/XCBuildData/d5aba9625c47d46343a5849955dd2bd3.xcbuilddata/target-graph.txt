@@ -1,0 +1,4 @@
+Target dependency graph (2 targets)
+Target 'AllExcludingTests' in project 'Aggregate'
+➜ Explicit dependency on target 'ExternalDisplay-product' in project 'ExternalDisplay'
+Target 'ExternalDisplay-product' in project 'ExternalDisplay' (no dependencies)

@@ -1,0 +1,12 @@
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Capture/ScreenCaptureEngine.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Display/VirtualDisplayManager.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Encoder/AdaptiveQuality.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Encoder/EncoderConfig.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Encoder/H264Converter.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Encoder/VideoEncoder.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/ExternalDisplayApp.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Input/InputInjector.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Network/Protocol.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Network/StreamSender.swift
+/Users/alifalahad/Codes/External\ Display\ (Mac->Windows)/mac-sender/ExternalDisplay/Performance/CaptureStats.swift

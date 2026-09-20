@@ -1,18 +1,30 @@
 // =============================================================================
 // VirtualDisplayManager.swift — Creates a virtual macOS display
 // =============================================================================
-// Uses the private CGVirtualDisplay API (same as BetterDisplay) to create
-// a virtual second monitor that macOS treats as a real display.
+// Uses the private CGVirtualDisplay API (same as BetterDisplay / hidpi-mirror)
+// to create a virtual second monitor that macOS treats as a real display.
 //
-// This display appears in System Settings → Displays, and users can:
-//   - Drag windows onto it
-//   - Arrange it relative to the built-in display
-//   - Use it as a true extended desktop
+// API structure (reverse-engineered from class-dump):
 //
-// ScreenCaptureKit then captures ONLY this virtual display for streaming.
+//   CGVirtualDisplayDescriptor:
+//     - name, maxPixelsWide, maxPixelsHigh, sizeInMillimeters
+//     - vendorID, productID, serialNum
+//     - queue (DispatchQueue for events), terminationHandler
 //
-// Technical approach: Runtime loading via Objective-C runtime to avoid
-// bridging header complications with SwiftPM.
+//   CGVirtualDisplayMode:
+//     - initWithWidth:height:refreshRate:
+//
+//   CGVirtualDisplaySettings:
+//     - modes (NSArray of CGVirtualDisplayMode)
+//     - hiDPI (BOOL)
+//
+//   CGVirtualDisplay:
+//     - initWithDescriptor:
+//     - applySettings:
+//     - displayID (readonly)
+//
+// Technical approach: Objective-C runtime (NSClassFromString + perform/KVC)
+// to avoid bridging header complications with SwiftPM.
 // =============================================================================
 
 import Foundation
@@ -39,13 +51,11 @@ final class VirtualDisplayManager: ObservableObject {
     /// Remember which displays existed BEFORE we created the virtual one
     private var preExistingDisplayIDs = Set<CGDirectDisplayID>()
 
-    /// Display serial number (used for identification)
-    private let displaySerial: UInt32 = 0xED5F_0001
+    /// Dispatch queue for virtual display events
+    private let displayQueue = DispatchQueue(label: "com.externaldisplay.virtualdisplay")
 
     // ── Create Virtual Display ──────────────────────────────────────────────
 
-    /// Create a virtual display with the specified resolution.
-    /// Returns true on success.
     @discardableResult
     func createDisplay(width: Int, height: Int) -> Bool {
         guard !isActive else {
@@ -58,20 +68,19 @@ final class VirtualDisplayManager: ObservableObject {
 
         // Snapshot existing displays before creating the virtual one
         preExistingDisplayIDs = getCurrentDisplayIDs()
+        print("[VDisplay] Pre-existing displays: \(preExistingDisplayIDs)")
 
-        // Access private classes via Objective-C runtime
+        // ── 1. Load private classes ─────────────────────────────────────────
         guard let descriptorClass = NSClassFromString("CGVirtualDisplayDescriptor"),
               let modeClass = NSClassFromString("CGVirtualDisplayMode"),
               let settingsClass = NSClassFromString("CGVirtualDisplaySettings"),
               let virtualDisplayClass = NSClassFromString("CGVirtualDisplay") else {
-            let err = "CGVirtualDisplay API not available on this macOS version"
-            print("[VDisplay] \(err)")
-            DispatchQueue.main.async { self.errorMessage = err }
+            setError("CGVirtualDisplay API not available on this macOS version")
             return false
         }
 
-        // ── Create CGVirtualDisplayDescriptor ───────────────────────────────
-        guard let desc = objcAlloc(descriptorClass) else {
+        // ── 2. Create CGVirtualDisplayDescriptor ────────────────────────────
+        guard let desc = objcAllocInit(descriptorClass) else {
             setError("Failed to create CGVirtualDisplayDescriptor")
             return false
         }
@@ -80,11 +89,15 @@ final class VirtualDisplayManager: ObservableObject {
         desc.setValue(width as NSNumber, forKey: "maxPixelsWide")
         desc.setValue(height as NSNumber, forKey: "maxPixelsHigh")
         desc.setValue("External Display (Windows)" as NSString, forKey: "name")
-        desc.setValue(displaySerial as NSNumber, forKey: "serialNum")
-        desc.setValue(0xED5F as NSNumber, forKey: "productID")
-        desc.setValue(0x0001 as NSNumber, forKey: "vendorID")
 
-        // Physical size in mm (approximate 24" display)
+        // Use width-based product ID so mode preferences don't stick
+        // (macOS caches display mode per vendor+product, ignoring serial)
+        let productID = UInt32(0xED00 | (width & 0xFF))
+        desc.setValue(productID as NSNumber, forKey: "productID")
+        desc.setValue(0xED5F as NSNumber, forKey: "vendorID")
+        desc.setValue(0 as NSNumber, forKey: "serialNum")
+
+        // Physical size in mm (approximate 24" display for realistic PPI)
         let aspectRatio = Double(width) / Double(height)
         let diagMM = 24.0 * 25.4
         let heightMM = diagMM / sqrt(1.0 + aspectRatio * aspectRatio)
@@ -92,26 +105,15 @@ final class VirtualDisplayManager: ObservableObject {
         desc.setValue(NSValue(size: NSSize(width: widthMM, height: heightMM)),
                       forKey: "sizeInMillimeters")
 
-        // ── Create CGVirtualDisplayMode ─────────────────────────────────────
-        if let mode = objcAlloc(modeClass) {
-            mode.setValue(width as NSNumber, forKey: "width")
-            mode.setValue(height as NSNumber, forKey: "height")
-            mode.setValue(60.0 as NSNumber, forKey: "refreshRate")
-            desc.setValue([mode], forKey: "queue")
-        }
+        // Set the dispatch queue (required — it's a DispatchQueue, NOT an array)
+        desc.setValue(displayQueue, forKey: "queue")
 
-        // ── Create CGVirtualDisplaySettings ─────────────────────────────────
-        if let settings = objcAlloc(settingsClass) {
-            // Apply HiDPI if resolution is 2x or higher of a standard res
-            let isHiDPI = width >= 2560 || height >= 1440
-            settings.setValue(NSNumber(value: isHiDPI), forKey: "hiDPI")
-            desc.setValue(settings, forKey: "settings")
-        }
+        print("[VDisplay] Descriptor: \(width)×\(height), vendor=0xED5F, product=0x\(String(productID, radix: 16))")
 
-        // ── Create CGVirtualDisplay ─────────────────────────────────────────
+        // ── 3. Create CGVirtualDisplay ──────────────────────────────────────
         let initSel = NSSelectorFromString("initWithDescriptor:")
         guard virtualDisplayClass.instancesRespond(to: initSel) else {
-            setError("CGVirtualDisplay missing initWithDescriptor: selector")
+            setError("CGVirtualDisplay missing initWithDescriptor:")
             return false
         }
 
@@ -122,31 +124,58 @@ final class VirtualDisplayManager: ObservableObject {
         }
 
         guard let display = allocated.perform(initSel, with: desc)?.takeUnretainedValue() else {
-            setError("initWithDescriptor: returned nil — check macOS version")
+            setError("initWithDescriptor: returned nil — check macOS version/entitlements")
             return false
+        }
+
+        print("[VDisplay] CGVirtualDisplay created, applying settings...")
+
+        // ── 4. Create CGVirtualDisplaySettings with modes ───────────────────
+        if let settings = objcAllocInit(settingsClass) {
+            // Create display mode using initWithWidth:height:refreshRate:
+            // Since perform() can't pass primitive args, we use NSInvocation
+            if let mode = createMode(modeClass: modeClass, w: width, h: height, hz: 60.0) {
+                settings.setValue([mode], forKey: "modes")
+                print("[VDisplay] Mode set: \(width)×\(height) @ 60Hz")
+            } else {
+                print("[VDisplay] ⚠️ Could not create display mode, continuing without explicit modes")
+            }
+
+            // Apply settings to the display
+            let applySel = NSSelectorFromString("applySettings:")
+            if display.responds(to: applySel) {
+                _ = display.perform(applySel, with: settings)
+                print("[VDisplay] Settings applied")
+            } else {
+                print("[VDisplay] ⚠️ applySettings: not available")
+            }
         }
 
         // Keep the display alive
         virtualDisplay = display
 
-        // ── Find the display ID ─────────────────────────────────────────────
-        // Try property first
-        let displayIDSel = NSSelectorFromString("displayID")
+        // ── 5. Find the display ID ──────────────────────────────────────────
         var foundID: CGDirectDisplayID = 0
+
+        // Try the displayID property
+        let displayIDSel = NSSelectorFromString("displayID")
         if display.responds(to: displayIDSel),
            let result = display.perform(displayIDSel) {
-            let rawID = UInt32(bitPattern: Int32(Int(bitPattern: result.toOpaque()) & 0xFFFFFFFF))
+            let rawPtr = result.toOpaque()
+            let rawID = UInt32(UInt(bitPattern: rawPtr) & 0xFFFFFFFF)
             if rawID != 0 {
                 foundID = rawID
+                print("[VDisplay] displayID property returned: \(foundID)")
             }
         }
 
         // Fallback: compare display lists before/after
         if foundID == 0 {
-            // Give WindowServer a moment to register the display
+            // Give WindowServer time to register the display
             Thread.sleep(forTimeInterval: 0.5)
             let currentIDs = getCurrentDisplayIDs()
             let newIDs = currentIDs.subtracting(preExistingDisplayIDs)
+            print("[VDisplay] Displays after creation: \(currentIDs), new: \(newIDs)")
             if let newID = newIDs.first {
                 foundID = newID
             }
@@ -162,7 +191,22 @@ final class VirtualDisplayManager: ObservableObject {
             return true
         }
 
-        setError("Display created but could not determine display ID")
+        // Even if we can't find the ID, the display may still be active
+        // Try one more time after a longer delay
+        Thread.sleep(forTimeInterval: 1.0)
+        let finalIDs = getCurrentDisplayIDs()
+        let finalNewIDs = finalIDs.subtracting(preExistingDisplayIDs)
+        if let newID = finalNewIDs.first {
+            DispatchQueue.main.async {
+                self.virtualDisplayID = newID
+                self.isActive = true
+                self.errorMessage = nil
+            }
+            print("[VDisplay] ✅ Created (delayed detection): \(width)×\(height), ID=\(newID)")
+            return true
+        }
+
+        setError("Display object created but could not detect display ID. Check System Settings → Displays.")
         return false
     }
 
@@ -187,13 +231,38 @@ final class VirtualDisplayManager: ObservableObject {
         return CGDisplayBounds(virtualDisplayID)
     }
 
-    /// Allocate + init an Objective-C class
-    private func objcAlloc(_ cls: AnyClass) -> AnyObject? {
+    /// Allocate + init an Objective-C class via runtime
+    private func objcAllocInit(_ cls: AnyClass) -> AnyObject? {
         guard let allocResult = (cls as AnyObject).perform(NSSelectorFromString("alloc")),
               let initResult = allocResult.takeUnretainedValue().perform(NSSelectorFromString("init")) else {
             return nil
         }
         return initResult.takeUnretainedValue()
+    }
+
+    /// Create a CGVirtualDisplayMode
+    private func createMode(modeClass: AnyClass, w: Int, h: Int, hz: Double) -> AnyObject? {
+        // First try the designated initializer via objc_msgSend (handles primitive args)
+        let sel = NSSelectorFromString("initWithWidth:height:refreshRate:")
+        if modeClass.instancesRespond(to: sel) {
+            typealias InitFunc = @convention(c) (AnyObject, Selector, UInt32, UInt32, Double) -> AnyObject?
+            guard let allocResult = (modeClass as AnyObject).perform(NSSelectorFromString("alloc")) else {
+                return nil
+            }
+            let allocated = allocResult.takeUnretainedValue()
+            let imp = allocated.method(for: sel)
+            let initCall = unsafeBitCast(imp, to: InitFunc.self)
+            if let mode = initCall(allocated, sel, UInt32(w), UInt32(h), hz) {
+                return mode
+            }
+        }
+
+        // Fallback: alloc/init then set properties via KVC
+        guard let mode = objcAllocInit(modeClass) else { return nil }
+        mode.setValue(w as NSNumber, forKey: "width")
+        mode.setValue(h as NSNumber, forKey: "height")
+        mode.setValue(hz as NSNumber, forKey: "refreshRate")
+        return mode
     }
 
     /// Get all currently active display IDs
