@@ -23,6 +23,12 @@ final class InputInjector {
     var displayWidth: CGFloat = 1920
     var displayHeight: CGFloat = 1200
 
+    /// Display origin offset (for virtual display coordinate mapping)
+    /// When a virtual display is positioned to the right of the main display,
+    /// these values offset mouse events to the correct screen region.
+    var displayOriginX: CGFloat = 0
+    var displayOriginY: CGFloat = 0
+
     /// Track mouse position for delta-based events
     private var lastMousePos = CGPoint(x: 960, y: 600)
 
@@ -202,8 +208,8 @@ final class InputInjector {
 
     private func normalizedToDisplay(x: Float, y: Float) -> CGPoint {
         return CGPoint(
-            x: CGFloat(x) * displayWidth,
-            y: CGFloat(y) * displayHeight
+            x: displayOriginX + CGFloat(x) * displayWidth,
+            y: displayOriginY + CGFloat(y) * displayHeight
         )
     }
 

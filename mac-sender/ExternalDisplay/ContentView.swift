@@ -1,8 +1,8 @@
 // =============================================================================
 // ContentView.swift — Main UI for the Mac sender
 // =============================================================================
-// Shows a display picker, start/stop controls, live preview of captured
-// frames, and real-time capture statistics.
+// Shows a display picker, virtual display controls, start/stop controls,
+// live preview of captured frames, and real-time capture statistics.
 // =============================================================================
 
 import SwiftUI
@@ -11,6 +11,17 @@ import ScreenCaptureKit
 struct ContentView: View {
     @StateObject private var engine = ScreenCaptureEngine()
 
+    // Virtual display resolution presets
+    private let resolutionPresets: [(String, Int, Int)] = [
+        ("1920×1080 (Full HD)", 1920, 1080),
+        ("1536×864", 1536, 864),
+        ("1366×768", 1366, 768),
+        ("2560×1440 (QHD)", 2560, 1440),
+        ("2560×1600", 2560, 1600),
+        ("1920×1200", 1920, 1200),
+    ]
+    @State private var selectedResolution = 0
+
     var body: some View {
         VStack(spacing: 0) {
             // ── Toolbar ─────────────────────────────────────────────────────
@@ -18,6 +29,14 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
                 .background(.ultraThinMaterial)
+
+            Divider()
+
+            // ── Virtual Display Controls ────────────────────────────────────
+            virtualDisplayBar
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color(nsColor: .controlBackgroundColor))
 
             Divider()
 
@@ -33,9 +52,81 @@ struct ContentView: View {
                 .padding(.vertical, 8)
                 .background(.ultraThinMaterial)
         }
-        .frame(minWidth: 800, minHeight: 550)
+        .frame(minWidth: 800, minHeight: 600)
         .task {
             await engine.refreshDisplays()
+        }
+    }
+
+    // ── Virtual Display Controls ────────────────────────────────────────────
+
+    private var virtualDisplayBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: engine.virtualDisplayManager.isActive
+                  ? "display.2" : "plus.display")
+                .font(.title3)
+                .foregroundStyle(engine.virtualDisplayManager.isActive ? .green : .secondary)
+
+            if engine.virtualDisplayManager.isActive {
+                // Active state
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Virtual Display Active")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                    Text("ID: \(engine.virtualDisplayManager.virtualDisplayID)  •  \(engine.virtualDisplayManager.width)×\(engine.virtualDisplayManager.height)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Text("Arrange in System Settings → Displays")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Button {
+                    engine.stopCapture()
+                    engine.virtualDisplayManager.destroyDisplay()
+                    Task { await engine.refreshDisplays() }
+                } label: {
+                    Label("Remove", systemImage: "xmark.circle")
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+                .disabled(engine.isCapturing)
+
+            } else {
+                // Inactive state — show creation controls
+                Text("Virtual Display")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Picker("Resolution:", selection: $selectedResolution) {
+                    ForEach(0..<resolutionPresets.count, id: \.self) { i in
+                        Text(resolutionPresets[i].0).tag(i)
+                    }
+                }
+                .frame(maxWidth: 200)
+
+                Spacer()
+
+                Button {
+                    let preset = resolutionPresets[selectedResolution]
+                    if engine.virtualDisplayManager.createDisplay(
+                        width: preset.1, height: preset.2
+                    ) {
+                        // Wait a bit for macOS to register the display, then refresh
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                            await engine.refreshDisplays()
+                        }
+                    }
+                } label: {
+                    Label("Create Virtual Display", systemImage: "plus.display")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(engine.isCapturing)
+            }
         }
     }
 
@@ -53,26 +144,35 @@ struct ContentView: View {
 
             Spacer()
 
-            // Display picker — always shown, disabled while loading or capturing
-            if engine.availableDisplays.isEmpty {
-                Text(engine.errorMessage != nil ? "No permission" : "Loading displays…")
-                    .foregroundStyle(.secondary)
+            // Display picker — show when NOT using virtual display
+            if !engine.virtualDisplayManager.isActive {
+                if engine.availableDisplays.isEmpty {
+                    Text(engine.errorMessage != nil ? "No permission" : "Loading displays…")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Picker("Display:", selection: $engine.selectedDisplayIndex) {
+                        ForEach(
+                            Array(engine.availableDisplays.enumerated()),
+                            id: \.offset
+                        ) { index, display in
+                            Text("Display \(display.displayID) — \(display.width)×\(display.height)")
+                                .tag(index)
+                        }
+                    }
+                    .frame(maxWidth: 280)
+                    .disabled(engine.isCapturing)
+                }
+            } else {
+                Text("Capturing: Virtual Display \(engine.virtualDisplayManager.virtualDisplayID)")
                     .font(.caption)
+                    .foregroundStyle(.green)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
-            } else {
-                Picker("Display:", selection: $engine.selectedDisplayIndex) {
-                    ForEach(
-                        Array(engine.availableDisplays.enumerated()),
-                        id: \.offset
-                    ) { index, display in
-                        Text("Display \(display.displayID) — \(display.width)×\(display.height)")
-                            .tag(index)
-                    }
-                }
-                .frame(maxWidth: 280)
-                .disabled(engine.isCapturing)
+                    .background(.green.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
             }
 
             // Refresh displays
@@ -104,7 +204,8 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(engine.isCapturing ? .red : .accentColor)
-            .disabled(!engine.isCapturing && engine.availableDisplays.isEmpty)
+            .disabled(!engine.isCapturing && engine.availableDisplays.isEmpty
+                       && !engine.virtualDisplayManager.isActive)
         }
     }
 
@@ -158,11 +259,21 @@ struct ContentView: View {
                                 Text("Waiting for frames…")
                                     .foregroundStyle(.secondary)
 
+                            } else if engine.virtualDisplayManager.isActive {
+                                Image(systemName: "display.2")
+                                    .font(.system(size: 48))
+                                    .foregroundStyle(.green.opacity(0.6))
+                                Text("Virtual display ready — press Start Capture")
+                                    .foregroundStyle(.secondary)
+                                Text("Tip: Arrange it in System Settings → Displays first")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+
                             } else {
                                 Image(systemName: "display.trianglebadge.exclamationmark")
                                     .font(.system(size: 48))
                                     .foregroundStyle(.tertiary)
-                                Text("Select a display and press Start Capture")
+                                Text("Create a virtual display or select a display, then press Start Capture")
                                     .foregroundStyle(.secondary)
                             }
                         }

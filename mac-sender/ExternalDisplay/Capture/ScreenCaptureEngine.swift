@@ -35,6 +35,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Network sender — published so ContentView can observe connection state
     let sender = StreamSender()
 
+    /// Virtual display manager — creates a second display on macOS
+    let virtualDisplayManager = VirtualDisplayManager()
+
     // ── Internals ───────────────────────────────────────────────────────────
 
     private var stream: SCStream?
@@ -105,6 +108,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             let injector = InputInjector()
             injector.displayWidth = CGFloat(width)
             injector.displayHeight = CGFloat(height)
+
+            // If virtual display is active, set the display origin offset
+            // so mouse events land on the virtual display, not the main screen
+            if virtualDisplayManager.isActive {
+                let bounds = virtualDisplayManager.getDisplayBounds()
+                injector.displayOriginX = bounds.origin.x
+                injector.displayOriginY = bounds.origin.y
+                print("[Engine] Input mapped to virtual display at (\(bounds.origin.x), \(bounds.origin.y))")
+            }
             inputInjector = injector
 
             // Wire up input events from receiver → injector
@@ -177,12 +189,36 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     // ── Start Capture ───────────────────────────────────────────────────────
 
     func startCapture() async {
-        guard selectedDisplayIndex < availableDisplays.count else {
-            await MainActor.run { self.errorMessage = "No display selected" }
-            return
-        }
+        // ── Determine which display to capture ──────────────────────────────
+        let display: SCDisplay
 
-        let display = availableDisplays[selectedDisplayIndex]
+        if virtualDisplayManager.isActive {
+            // Prefer the virtual display when it's active
+            let vdID = virtualDisplayManager.virtualDisplayID
+            if let vd = availableDisplays.first(where: { $0.displayID == vdID }) {
+                display = vd
+                print("[Capture] Using virtual display ID=\(vdID)")
+            } else {
+                // Virtual display not in the list yet — refresh and retry
+                await refreshDisplays()
+                if let vd = availableDisplays.first(where: { $0.displayID == vdID }) {
+                    display = vd
+                    print("[Capture] Using virtual display ID=\(vdID) (after refresh)")
+                } else {
+                    await MainActor.run {
+                        self.errorMessage = "Virtual display not found in ScreenCaptureKit. Refresh displays."
+                    }
+                    return
+                }
+            }
+        } else {
+            // No virtual display — use selected physical display
+            guard selectedDisplayIndex < availableDisplays.count else {
+                await MainActor.run { self.errorMessage = "No display selected" }
+                return
+            }
+            display = availableDisplays[selectedDisplayIndex]
+        }
 
         do {
             // Re-fetch content to get current windows for exclusion
@@ -204,8 +240,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Configure the stream
             let config = SCStreamConfiguration()
 
-            // Capture at display's point resolution (1x, not Retina 2x)
-            // This keeps data volume manageable for Phase 2
+            // Capture at display's point resolution
             config.width = display.width
             config.height = display.height
 
@@ -250,7 +285,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Watch for connection state changes — auto-start streaming
             setupSenderObserver()
 
-            print("[Capture] Started: \(display.width)×\(display.height) @ 60 FPS")
+            let modeStr = virtualDisplayManager.isActive ? "Virtual" : "Physical"
+            print("[Capture] Started (\(modeStr)): \(display.width)×\(display.height) @ 60 FPS")
 
         } catch {
             await MainActor.run {
@@ -284,6 +320,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
             print("[Capture] Stopped. Total frames: \(statsTracker.totalFrames)")
         }
+    }
+
+    /// Stop everything including virtual display
+    func stopAll() {
+        stopCapture()
+        virtualDisplayManager.destroyDisplay()
     }
 
     // ── Sender State Observer ───────────────────────────────────────────────
