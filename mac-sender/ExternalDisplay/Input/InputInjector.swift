@@ -14,6 +14,7 @@
 import Foundation
 import CoreGraphics
 import Carbon.HIToolbox
+import ApplicationServices
 
 final class InputInjector {
 
@@ -36,6 +37,9 @@ final class InputInjector {
     private var leftButtonDown = false
     private var rightButtonDown = false
 
+    /// Whether we have Accessibility permission
+    private var hasAccessibility = false
+
     // ── Event Source ────────────────────────────────────────────────────────
 
     private let eventSource: CGEventSource?
@@ -43,6 +47,20 @@ final class InputInjector {
     init() {
         eventSource = CGEventSource(stateID: .combinedSessionState)
         eventSource?.localEventsSuppressionInterval = 0.0
+
+        // Check Accessibility permission — required for CGEvent.post (clicks + keyboard)
+        // CGWarpMouseCursorPosition works without it (mouse movement only)
+        hasAccessibility = AXIsProcessTrusted()
+        if hasAccessibility {
+            print("[Input] ✅ Accessibility permission granted")
+        } else {
+            print("[Input] ⚠️ Accessibility NOT granted — clicks & keyboard will NOT work!")
+            print("[Input] → Go to: System Settings → Privacy & Security → Accessibility")
+            print("[Input] → Add this app, then RESTART the app")
+            // Show the system prompt to guide the user
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+        }
     }
 
     // ── Process Input Event ─────────────────────────────────────────────────
