@@ -51,12 +51,18 @@ final class ClipboardSync {
         guard !isActive else { return }
         isActive = true
 
-        // Record current pasteboard state (don't send whatever is already there)
-        lastChangeCount = NSPasteboard.general.changeCount
+        // Must run on main thread — NSPasteboard and Timer.scheduledTimer
+        // both require the main RunLoop
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
 
-        // Poll on main thread (NSPasteboard requires it)
-        pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.checkForChanges()
+            // Record current pasteboard state (don't send whatever is already there)
+            self.lastChangeCount = NSPasteboard.general.changeCount
+
+            // Poll on main thread (NSPasteboard requires it)
+            self.pollTimer = Timer.scheduledTimer(withTimeInterval: self.pollInterval, repeats: true) { [weak self] _ in
+                self?.checkForChanges()
+            }
         }
 
         print("[Clipboard] Monitoring started (poll interval: \(pollInterval)s)")
