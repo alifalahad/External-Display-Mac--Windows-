@@ -43,7 +43,7 @@ private:
 
     SendCallback m_sendCallback;
     uint32_t m_videoW = 0, m_videoH = 0;
-    bool m_enabled = true;  // Auto-enabled — F3 toggles off/on
+    bool m_enabled = false;
 
     // Mouse move throttle (max 120 events/sec)
     std::chrono::steady_clock::time_point m_lastMouseMove;

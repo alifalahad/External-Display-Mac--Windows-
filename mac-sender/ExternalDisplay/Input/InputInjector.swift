@@ -70,9 +70,18 @@ final class InputInjector {
 
     // ── Mouse Handling ──────────────────────────────────────────────────────
 
+    private var debugLogCounter: Int = 0
+
     private func handleMouseMove(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
         lastMousePos = point
+
+        // For virtual displays, CGEvent alone may not move the cursor.
+        // Use CGWarpMouseCursorPosition to force the cursor to the target display.
+        CGWarpMouseCursorPosition(point)
+
+        // Prevent macOS from suppressing events after warp
+        CGAssociateMouseAndMouseCursorPosition(1)
 
         let type: CGEventType = leftButtonDown ? .leftMouseDragged :
                                 rightButtonDown ? .rightMouseDragged : .mouseMoved
@@ -82,11 +91,19 @@ final class InputInjector {
                                    mouseCursorPosition: point,
                                    mouseButton: .left) else { return }
         event.post(tap: .cghidEventTap)
+
+        // Debug: log first few events and then every 100th
+        debugLogCounter += 1
+        if debugLogCounter <= 3 || debugLogCounter % 100 == 0 {
+            print("[Input] Mouse → (\(String(format: "%.0f", point.x)), \(String(format: "%.0f", point.y))) [norm: \(String(format: "%.3f", p.x)), \(String(format: "%.3f", p.y))]")
+        }
     }
 
     private func handleMouseDown(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
         lastMousePos = point
+        CGWarpMouseCursorPosition(point)
+        CGAssociateMouseAndMouseCursorPosition(1)
 
         let button = p.button
         if button == 0 {
@@ -118,6 +135,8 @@ final class InputInjector {
     private func handleMouseUp(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
         lastMousePos = point
+        CGWarpMouseCursorPosition(point)
+        CGAssociateMouseAndMouseCursorPosition(1)
 
         let button = p.button
         if button == 0 {
@@ -162,13 +181,17 @@ final class InputInjector {
     // ── Keyboard Handling ───────────────────────────────────────────────────
 
     private func handleKeyDown(_ p: InputEventPayload) {
-        guard let macKeyCode = windowsVKToMacKeyCode(p.keyCode) else { return }
+        guard let macKeyCode = windowsVKToMacKeyCode(p.keyCode) else {
+            print("[Input] Key down: VK=0x\(String(p.keyCode, radix: 16)) — unmapped")
+            return
+        }
 
         guard let event = CGEvent(keyboardEventSource: eventSource,
                                    virtualKey: CGKeyCode(macKeyCode),
                                    keyDown: true) else { return }
         applyModifiers(event, modifiers: p.modifiers)
         event.post(tap: .cghidEventTap)
+        print("[Input] Key down: VK=0x\(String(p.keyCode, radix: 16)) → mac=\(macKeyCode)")
     }
 
     private func handleKeyUp(_ p: InputEventPayload) {
