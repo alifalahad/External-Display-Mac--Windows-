@@ -13,6 +13,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Network/StreamReceiver.cpp
     src/Decoder/H264Decoder.cpp
     src/Input/InputCapture.cpp
+    src/Clipboard/ClipboardSync.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

@@ -21,6 +21,7 @@
 #include "Network/StreamReceiver.h"
 #include "Decoder/H264Decoder.h"
 #include "Input/InputCapture.h"
+#include "Clipboard/ClipboardSync.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -145,6 +146,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         std::unique_ptr<StreamReceiver> receiver;
         std::unique_ptr<H264Decoder> decoder;
         std::unique_ptr<InputCapture> inputCapture;
+        std::unique_ptr<ClipboardSync> clipboardSync;
 
         if (networkMode) {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -185,6 +187,21 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     if (receiver) receiver->sendInputEvent(evt);
                 });
             window.SetInputCapture(inputCapture.get());
+
+            // Set up clipboard sync
+            clipboardSync = std::make_unique<ClipboardSync>();
+            // Mac → Windows: clipboard data from network → set on Windows clipboard
+            receiver->setClipboardCallback(
+                [&clipboardSync](const std::string& text) {
+                    if (clipboardSync) clipboardSync->receiveRemoteClipboard(text);
+                });
+            // Windows → Mac: local clipboard changes → send over network
+            clipboardSync->setClipboardCallback(
+                [&receiver](const std::string& text) {
+                    if (receiver) receiver->sendClipboardData(text);
+                });
+            clipboardSync->start(GetModuleHandle(nullptr));
+
             printf("Controls: ESC=quit, F11=fullscreen, F2=stats, F3=toggle input\n\n");
         }
 
@@ -254,6 +271,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 }
             }
 
+            // Poll clipboard sync (processes hidden window messages)
+            if (clipboardSync) {
+                clipboardSync->poll();
+            }
+
             // Render
             auto now = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(now - startTime).count();
@@ -294,6 +316,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             }
         }
 
+        if (clipboardSync) clipboardSync->stop();
         if (receiver) receiver->disconnect();
         if (decoder) decoder->shutdown();
         wprintf(L"\nFinal: %s\n", stats.FormatStats().c_str());

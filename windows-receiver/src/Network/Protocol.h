@@ -41,6 +41,7 @@ enum class MessageType : uint8_t {
     KeyframeReq   = 0x30,
     QualityReport = 0x50,
     InputEvent    = 0x60,
+    ClipboardData = 0x70,
     Disconnect    = 0xFF,
 
     // Data (UDP)

@@ -38,6 +38,7 @@ enum MessageType: UInt8 {
     case keyframeReq    = 0x30   // Win → Mac: request I-frame
     case qualityReport  = 0x50   // Win → Mac: network health report
     case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
+    case clipboardData  = 0x70   // Both: clipboard text sync
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)

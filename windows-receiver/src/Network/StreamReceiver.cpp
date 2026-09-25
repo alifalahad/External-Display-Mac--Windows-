@@ -119,6 +119,12 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                     std::cout << "[Net] Disconnect received" << std::endl;
                     m_running.store(false);
                     break;
+                case exdp::MessageType::ClipboardData:
+                    if (m_clipboardCallback && !payload.empty()) {
+                        std::string text(payload.begin(), payload.end());
+                        m_clipboardCallback(text);
+                    }
+                    break;
                 default:
                     break;
             }

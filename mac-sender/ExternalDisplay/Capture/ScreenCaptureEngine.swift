@@ -64,6 +64,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Input injector — forwards mouse/keyboard from Windows to Mac
     private var inputInjector: InputInjector?
 
+    /// Clipboard sync — bidirectional clipboard between Mac and Windows
+    private var clipboardSync: ClipboardSync?
+
     // ── Encoder Control ─────────────────────────────────────────────────────
 
     /// Start the H.264 encoder with the given resolution
@@ -125,10 +128,24 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
 
             encoder = enc
+
+            // Set up clipboard sync
+            let clipboard = ClipboardSync()
+            clipboard.onClipboardChanged = { [weak self] data in
+                self?.sender.sendClipboardData(data)
+            }
+            sender.onClipboardData = { [weak clipboard] data in
+                DispatchQueue.main.async {
+                    clipboard?.receiveRemoteClipboard(data)
+                }
+            }
+            clipboard.start()
+            clipboardSync = clipboard
+
             DispatchQueue.main.async { [weak self] in
                 self?.isEncoding = true
             }
-            print("[Engine] Encoder started with adaptive quality + input forwarding")
+            print("[Engine] Encoder started with adaptive quality + input forwarding + clipboard sync")
         } catch {
             DispatchQueue.main.async { [weak self] in
                 self?.errorMessage = "Encoder error: \(error.localizedDescription)"
@@ -143,8 +160,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         encoder = nil
         qualityController = nil
         inputInjector = nil
+        clipboardSync?.stop()
+        clipboardSync = nil
         sender.onQualityReport = nil
         sender.onInputEvent = nil
+        sender.onClipboardData = nil
         DispatchQueue.main.async { [weak self] in
             self?.isEncoding = false
             self?.encoderStats = EncoderStats()

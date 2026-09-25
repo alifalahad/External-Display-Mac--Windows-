@@ -95,6 +95,21 @@ public:
         }
     }
 
+    // ── Clipboard Sync ──────────────────────────────────────────────────────
+
+    using ClipboardCallback = std::function<void(const std::string& utf8Text)>;
+
+    /// Set callback for clipboard data received from Mac
+    void setClipboardCallback(ClipboardCallback cb) { m_clipboardCallback = std::move(cb); }
+
+    /// Send clipboard text to the Mac sender
+    void sendClipboardData(const std::string& utf8Text) {
+        if (m_state.load() == State::Streaming && !utf8Text.empty()) {
+            tcpSendMessage(exdp::MessageType::ClipboardData,
+                           utf8Text.data(), static_cast<uint32_t>(utf8Text.size()));
+        }
+    }
+
 private:
     // ── Network Thread ──────────────────────────────────────────────────────
 
@@ -135,6 +150,7 @@ private:
 
     FrameCallback m_frameCallback;
     StreamInfoCallback m_streamInfoCallback;
+    ClipboardCallback m_clipboardCallback;
 
     uint32_t m_sequence = 0;
 

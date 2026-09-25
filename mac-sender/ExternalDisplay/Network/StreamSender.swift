@@ -87,6 +87,9 @@ final class StreamSender: ObservableObject {
     /// Called when an input event is received from the Windows receiver
     var onInputEvent: ((InputEventPayload) -> Void)?
 
+    /// Called when clipboard data is received from the Windows receiver
+    var onClipboardData: ((Data) -> Void)?
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Start listening for incoming connections
@@ -272,6 +275,8 @@ final class StreamSender: ObservableObject {
             handleQualityReport(payload)
         case .inputEvent:
             handleInputEvent(payload)
+        case .clipboardData:
+            handleClipboardData(payload)
         case .disconnect:
             handleDisconnect(for: connection)
         default:
@@ -292,6 +297,11 @@ final class StreamSender: ObservableObject {
             return
         }
         onQualityReport?(report)
+    }
+
+    private func handleClipboardData(_ payload: Data) {
+        guard !payload.isEmpty else { return }
+        onClipboardData?(payload)
     }
 
     private func handleHello(_ payload: Data) {
@@ -523,5 +533,13 @@ final class StreamSender: ObservableObject {
     private func nextSequence() -> UInt32 {
         sequenceNumber += 1
         return sequenceNumber
+    }
+
+    // ── Clipboard ───────────────────────────────────────────────────────────
+
+    /// Send clipboard text data to the Windows receiver
+    func sendClipboardData(_ data: Data) {
+        guard state.isStreaming else { return }
+        sendControlMessage(type: .clipboardData, payload: data)
     }
 }
