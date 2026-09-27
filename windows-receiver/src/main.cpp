@@ -2,12 +2,12 @@
 // main.cpp — External Display Receiver Entry Point
 // =============================================================================
 // Creates a fullscreen borderless D3D11 window and either:
-//   - Shows test pattern (no args)
-//   - Connects to Mac sender and displays live video (with IP arg)
+//   - Auto-discovers Mac sender via mDNS (no args)
+//   - Connects to Mac sender at given IP (with IP arg)
 //
 // Usage:
-//   ExternalDisplayReceiver.exe              → test pattern mode
-//   ExternalDisplayReceiver.exe 192.168.1.5  → connect to Mac sender
+//   ExternalDisplayReceiver.exe              → auto-discover Mac sender
+//   ExternalDisplayReceiver.exe 192.168.1.5  → connect to Mac sender directly
 //
 // Controls:
 //   ESC  — Exit
@@ -22,6 +22,7 @@
 #include "Decoder/H264Decoder.h"
 #include "Input/InputCapture.h"
 #include "Clipboard/ClipboardSync.h"
+#include "Discovery/ServiceDiscovery.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -122,6 +123,104 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         while (!macIP.empty() && macIP.back() == ' ') macIP.pop_back();
         while (!macIP.empty() && macIP.front() == ' ') macIP.erase(macIP.begin());
     }
+
+    // ── Auto-Discovery Mode ─────────────────────────────────────────────
+    // If no IP is provided, discover Mac senders on the LAN via mDNS
+    if (macIP.empty()) {
+        printf("=== External Display Receiver — Auto-Discovery ===\n");
+        printf("Searching for Mac senders on the local network...\n\n");
+
+        // Initialize Winsock for discovery
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+        ServiceDiscovery discovery;
+        std::mutex discoveryMutex;
+        std::vector<DiscoveredService> foundServices;
+
+        discovery.setDiscoveryCallback(
+            [&discoveryMutex, &foundServices](const DiscoveredService& svc) {
+                std::lock_guard<std::mutex> lock(discoveryMutex);
+                // Update or add
+                bool found = false;
+                for (auto& existing : foundServices) {
+                    if (existing.name == svc.name) {
+                        existing = svc;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) foundServices.push_back(svc);
+            });
+
+        discovery.startBrowsing();
+
+        // Wait up to 10 seconds for services to appear, checking every second
+        printf("Waiting for Mac senders to respond...\n");
+        for (int i = 0; i < 10; i++) {
+            Sleep(1000);
+            std::lock_guard<std::mutex> lock(discoveryMutex);
+            if (!foundServices.empty()) {
+                // Found at least one — wait 2 more seconds for others
+                printf("Found %zu sender(s), waiting for more...\n", foundServices.size());
+                Sleep(2000);
+                break;
+            }
+            printf("  Searching... (%d/10s)\n", i + 1);
+        }
+
+        discovery.stopBrowsing();
+
+        {
+            std::lock_guard<std::mutex> lock(discoveryMutex);
+            if (foundServices.empty()) {
+                printf("\nNo Mac senders found on the network.\n");
+                printf("Make sure:\n");
+                printf("  1. The Mac sender app is running and capture is started\n");
+                printf("  2. Both devices are on the same Wi-Fi network\n");
+                printf("  3. Firewall is not blocking mDNS (port 5353)\n");
+                printf("\nYou can also pass the Mac's IP address directly:\n");
+                printf("  ExternalDisplayReceiver.exe 192.168.1.x\n\n");
+                printf("Press Enter to exit...\n");
+                getchar();
+                WSACleanup();
+                CleanupConsole();
+                return 0;
+            }
+
+            if (foundServices.size() == 1) {
+                // Auto-select the only sender
+                macIP = foundServices[0].ipAddress;
+                printf("\nAuto-connecting to: %s (%s)\n\n",
+                    foundServices[0].name.c_str(), macIP.c_str());
+            } else {
+                // Multiple senders — let user choose
+                printf("\n═══════════════════════════════════════════════════\n");
+                printf("  Discovered Mac Senders:\n");
+                printf("═══════════════════════════════════════════════════\n");
+                for (size_t i = 0; i < foundServices.size(); i++) {
+                    printf("  [%zu] %s\n", i + 1, foundServices[i].name.c_str());
+                    printf("      IP: %s  Port: %u\n",
+                        foundServices[i].ipAddress.c_str(),
+                        foundServices[i].port);
+                }
+                printf("═══════════════════════════════════════════════════\n");
+                printf("\nSelect sender (1-%zu): ", foundServices.size());
+
+                int choice = 0;
+                if (scanf_s("%d", &choice) != 1 || choice < 1 || choice > (int)foundServices.size()) {
+                    printf("Invalid selection. Using first sender.\n");
+                    choice = 1;
+                }
+                macIP = foundServices[choice - 1].ipAddress;
+                printf("\nConnecting to: %s (%s)\n\n",
+                    foundServices[choice - 1].name.c_str(), macIP.c_str());
+            }
+        }
+
+        WSACleanup(); // StreamReceiver will re-init Winsock
+    }
+
     bool networkMode = !macIP.empty();
 
     try {

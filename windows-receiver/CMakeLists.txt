@@ -14,6 +14,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Decoder/H264Decoder.cpp
     src/Input/InputCapture.cpp
     src/Clipboard/ClipboardSync.cpp
+    src/Discovery/ServiceDiscovery.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
