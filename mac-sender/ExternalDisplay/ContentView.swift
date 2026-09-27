@@ -353,6 +353,43 @@ struct ContentView: View {
                     Spacer()
                 }
             }
+
+            // Row 4: Pairing PIN display
+            if let pin = engine.pairingManager.currentPIN {
+                HStack(spacing: 12) {
+                    Image(systemName: "key.fill")
+                        .foregroundStyle(.yellow)
+                        .font(.title3)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Pairing PIN")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+
+                        Text(pin)
+                            .font(.system(.title, design: .monospaced, weight: .bold))
+                            .foregroundStyle(.yellow)
+                    }
+
+                    if let deviceName = engine.pairingManager.pairingDeviceName {
+                        Text("for \(deviceName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+                }
+                .padding(.vertical, 6)
+                .padding(.horizontal, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(.yellow.opacity(0.1))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(.yellow.opacity(0.3), lineWidth: 1)
+                        )
+                )
+            }
         }
     }
 

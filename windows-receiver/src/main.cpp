@@ -23,6 +23,7 @@
 #include "Input/InputCapture.h"
 #include "Clipboard/ClipboardSync.h"
 #include "Discovery/ServiceDiscovery.h"
+#include "Security/PairingManager.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -34,15 +35,18 @@
 
 // Console helpers
 static FILE* gConsoleFile = nullptr;
+static FILE* gConsoleInput = nullptr;
 static void InitConsole() {
     if (AllocConsole()) {
         freopen_s(&gConsoleFile, "CONOUT$", "w", stdout);
         freopen_s(&gConsoleFile, "CONOUT$", "w", stderr);
+        freopen_s(&gConsoleInput, "CONIN$", "r", stdin);  // Enable console input for PIN entry
         SetConsoleTitleW(L"External Display Receiver - Stats");
     }
 }
 static void CleanupConsole() {
     if (gConsoleFile) { fclose(gConsoleFile); gConsoleFile = nullptr; }
+    if (gConsoleInput) { fclose(gConsoleInput); gConsoleInput = nullptr; }
     FreeConsole();
 }
 
@@ -275,6 +279,32 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                    int stride, uint32_t w, uint32_t h) {
                     QueueNV12Frame(yData, uvData, stride, w, h);
                 });
+
+            // Set up pairing manager for secure authentication
+            PairingManager pairingMgr;
+            pairingMgr.initialize();
+            pairingMgr.setPINRequestCallback([](std::string& outPIN) -> bool {
+                printf("\n");
+                printf("==========================================================\n");
+                printf("  PAIRING REQUIRED\n");
+                printf("  Look at the Mac app for a 6-digit PIN\n");
+                printf("==========================================================\n");
+                printf("  Enter PIN: ");
+                fflush(stdout);
+
+                char buf[32];
+                if (fgets(buf, sizeof(buf), stdin)) {
+                    outPIN = buf;
+                    // Remove trailing newline/whitespace
+                    while (!outPIN.empty() && (outPIN.back() == '\n' || outPIN.back() == '\r' || outPIN.back() == ' '))
+                        outPIN.pop_back();
+                    printf("==========================================================\n\n");
+                    return true;
+                }
+                return false;
+            });
+
+            receiver->setPairingManager(&pairingMgr);
 
             if (!receiver->connect(macIP))
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());

@@ -90,6 +90,13 @@ final class StreamSender: ObservableObject {
     /// Called when clipboard data is received from the Windows receiver
     var onClipboardData: ((Data) -> Void)?
 
+    /// Pairing manager for secure authentication
+    var pairingManager: PairingManager?
+
+    // Pairing state for the current connection
+    private var pendingDeviceId: String?
+    private var pendingDeviceName: String?
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Start listening for incoming connections
@@ -277,6 +284,8 @@ final class StreamSender: ObservableObject {
             handleInputEvent(payload)
         case .clipboardData:
             handleClipboardData(payload)
+        case .pairResponse:
+            handlePairResponse(payload)
         case .disconnect:
             handleDisconnect(for: connection)
         default:
@@ -310,15 +319,90 @@ final class StreamSender: ObservableObject {
             return
         }
 
-        print("[Net] HELLO from: \(hello.receiverName), UDP port: \(hello.udpPort)")
+        print("[Net] HELLO from: \(hello.receiverName), UDP port: \(hello.udpPort), device: \(hello.deviceId.prefix(16))")
         remoteUDPPort = hello.udpPort
 
-        // Send WELCOME back
-        let welcomePayload = Data()  // Empty for now — display info sent in START_STREAM
-        sendControlMessage(type: .welcome, payload: welcomePayload)
+        // Store pending connection info for pairing
+        pendingDeviceId = hello.deviceId
+        pendingDeviceName = hello.receiverName
+
+        // Check pairing status
+        if let pm = pairingManager, !hello.deviceId.isEmpty {
+            if pm.isPaired(deviceId: hello.deviceId) {
+                // Already paired — send HMAC challenge
+                let nonce = pm.generateNonce()
+                var challenge = PairChallengePayload()
+                challenge.type = PairChallengeType.hmac.rawValue
+                challenge.nonce = nonce
+                sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
+                print("[Pairing] Sent HMAC challenge to '\(hello.receiverName)'")
+            } else {
+                // Not paired — generate PIN and show in UI
+                let pin = pm.generatePIN(forDevice: hello.receiverName)
+                var challenge = PairChallengePayload()
+                challenge.type = PairChallengeType.pin.rawValue
+                challenge.nonce = Data(repeating: 0, count: 32)  // unused for PIN
+                sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
+                print("[Pairing] Sent PIN challenge to '\(hello.receiverName)' — PIN: \(pin)")
+            }
+        } else {
+            // No pairing manager — skip pairing (backward compat)
+            let welcomePayload = Data()
+            sendControlMessage(type: .welcome, payload: welcomePayload)
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.state = .connected(hello.receiverName)
+        }
+    }
+
+    /// Handle pairing response from Windows (PIN or HMAC)
+    private func handlePairResponse(_ payload: Data) {
+        guard let response = PairResponsePayload.deserialize(from: payload),
+              let pm = pairingManager,
+              let deviceId = pendingDeviceId else {
+            print("[Pairing] Invalid pair response")
+            sendControlMessage(type: .pairReject, payload: Data())
+            return
+        }
+
+        let deviceName = pendingDeviceName ?? "Unknown"
+
+        if response.type == PairChallengeType.pin.rawValue {
+            // Validate PIN
+            let enteredPIN = response.pinString
+            if let pairingKey = pm.validatePIN(enteredPIN, deviceId: deviceId, deviceName: deviceName) {
+                // Send PAIR_ACCEPT with the pairing key
+                var accept = PairAcceptPayload()
+                accept.newlyPaired = 1
+                accept.pairingKey = pairingKey
+                sendControlMessage(type: .pairAccept, payload: accept.serialize())
+
+                // Now send WELCOME to proceed
+                sendControlMessage(type: .welcome, payload: Data())
+                print("[Pairing] ✅ PIN accepted — paired with '\(deviceName)'")
+            } else {
+                sendControlMessage(type: .pairReject, payload: Data())
+                print("[Pairing] ❌ PIN rejected from '\(deviceName)'")
+            }
+
+        } else if response.type == PairChallengeType.hmac.rawValue {
+            // Validate HMAC
+            let hmacData = response.data_
+            if pm.validateHMAC(deviceId: deviceId, receivedHMAC: hmacData) {
+                // Send PAIR_ACCEPT (no key since already paired)
+                var accept = PairAcceptPayload()
+                accept.newlyPaired = 0
+                accept.pairingKey = Data(repeating: 0, count: 32)
+                sendControlMessage(type: .pairAccept, payload: accept.serialize())
+
+                // Now send WELCOME to proceed
+                sendControlMessage(type: .welcome, payload: Data())
+                print("[Pairing] ✅ HMAC verified — auto-authenticated '\(deviceName)'")
+            } else {
+                sendControlMessage(type: .pairReject, payload: Data())
+                print("[Pairing] ❌ HMAC failed from '\(deviceName)'")
+            }
         }
     }
 

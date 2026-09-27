@@ -15,6 +15,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Input/InputCapture.cpp
     src/Clipboard/ClipboardSync.cpp
     src/Discovery/ServiceDiscovery.cpp
+    src/Security/PairingManager.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -32,6 +33,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     mfplat
     mfuuid
     ole32
+    bcrypt
 )
 
 # Enable UNICODE

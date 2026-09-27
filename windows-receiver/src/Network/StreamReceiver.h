@@ -15,6 +15,7 @@
 #pragma once
 
 #include "Protocol.h"
+#include "../Security/PairingManager.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <functional>
@@ -70,6 +71,9 @@ public:
 
     /// Enable/disable auto-reconnect on connection loss (default: enabled)
     void enableAutoReconnect(bool enable) { m_autoReconnect.store(enable); }
+
+    /// Set pairing manager for secure authentication
+    void setPairingManager(PairingManager* pm) { m_pairingManager = pm; }
 
     // ── Stats ───────────────────────────────────────────────────────────────
 
@@ -136,11 +140,18 @@ private:
                              const uint8_t* data, size_t dataLen);
     void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe);
 
+    /// Handle pairing messages
+    void handlePairChallenge(const std::vector<uint8_t>& payload);
+    void handlePairAccept(const std::vector<uint8_t>& payload);
+    void handlePairReject();
+
     // ── State ───────────────────────────────────────────────────────────────
 
     std::atomic<State> m_state{State::Disconnected};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_autoReconnect{true};
+
+    PairingManager* m_pairingManager = nullptr;  // Not owned
 
     SOCKET m_tcpSocket = INVALID_SOCKET;
     SOCKET m_udpSocket = INVALID_SOCKET;

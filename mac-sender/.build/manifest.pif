@@ -5,11 +5,11 @@
       "name" : "ExternalDisplay",
       "path" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender",
       "projects" : [
-        "c67df3bbcbf738f5ed2b97cdbd0445ef67aafab4dcc30ea09dab65a727569d4f",
+        "8cce8d9087bda9553c5947223100b2e9d8df469de25133691559e41fe4abf74a",
         "db074465ebfe16ce1825fdb1fc3d2e5e00b366f4a28e8df183e5d847b0e96ccf"
       ]
     },
-    "signature" : "6102b8960d90bbaf57ca66cffabe7d11a82ff53489bad23d9fe99bb53cea45b6",
+    "signature" : "85bf40f5e1303117abbb44bafeeab631af1f7c789da020cfe7327672beaf9513",
     "type" : "workspace"
   },
   {
@@ -209,6 +209,14 @@
               {
                 "fileType" : "sourcecode.swift",
                 "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_1",
+                "name" : "Clipboard/ClipboardSync.swift",
+                "path" : "Clipboard/ClipboardSync.swift",
+                "sourceTree" : "<group>",
+                "type" : "file"
+              },
+              {
+                "fileType" : "sourcecode.swift",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_2",
                 "name" : "ContentView.swift",
                 "path" : "ContentView.swift",
                 "sourceTree" : "<group>",
@@ -216,7 +224,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_2",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_3",
                 "name" : "Display/VirtualDisplayManager.swift",
                 "path" : "Display/VirtualDisplayManager.swift",
                 "sourceTree" : "<group>",
@@ -224,7 +232,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_3",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_4",
                 "name" : "Encoder/AdaptiveQuality.swift",
                 "path" : "Encoder/AdaptiveQuality.swift",
                 "sourceTree" : "<group>",
@@ -232,7 +240,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_4",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_5",
                 "name" : "Encoder/EncoderConfig.swift",
                 "path" : "Encoder/EncoderConfig.swift",
                 "sourceTree" : "<group>",
@@ -240,7 +248,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_5",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_6",
                 "name" : "Encoder/H264Converter.swift",
                 "path" : "Encoder/H264Converter.swift",
                 "sourceTree" : "<group>",
@@ -248,7 +256,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_6",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_7",
                 "name" : "Encoder/VideoEncoder.swift",
                 "path" : "Encoder/VideoEncoder.swift",
                 "sourceTree" : "<group>",
@@ -256,7 +264,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_7",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_8",
                 "name" : "ExternalDisplayApp.swift",
                 "path" : "ExternalDisplayApp.swift",
                 "sourceTree" : "<group>",
@@ -264,7 +272,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_8",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_9",
                 "name" : "Input/InputInjector.swift",
                 "path" : "Input/InputInjector.swift",
                 "sourceTree" : "<group>",
@@ -272,7 +280,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_9",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_10",
                 "name" : "Network/Protocol.swift",
                 "path" : "Network/Protocol.swift",
                 "sourceTree" : "<group>",
@@ -280,7 +288,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_10",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_11",
                 "name" : "Network/StreamSender.swift",
                 "path" : "Network/StreamSender.swift",
                 "sourceTree" : "<group>",
@@ -288,9 +296,17 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_11",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_12",
                 "name" : "Performance/CaptureStats.swift",
                 "path" : "Performance/CaptureStats.swift",
+                "sourceTree" : "<group>",
+                "type" : "file"
+              },
+              {
+                "fileType" : "sourcecode.swift",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_13",
+                "name" : "Security/PairingManager.swift",
+                "path" : "Security/PairingManager.swift",
                 "sourceTree" : "<group>",
                 "type" : "file"
               }
@@ -314,6 +330,14 @@
               {
                 "fileType" : "sourcecode.swift",
                 "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_1",
+                "name" : "Clipboard/ClipboardSync.swift",
+                "path" : "Clipboard/ClipboardSync.swift",
+                "sourceTree" : "<group>",
+                "type" : "file"
+              },
+              {
+                "fileType" : "sourcecode.swift",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_2",
                 "name" : "ContentView.swift",
                 "path" : "ContentView.swift",
                 "sourceTree" : "<group>",
@@ -321,7 +345,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_2",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_3",
                 "name" : "Display/VirtualDisplayManager.swift",
                 "path" : "Display/VirtualDisplayManager.swift",
                 "sourceTree" : "<group>",
@@ -329,7 +353,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_3",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_4",
                 "name" : "Encoder/AdaptiveQuality.swift",
                 "path" : "Encoder/AdaptiveQuality.swift",
                 "sourceTree" : "<group>",
@@ -337,7 +361,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_4",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_5",
                 "name" : "Encoder/EncoderConfig.swift",
                 "path" : "Encoder/EncoderConfig.swift",
                 "sourceTree" : "<group>",
@@ -345,7 +369,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_5",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_6",
                 "name" : "Encoder/H264Converter.swift",
                 "path" : "Encoder/H264Converter.swift",
                 "sourceTree" : "<group>",
@@ -353,7 +377,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_6",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_7",
                 "name" : "Encoder/VideoEncoder.swift",
                 "path" : "Encoder/VideoEncoder.swift",
                 "sourceTree" : "<group>",
@@ -361,7 +385,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_7",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_8",
                 "name" : "ExternalDisplayApp.swift",
                 "path" : "ExternalDisplayApp.swift",
                 "sourceTree" : "<group>",
@@ -369,7 +393,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_8",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_9",
                 "name" : "Input/InputInjector.swift",
                 "path" : "Input/InputInjector.swift",
                 "sourceTree" : "<group>",
@@ -377,7 +401,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_9",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_10",
                 "name" : "Network/Protocol.swift",
                 "path" : "Network/Protocol.swift",
                 "sourceTree" : "<group>",
@@ -385,7 +409,7 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_10",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_11",
                 "name" : "Network/StreamSender.swift",
                 "path" : "Network/StreamSender.swift",
                 "sourceTree" : "<group>",
@@ -393,9 +417,17 @@
               },
               {
                 "fileType" : "sourcecode.swift",
-                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_11",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_12",
                 "name" : "Performance/CaptureStats.swift",
                 "path" : "Performance/CaptureStats.swift",
+                "sourceTree" : "<group>",
+                "type" : "file"
+              },
+              {
+                "fileType" : "sourcecode.swift",
+                "guid" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_13",
+                "name" : "Security/PairingManager.swift",
+                "path" : "Security/PairingManager.swift",
                 "sourceTree" : "<group>",
                 "type" : "file"
               }
@@ -419,12 +451,12 @@
       "projectIsPackage" : "true",
       "projectName" : "ExternalDisplay",
       "targets" : [
-        "5f9f0e63f41f1c11586d6220b888c5d9575f987cca2c8946d4fbb33646b573cc",
-        "0f0a391212e0c430c14115ea4be48d06c70fd7614632e9032cd1e844c5b41bab",
+        "fe2d9b3279250884da165ff76c81e2071865f3454a61c12321a605c5c9e75e70",
+        "8bd1fa4e5241656617bfb02c62a9c20bde148968337c6203719c491e781a37bd",
         "07c159a577dde340dc804da22165bc8d32dcd1f3a0eddd7182a0c25652e5cba0"
       ]
     },
-    "signature" : "c67df3bbcbf738f5ed2b97cdbd0445ef67aafab4dcc30ea09dab65a727569d4f",
+    "signature" : "8cce8d9087bda9553c5947223100b2e9d8df469de25133691559e41fe4abf74a",
     "type" : "project"
   },
   {
@@ -636,6 +668,24 @@
 
               ],
               "removeHeadersOnCopy" : "false"
+            },
+            {
+              "codeSignOnCopy" : "false",
+              "fileReference" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_12",
+              "guid" : "PACKAGE-PRODUCT:mac-sender_ExternalDisplay.ExternalDisplay::BUILDPHASE_0::12",
+              "platformFilters" : [
+
+              ],
+              "removeHeadersOnCopy" : "false"
+            },
+            {
+              "codeSignOnCopy" : "false",
+              "fileReference" : "PACKAGE:mac-sender::MAINGROUP::REF_2::REF_13",
+              "guid" : "PACKAGE-PRODUCT:mac-sender_ExternalDisplay.ExternalDisplay::BUILDPHASE_0::13",
+              "platformFilters" : [
+
+              ],
+              "removeHeadersOnCopy" : "false"
             }
           ],
           "guid" : "PACKAGE-PRODUCT:mac-sender_ExternalDisplay.ExternalDisplay::BUILDPHASE_0",
@@ -661,7 +711,7 @@
       "productTypeIdentifier" : "com.apple.product-type.tool",
       "type" : "standard"
     },
-    "signature" : "5f9f0e63f41f1c11586d6220b888c5d9575f987cca2c8946d4fbb33646b573cc",
+    "signature" : "fe2d9b3279250884da165ff76c81e2071865f3454a61c12321a605c5c9e75e70",
     "type" : "target"
   },
   {
@@ -904,6 +954,24 @@
 
               ],
               "removeHeadersOnCopy" : "false"
+            },
+            {
+              "codeSignOnCopy" : "false",
+              "fileReference" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_12",
+              "guid" : "PACKAGE-TARGET:ExternalDisplay--1B4423B7936A2BD8-testable::BUILDPHASE_0::12",
+              "platformFilters" : [
+
+              ],
+              "removeHeadersOnCopy" : "false"
+            },
+            {
+              "codeSignOnCopy" : "false",
+              "fileReference" : "PACKAGE:mac-sender::MAINGROUP::REF_3::REF_13",
+              "guid" : "PACKAGE-TARGET:ExternalDisplay--1B4423B7936A2BD8-testable::BUILDPHASE_0::13",
+              "platformFilters" : [
+
+              ],
+              "removeHeadersOnCopy" : "false"
             }
           ],
           "guid" : "PACKAGE-TARGET:ExternalDisplay--1B4423B7936A2BD8-testable::BUILDPHASE_0",
@@ -929,7 +997,7 @@
       "productTypeIdentifier" : "org.swift.product-type.common.object",
       "type" : "standard"
     },
-    "signature" : "0f0a391212e0c430c14115ea4be48d06c70fd7614632e9032cd1e844c5b41bab",
+    "signature" : "8bd1fa4e5241656617bfb02c62a9c20bde148968337c6203719c491e781a37bd",
     "type" : "target"
   },
   {

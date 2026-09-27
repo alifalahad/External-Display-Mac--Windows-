@@ -38,6 +38,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Virtual display manager — creates a second display on macOS
     let virtualDisplayManager = VirtualDisplayManager()
 
+    /// Pairing manager — handles secure device authentication
+    let pairingManager = PairingManager()
+
     // ── Internals ───────────────────────────────────────────────────────────
 
     private var stream: SCStream?
@@ -89,6 +92,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Configure sender with stream parameters
             sender.streamWidth = UInt32(width)
             sender.streamHeight = UInt32(height)
+
+            // Wire pairing manager for secure authentication
+            sender.pairingManager = pairingManager
 
             // Set up adaptive quality controller
             let controller = AdaptiveQualityController()

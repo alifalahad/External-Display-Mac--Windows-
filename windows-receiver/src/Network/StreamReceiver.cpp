@@ -74,12 +74,16 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         }
         std::cout << "[Net] UDP bound on port " << exdp::UDP_PORT << std::endl;
 
-        // Step 3: Send HELLO
+        // Step 3: Send HELLO (with device ID for pairing)
         exdp::HelloPayload hello{};
         strncpy_s(hello.receiverName, "Windows Receiver", sizeof(hello.receiverName) - 1);
         hello.udpPort = exdp::UDP_PORT;
+        if (m_pairingManager) {
+            strncpy_s(hello.deviceId, m_pairingManager->getDeviceId().c_str(),
+                      sizeof(hello.deviceId) - 1);
+        }
         tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
-        std::cout << "[Net] HELLO sent" << std::endl;
+        std::cout << "[Net] HELLO sent (device: " << (m_pairingManager ? m_pairingManager->getDeviceId().substr(0, 16) : "none") << "...)" << std::endl;
 
         m_state.store(State::Connected);
         m_lastQualityReport = std::chrono::steady_clock::now();
@@ -124,6 +128,15 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                         std::string text(payload.begin(), payload.end());
                         m_clipboardCallback(text);
                     }
+                    break;
+                case exdp::MessageType::PairChallenge:
+                    handlePairChallenge(payload);
+                    break;
+                case exdp::MessageType::PairAccept:
+                    handlePairAccept(payload);
+                    break;
+                case exdp::MessageType::PairReject:
+                    handlePairReject();
                     break;
                 default:
                     break;
@@ -472,4 +485,76 @@ void StreamReceiver::sendQualityReport() {
     m_prevFramesReceived = currentStats.framesReceived;
     m_prevFramesDropped = currentStats.framesDropped;
     m_prevPacketsReceived = currentStats.packetsReceived;
+}
+
+// ── Pairing Handlers ───────────────────────────────────────────────────────────
+
+void StreamReceiver::handlePairChallenge(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::PairChallengePayload)) return;
+
+    exdp::PairChallengePayload challenge;
+    memcpy(&challenge, payload.data(), sizeof(challenge));
+
+    if (challenge.type == exdp::PAIR_PIN) {
+        // First-time pairing — need to get PIN from user
+        std::cout << "[Pairing] PIN required for first-time pairing" << std::endl;
+
+        std::string pin;
+        if (m_pairingManager && m_pairingManager->requestPIN(pin)) {
+            // Send PIN response
+            exdp::PairResponsePayload response{};
+            response.type = exdp::PAIR_PIN;
+            strncpy_s((char*)response.data, sizeof(response.data),
+                      pin.c_str(), sizeof(response.data) - 1);
+            tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
+            std::cout << "[Pairing] PIN sent" << std::endl;
+        } else {
+            std::cerr << "[Pairing] Failed to get PIN from user" << std::endl;
+        }
+
+    } else if (challenge.type == exdp::PAIR_HMAC) {
+        // Already paired — compute HMAC response
+        std::cout << "[Pairing] HMAC challenge received (auto-authenticating)" << std::endl;
+
+        if (m_pairingManager && m_pairingManager->isPaired()) {
+            exdp::PairResponsePayload response{};
+            response.type = exdp::PAIR_HMAC;
+            if (m_pairingManager->computeHMAC(challenge.nonce, 32, response.data)) {
+                tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
+                std::cout << "[Pairing] HMAC response sent" << std::endl;
+            } else {
+                std::cerr << "[Pairing] HMAC computation failed" << std::endl;
+            }
+        } else {
+            std::cerr << "[Pairing] Server expects paired device but we have no key" << std::endl;
+            // Server will send PairReject, we'll reconnect and be treated as new device
+        }
+    }
+}
+
+void StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::PairAcceptPayload)) return;
+
+    exdp::PairAcceptPayload accept;
+    memcpy(&accept, payload.data(), sizeof(accept));
+
+    if (accept.newlyPaired && m_pairingManager) {
+        // Save the new pairing key
+        m_pairingManager->savePairing("Mac Sender", accept.pairingKey, 32);
+        std::cout << "[Pairing] \xe2\x9c\x85 Paired successfully!" << std::endl;
+    } else {
+        std::cout << "[Pairing] \xe2\x9c\x85 Auto-authenticated" << std::endl;
+    }
+}
+
+void StreamReceiver::handlePairReject() {
+    std::cerr << "[Pairing] \xe2\x9d\x8c Pairing rejected by Mac" << std::endl;
+
+    // Clear any stored pairing that might be invalid
+    if (m_pairingManager) {
+        m_pairingManager->clearPairing();
+    }
+
+    // Disconnect — user needs to retry
+    m_running.store(false);
 }

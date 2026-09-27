@@ -42,6 +42,10 @@ enum class MessageType : uint8_t {
     QualityReport = 0x50,
     InputEvent    = 0x60,
     ClipboardData = 0x70,
+    PairChallenge = 0x80,
+    PairResponse  = 0x81,
+    PairAccept    = 0x82,
+    PairReject    = 0x83,
     Disconnect    = 0xFF,
 
     // Data (UDP)
@@ -85,6 +89,7 @@ static_assert(sizeof(FragmentHeader) == 8, "Fragment header must be 8 bytes");
 struct HelloPayload {
     char     receiverName[64] = {};  // Null-terminated UTF-8
     uint16_t udpPort = UDP_PORT;
+    char     deviceId[64] = {};      // Unique device identifier for pairing
 };
 
 // ── START_STREAM payload (20 bytes) ─────────────────────────────────────────
@@ -137,6 +142,37 @@ struct InputEventPayload {
     float    scrollDeltaY = 0; // Vertical scroll
 };
 static_assert(sizeof(InputEventPayload) == 24, "InputEventPayload must be 24 bytes");
+
+// ── Pairing Payloads ────────────────────────────────────────────────────────────
+
+enum PairChallengeType : uint8_t {
+    PAIR_PIN  = 0,   // First-time pairing: user must enter PIN
+    PAIR_HMAC = 1,   // Already paired: HMAC challenge-response
+};
+
+/// PAIR_CHALLENGE payload (Mac → Windows, 40 bytes)
+struct PairChallengePayload {
+    uint8_t type = 0;           // PairChallengeType
+    uint8_t reserved[7] = {};   // Padding
+    uint8_t nonce[32] = {};     // 32-byte random nonce
+};
+static_assert(sizeof(PairChallengePayload) == 40, "PairChallengePayload must be 40 bytes");
+
+/// PAIR_RESPONSE payload (Windows → Mac, 40 bytes)
+struct PairResponsePayload {
+    uint8_t type = 0;           // 0 = PIN, 1 = HMAC
+    uint8_t reserved[7] = {};   // Padding
+    uint8_t data[32] = {};      // PIN (null-padded) or HMAC-SHA256
+};
+static_assert(sizeof(PairResponsePayload) == 40, "PairResponsePayload must be 40 bytes");
+
+/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes)
+struct PairAcceptPayload {
+    uint8_t newlyPaired = 0;    // 1 = new pairing (key included), 0 = existing
+    uint8_t reserved[7] = {};   // Padding
+    uint8_t pairingKey[32] = {};// 256-bit pairing key (only when newlyPaired=1)
+};
+static_assert(sizeof(PairAcceptPayload) == 40, "PairAcceptPayload must be 40 bytes");
 
 #pragma pack(pop)
 

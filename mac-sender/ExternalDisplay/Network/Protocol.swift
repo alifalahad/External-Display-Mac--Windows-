@@ -39,6 +39,10 @@ enum MessageType: UInt8 {
     case qualityReport  = 0x50   // Win → Mac: network health report
     case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
     case clipboardData  = 0x70   // Both: clipboard text sync
+    case pairChallenge  = 0x80   // Mac → Win: pairing challenge
+    case pairResponse   = 0x81   // Win → Mac: pairing response (PIN or HMAC)
+    case pairAccept     = 0x82   // Mac → Win: pairing accepted
+    case pairReject     = 0x83   // Mac → Win: pairing rejected
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)
@@ -126,10 +130,11 @@ struct FragmentHeader {
 
 // ── Control Message Payloads ────────────────────────────────────────────────
 
-/// HELLO payload (Windows → Mac)
+/// HELLO payload (Windows → Mac, 130 bytes)
 struct HelloPayload {
     var receiverName: String = "Windows Receiver"
     var udpPort: UInt16 = ProtocolConstants.udpPort
+    var deviceId: String = ""   // Unique device identifier for pairing
 
     func serialize() -> Data {
         var data = Data()
@@ -140,6 +145,14 @@ struct HelloPayload {
         // Pad to 64 bytes
         data.append(contentsOf: [UInt8](repeating: 0, count: 64 - data.count))
         data.appendLE(udpPort)
+        // Device ID as null-terminated UTF-8, 64 bytes
+        let idData = deviceId.utf8.prefix(63)
+        data.append(contentsOf: idData)
+        data.append(0)
+        let idPadding = 64 - (idData.count + 1)
+        if idPadding > 0 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: idPadding))
+        }
         return data
     }
 
@@ -151,7 +164,104 @@ struct HelloPayload {
         }
         var offset = 64
         h.udpPort = data.readLE(at: &offset)
+        // Read optional device ID (added in Phase 14)
+        if data.count >= 130 {
+            h.deviceId = data.subdata(in: 66..<130).withUnsafeBytes { buf in
+                String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+        }
         return h
+    }
+}
+
+// ── Pairing Payloads ────────────────────────────────────────────────────────
+
+/// Challenge types for PAIR_CHALLENGE
+enum PairChallengeType: UInt8 {
+    case pin  = 0   // First-time pairing: user must enter PIN
+    case hmac = 1   // Already paired: HMAC challenge-response
+}
+
+/// PAIR_CHALLENGE payload (Mac → Windows, 40 bytes)
+struct PairChallengePayload {
+    var type: UInt8 = 0          // PairChallengeType
+    var nonce: Data = Data(repeating: 0, count: 32)  // 32-byte random nonce
+
+    func serialize() -> Data {
+        var data = Data(capacity: 40)
+        data.append(type)
+        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
+        data.append(nonce.prefix(32))
+        // Pad nonce if needed
+        if nonce.count < 32 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - nonce.count))
+        }
+        return data
+    }
+
+    static func deserialize(from data: Data) -> PairChallengePayload? {
+        guard data.count >= 40 else { return nil }
+        var p = PairChallengePayload()
+        p.type = data[0]
+        p.nonce = data.subdata(in: 8..<40)
+        return p
+    }
+}
+
+/// PAIR_RESPONSE payload (Windows → Mac, 40 bytes)
+struct PairResponsePayload {
+    var type: UInt8 = 0          // 0 = PIN response, 1 = HMAC response
+    var data_: Data = Data(repeating: 0, count: 32)  // PIN (null-padded) or HMAC-SHA256
+
+    func serialize() -> Data {
+        var data = Data(capacity: 40)
+        data.append(type)
+        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
+        data.append(data_.prefix(32))
+        if data_.count < 32 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - data_.count))
+        }
+        return data
+    }
+
+    static func deserialize(from data: Data) -> PairResponsePayload? {
+        guard data.count >= 40 else { return nil }
+        var p = PairResponsePayload()
+        p.type = data[0]
+        p.data_ = data.subdata(in: 8..<40)
+        return p
+    }
+
+    /// Extract PIN string from data_ field
+    var pinString: String {
+        data_.withUnsafeBytes { buf in
+            String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+    }
+}
+
+/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes)
+struct PairAcceptPayload {
+    var newlyPaired: UInt8 = 0   // 1 = new pairing (key included), 0 = existing
+    var pairingKey: Data = Data(repeating: 0, count: 32)  // 256-bit pairing key
+
+    func serialize() -> Data {
+        var data = Data(capacity: 40)
+        data.append(newlyPaired)
+        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
+        data.append(pairingKey.prefix(32))
+        if pairingKey.count < 32 {
+            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - pairingKey.count))
+        }
+        return data
+    }
+
+    static func deserialize(from data: Data) -> PairAcceptPayload? {
+        guard data.count >= 40 else { return nil }
+        var p = PairAcceptPayload()
+        p.newlyPaired = data[0]
+        p.pairingKey = data.subdata(in: 8..<40)
+        return p
     }
 }
 
