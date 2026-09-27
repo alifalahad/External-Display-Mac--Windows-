@@ -281,7 +281,6 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
 
     for (uint16_t i = 0; i < totalRecords && offset < length; i++) {
         // Parse record name
-        size_t nameStart = offset;
         std::string recordName = parseDNSName(data, length, offset);
 
         // Parse type, class, TTL, data length
@@ -302,7 +301,8 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
             // Check if this is for our service type
             // recordName should be "_externaldisplay._tcp.local" (case-insensitive)
             std::string lower = recordName;
-            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
 
             if (lower.find("_externaldisplay._tcp") != std::string::npos) {
                 // The RDATA is the instance name (e.g. "ExternalDisplay-Alif's Mac._externaldisplay._tcp.local")
