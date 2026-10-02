@@ -86,6 +86,7 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         std::cout << "[Net] HELLO sent (device: " << (m_pairingManager ? m_pairingManager->getDeviceId().substr(0, 16) : "none") << "...)" << std::endl;
 
         m_state.store(State::Connected);
+        m_reconnectAttempts = 0;  // Phase 15: reset backoff on successful connection
         m_lastQualityReport = std::chrono::steady_clock::now();
         m_prevFramesReceived = 0;
         m_prevFramesDropped = 0;
@@ -116,6 +117,7 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                     handleStopStream();
                     break;
                 case exdp::MessageType::Ping: {
+                    // Phase 15: Respond to server heartbeat
                     tcpSendMessage(exdp::MessageType::Pong, nullptr, 0);
                     break;
                 }
@@ -164,12 +166,16 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         }
         if (m_udpThread.joinable()) m_udpThread.join();
 
-        // Auto-reconnect if enabled
+        // Auto-reconnect if enabled (Phase 15: exponential backoff)
         if (m_running.load() && m_autoReconnect.load()) {
-            std::cout << "[Net] Reconnecting in 3s..." << std::endl;
+            m_isReconnect = true;
+            m_reconnectAttempts++;
+            // Backoff: 3s, 6s, 12s, 24s, max 30s
+            int delaySec = (std::min)(3 * (1 << (std::min)(m_reconnectAttempts - 1, 3)), 30);
+            std::cout << "[Net] Reconnecting in " << delaySec << "s... (attempt " << m_reconnectAttempts << ")" << std::endl;
             m_state.store(State::Reconnecting);
-            for (int i = 0; i < 30 && m_running.load(); i++)
-                Sleep(100);
+            for (int i = 0; i < delaySec * 10 && m_running.load(); i++)
+                Sleep(100);  // Sleep in 100ms chunks for clean shutdown
         }
     }
 
@@ -330,6 +336,12 @@ void StreamReceiver::udpReceiveLoop() {
 
 void StreamReceiver::handleWelcome(const std::vector<uint8_t>& payload) {
     std::cout << "[Net] WELCOME received" << std::endl;
+
+    // Phase 15: Request keyframe after reconnection so video resumes immediately
+    if (m_isReconnect) {
+        std::cout << "[Net] Reconnected — requesting keyframe for immediate video resume" << std::endl;
+        tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0);
+    }
 }
 
 void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {

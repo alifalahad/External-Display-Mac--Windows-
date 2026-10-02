@@ -151,6 +151,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.isEncoding = true
             }
+
+            // Phase 15: Wire keyframe request handler for reconnection
+            sender.onReconnection = { [weak enc] in
+                enc?.forceKeyframe()
+            }
+
+            // Phase 15: Set up sleep/wake observer
+            setupSleepWakeObserver()
+
             print("[Engine] Encoder started with adaptive quality + input forwarding + clipboard sync")
         } catch {
             DispatchQueue.main.async { [weak self] in
@@ -171,6 +180,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         sender.onQualityReport = nil
         sender.onInputEvent = nil
         sender.onClipboardData = nil
+        sender.onReconnection = nil
+        removeSleepWakeObserver()
         DispatchQueue.main.async { [weak self] in
             self?.isEncoding = false
             self?.encoderStats = EncoderStats()
@@ -368,6 +379,41 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                     self?.sender.startStreaming()
                 }
             }
+    }
+
+    // ── Sleep/Wake Recovery (Phase 15) ──────────────────────────────────────
+
+    private var sleepWakeObservers: [NSObjectProtocol] = []
+
+    /// Observe system sleep/wake to handle recovery
+    private func setupSleepWakeObserver() {
+        let wakeObs = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, self.isCapturing else { return }
+            print("[Engine] ⏰ System wake detected — forcing keyframe for stream recovery")
+
+            // Force keyframe so receiver can resume decoding immediately
+            self.encoder?.forceKeyframe()
+        }
+
+        let sleepObs = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil, queue: .main
+        ) { _ in
+            print("[Engine] 💤 System going to sleep")
+        }
+
+        sleepWakeObservers = [wakeObs, sleepObs]
+    }
+
+    /// Remove sleep/wake observers
+    private func removeSleepWakeObserver() {
+        for obs in sleepWakeObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        sleepWakeObservers.removeAll()
     }
 }
 

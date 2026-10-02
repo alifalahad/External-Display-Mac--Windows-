@@ -75,6 +75,9 @@ public:
     /// Set pairing manager for secure authentication
     void setPairingManager(PairingManager* pm) { m_pairingManager = pm; }
 
+    /// Request a keyframe from the sender (Phase 15: for decoder recovery)
+    void requestKeyframe() { tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
+
     // ── Stats ───────────────────────────────────────────────────────────────
 
     struct Stats {
@@ -150,6 +153,8 @@ private:
     std::atomic<State> m_state{State::Disconnected};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_autoReconnect{true};
+    int m_reconnectAttempts = 0;    // Phase 15: exponential backoff counter
+    bool m_isReconnect = false;     // Phase 15: true after first connection cycle
 
     PairingManager* m_pairingManager = nullptr;  // Not owned
 

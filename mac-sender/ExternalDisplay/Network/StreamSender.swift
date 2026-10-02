@@ -67,6 +67,16 @@ final class StreamSender: ObservableObject {
         qos: .userInteractive
     )
 
+    // ── Heartbeat (Phase 15) ────────────────────────────────────────────────
+
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var lastPongReceived: Double = 0
+    private let heartbeatInterval: TimeInterval = 5.0   // Send Ping every 5s
+    private let heartbeatTimeout: TimeInterval = 15.0    // Dead if no Pong in 15s
+
+    /// Called when reconnection happens (encoder can force keyframe)
+    var onReconnection: (() -> Void)?
+
     // ── Stream state ────────────────────────────────────────────────────────
 
     private var remoteHost: NWEndpoint.Host?
@@ -134,12 +144,21 @@ final class StreamSender: ObservableObject {
             }
 
             listener.newConnectionHandler = { [weak self] connection in
-                // Only accept one connection at a time
-                if self?.tcpConnection != nil {
-                    connection.cancel()
-                    return
+                guard let self = self else { connection.cancel(); return }
+
+                // Phase 15: If a client is already connected, check if it's still alive.
+                // If the old connection is stale (e.g. Wi-Fi dropout), drop it and accept the new one.
+                if self.tcpConnection != nil {
+                    print("[Net] New connection while already connected — dropping old connection for reconnect")
+                    self.stopHeartbeat()
+                    self.stopStreaming()
+                    self.tcpConnection?.cancel()
+                    self.tcpConnection = nil
+                    self.udpConnection?.cancel()
+                    self.udpConnection = nil
+                    self.remoteHost = nil
                 }
-                self?.handleNewTCPConnection(connection)
+                self.handleNewTCPConnection(connection)
             }
 
             listener.start(queue: networkQueue)
@@ -207,14 +226,16 @@ final class StreamSender: ObservableObject {
             switch state {
             case .ready:
                 print("[Net] TCP connection ready")
+                self?.lastPongReceived = CACurrentMediaTime()
+                self?.startHeartbeat()
                 self?.receiveTCPMessages()
             case .failed(let error):
                 print("[Net] TCP connection failed: \(error)")
+                self?.stopHeartbeat()
                 self?.handleDisconnect(for: connection)
             case .cancelled:
                 print("[Net] TCP connection cancelled")
-                // Don't call handleDisconnect for manual cancels (stop())
-                // stop() already cleans up. Only handle unexpected disconnects.
+                self?.stopHeartbeat()
                 break
             default:
                 break
@@ -275,9 +296,12 @@ final class StreamSender: ObservableObject {
             handleHello(payload)
         case .ping:
             sendPong(sequence: header.sequence)
+        case .pong:
+            // Phase 15: Update heartbeat timestamp
+            lastPongReceived = CACurrentMediaTime()
         case .keyframeReq:
-            print("[Net] Keyframe requested")
-            // TODO: Signal encoder to force keyframe
+            print("[Net] Keyframe requested by receiver")
+            onReconnection?()  // Signal encoder to force keyframe
         case .qualityReport:
             handleQualityReport(payload)
         case .inputEvent:
@@ -414,15 +438,50 @@ final class StreamSender: ObservableObject {
             print("[Net] Ignoring stale disconnect callback")
             return
         }
+        stopHeartbeat()
         stopStreaming()
         tcpConnection?.cancel()
         tcpConnection = nil
         udpConnection?.cancel()
         udpConnection = nil
         remoteHost = nil
+        print("[Net] Client disconnected — waiting for reconnection...")
         DispatchQueue.main.async { [weak self] in
             self?.state = .listening
         }
+    }
+
+    // ── Heartbeat (Phase 15) ─────────────────────────────────────────────────
+
+    /// Start sending periodic Pings to detect dead connections
+    private func startHeartbeat() {
+        stopHeartbeat()
+        let timer = DispatchSource.makeTimerSource(queue: networkQueue)
+        timer.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.tcpConnection != nil else { return }
+
+            // Check if the peer has responded recently
+            let now = CACurrentMediaTime()
+            if now - self.lastPongReceived > self.heartbeatTimeout {
+                print("[Net] ⚠️ Heartbeat timeout — peer not responding (\(Int(now - self.lastPongReceived))s)")
+                if let conn = self.tcpConnection {
+                    self.handleDisconnect(for: conn)
+                }
+                return
+            }
+
+            // Send Ping
+            self.sendControlMessage(type: .ping, payload: Data())
+        }
+        timer.resume()
+        heartbeatTimer = timer
+    }
+
+    /// Stop the heartbeat timer
+    private func stopHeartbeat() {
+        heartbeatTimer?.cancel()
+        heartbeatTimer = nil
     }
 
     // ── Streaming Control ───────────────────────────────────────────────────

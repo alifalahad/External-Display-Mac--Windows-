@@ -378,11 +378,33 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (networkMode && decoder) {
                 std::lock_guard<std::mutex> lock(gInputMutex);
                 int decoded = 0;
+                static int consecutiveDecodeFailures = 0;
                 while (!gInputQueue.empty() && decoded < 2) {
                     auto& frame = gInputQueue.front();
-                    decoder->decode(frame.data.data(), frame.data.size());
+                    bool ok = decoder->decode(frame.data.data(), frame.data.size());
                     gInputQueue.pop_front();
                     decoded++;
+
+                    // Phase 15: Track decoder failures for auto-recovery
+                    if (!ok) {
+                        consecutiveDecodeFailures++;
+                        if (consecutiveDecodeFailures >= 30) {
+                            printf("[Decoder] %d consecutive failures — reinitializing decoder\n",
+                                   consecutiveDecodeFailures);
+                            decoder->shutdown();
+                            decoder->initialize(gPendingWidth > 0 ? gPendingWidth : 1920,
+                                               gPendingHeight > 0 ? gPendingHeight : 1080);
+                            consecutiveDecodeFailures = 0;
+                            gInputQueue.clear();
+                            // Request keyframe from server
+                            if (receiver) {
+                                receiver->requestKeyframe();
+                            }
+                            break;
+                        }
+                    } else {
+                        consecutiveDecodeFailures = 0;
+                    }
                 }
             }
 
