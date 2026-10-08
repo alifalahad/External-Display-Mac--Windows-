@@ -41,6 +41,13 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Pairing manager — handles secure device authentication
     let pairingManager = PairingManager()
 
+    override init() {
+        super.init()
+        // Wire pairing manager to sender immediately so it's ready
+        // before any connections arrive (fixes: PIN not asked)
+        sender.pairingManager = pairingManager
+    }
+
     // ── Internals ───────────────────────────────────────────────────────────
 
     private var stream: SCStream?
@@ -92,9 +99,6 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Configure sender with stream parameters
             sender.streamWidth = UInt32(width)
             sender.streamHeight = UInt32(height)
-
-            // Wire pairing manager for secure authentication
-            sender.pairingManager = pairingManager
 
             // Set up adaptive quality controller
             let controller = AdaptiveQualityController()
