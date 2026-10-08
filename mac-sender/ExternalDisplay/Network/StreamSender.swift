@@ -248,11 +248,11 @@ final class StreamSender: ObservableObject {
     private func receiveTCPMessages() {
         guard let connection = tcpConnection else { return }
 
-        // Read header first (28 bytes)
+        // Step 1: Read exactly the 28-byte header
         connection.receive(
             minimumIncompleteLength: ProtocolConstants.headerSize,
-            maximumLength: 65536
-        ) { [weak self] data, _, isComplete, error in
+            maximumLength: ProtocolConstants.headerSize
+        ) { [weak self] headerData, _, isComplete, error in
             guard let self = self else { return }
 
             if let error = error {
@@ -267,29 +267,72 @@ final class StreamSender: ObservableObject {
                 return
             }
 
-            if let data = data, !data.isEmpty {
-                self.handleTCPData(data, connection: connection)
+            guard let headerData = headerData, headerData.count >= ProtocolConstants.headerSize,
+                  let header = ProtocolHeader.deserialize(from: headerData) else {
+                // Continue receiving if we didn't get a full header
+                self.receiveTCPMessages()
+                return
             }
 
-            // Continue receiving
-            self.receiveTCPMessages()
+            let payloadLen = Int(header.payloadLength)
+
+            if payloadLen == 0 {
+                // No payload — dispatch immediately
+                self.dispatchMessage(header: header, payload: Data(), connection: connection)
+                self.receiveTCPMessages()
+            } else {
+                // Step 2: Read exactly payloadLength bytes
+                self.readTCPPayload(connection: connection, header: header,
+                                     remaining: payloadLen, accumulated: Data())
+            }
         }
     }
 
-    private func handleTCPData(_ data: Data, connection: NWConnection) {
-        guard let header = ProtocolHeader.deserialize(from: data) else {
-            print("[Net] Invalid header received")
-            return
-        }
+    /// Read exactly `remaining` bytes of payload from TCP, accumulating chunks
+    private func readTCPPayload(connection: NWConnection, header: ProtocolHeader,
+                                 remaining: Int, accumulated: Data) {
+        connection.receive(
+            minimumIncompleteLength: remaining,
+            maximumLength: remaining
+        ) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
 
+            if let error = error {
+                print("[Net] TCP payload read error: \(error)")
+                self.handleDisconnect(for: connection)
+                return
+            }
+
+            if isComplete && (data == nil || data!.isEmpty) {
+                print("[Net] TCP connection closed during payload read")
+                self.handleDisconnect(for: connection)
+                return
+            }
+
+            var acc = accumulated
+            if let data = data {
+                acc.append(data)
+            }
+
+            let left = remaining - (data?.count ?? 0)
+            if left > 0 {
+                // Need more data
+                self.readTCPPayload(connection: connection, header: header,
+                                     remaining: left, accumulated: acc)
+            } else {
+                // Full payload received
+                self.dispatchMessage(header: header, payload: acc, connection: connection)
+                self.receiveTCPMessages()
+            }
+        }
+    }
+
+    /// Dispatch a fully-received TCP message to the appropriate handler
+    private func dispatchMessage(header: ProtocolHeader, payload: Data, connection: NWConnection) {
         guard let msgType = MessageType(rawValue: header.type) else {
             print("[Net] Unknown message type: \(header.type)")
             return
         }
-
-        let payload = data.count > ProtocolConstants.headerSize
-            ? data.subdata(in: ProtocolConstants.headerSize..<data.count)
-            : Data()
 
         switch msgType {
         case .hello:
