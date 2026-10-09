@@ -84,13 +84,14 @@ struct FragmentHeader {
 };
 static_assert(sizeof(FragmentHeader) == 8, "Fragment header must be 8 bytes");
 
-// ── HELLO payload (66 bytes) ────────────────────────────────────────────────
+// ── HELLO payload (130 bytes) ───────────────────────────────────────────────
 
 struct HelloPayload {
     char     receiverName[64] = {};  // Null-terminated UTF-8
     uint16_t udpPort = UDP_PORT;
     char     deviceId[64] = {};      // Unique device identifier for pairing
 };
+static_assert(sizeof(HelloPayload) == 130, "HelloPayload must be 130 bytes");
 
 // ── START_STREAM payload (20 bytes) ─────────────────────────────────────────
 
