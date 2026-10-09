@@ -165,10 +165,15 @@ struct HelloPayload {
         var offset = 64
         h.udpPort = data.readLE(at: &offset)
         // Read optional device ID (added in Phase 14)
+        print("[Net] HELLO payload size: \(data.count) bytes (need 130 for deviceId)")
         if data.count >= 130 {
-            h.deviceId = data.subdata(in: 66..<130).withUnsafeBytes { buf in
+            let idBytes = data.subdata(in: 66..<130)
+            let firstBytes = idBytes.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " ")
+            print("[Net] deviceId bytes[0..7]: \(firstBytes)")
+            h.deviceId = idBytes.withUnsafeBytes { buf in
                 String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
             }
+            print("[Net] parsed deviceId: '\(h.deviceId)'")
         }
         return h
     }
