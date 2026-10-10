@@ -163,15 +163,19 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         printf("Waiting for Mac senders to respond...\n");
         for (int i = 0; i < 10; i++) {
             Sleep(1000);
-            std::lock_guard<std::mutex> lock(discoveryMutex);
-            if (!foundServices.empty()) {
-                // Found at least one — wait 2 more seconds for others
-                printf("Found %zu sender(s), waiting for more...\n", foundServices.size());
-                Sleep(2000);
-                break;
+            {
+                std::lock_guard<std::mutex> lock(discoveryMutex);
+                if (!foundServices.empty()) {
+                    printf("Found %zu sender(s), waiting for more...\n", foundServices.size());
+                    fflush(stdout);
+                    break;
+                }
             }
             printf("  Searching... (%d/10s)\n", i + 1);
         }
+
+        // Wait 2 more seconds for additional senders (outside mutex!)
+        Sleep(2000);
 
         discovery.stopBrowsing();
 
