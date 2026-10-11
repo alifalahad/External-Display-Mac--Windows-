@@ -24,6 +24,7 @@
 #include "Clipboard/ClipboardSync.h"
 #include "Discovery/ServiceDiscovery.h"
 #include "Security/PairingManager.h"
+#include "UI/PinPrompt.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -40,7 +41,7 @@ static void InitConsole() {
     if (AllocConsole()) {
         freopen_s(&gConsoleFile, "CONOUT$", "w", stdout);
         freopen_s(&gConsoleFile, "CONOUT$", "w", stderr);
-        freopen_s(&gConsoleInput, "CONIN$", "r", stdin);  // Enable console input for PIN entry
+        freopen_s(&gConsoleInput, "CONIN$", "r", stdin);  // Console input for sender selection
         SetConsoleTitleW(L"External Display Receiver - Stats");
     }
 }
@@ -250,6 +251,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         wprintf(L"GPU:    %s\n", renderer.GetAdapterName().c_str());
         printf("VSync:  Enabled (60 Hz target)\n\n");
 
+        // Declared before the receiver so it outlives the receiver's network thread
+        std::unique_ptr<PairingManager> pairingMgr;
         std::unique_ptr<StreamReceiver> receiver;
         std::unique_ptr<H264Decoder> decoder;
         std::unique_ptr<InputCapture> inputCapture;
@@ -284,31 +287,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     QueueNV12Frame(yData, uvData, stride, w, h);
                 });
 
-            // Set up pairing manager for secure authentication
-            PairingManager pairingMgr;
-            pairingMgr.initialize();
-            pairingMgr.setPINRequestCallback([](std::string& outPIN) -> bool {
-                printf("\n");
-                printf("==========================================================\n");
-                printf("  PAIRING REQUIRED\n");
-                printf("  Look at the Mac app for a 6-digit PIN\n");
-                printf("==========================================================\n");
-                printf("  Enter PIN: ");
-                fflush(stdout);
-
-                char buf[32];
-                if (fgets(buf, sizeof(buf), stdin)) {
-                    outPIN = buf;
-                    // Remove trailing newline/whitespace
-                    while (!outPIN.empty() && (outPIN.back() == '\n' || outPIN.back() == '\r' || outPIN.back() == ' '))
-                        outPIN.pop_back();
-                    printf("==========================================================\n\n");
-                    return true;
-                }
-                return false;
-            });
-
-            receiver->setPairingManager(&pairingMgr);
+            // Set up pairing manager for secure authentication.
+            // Must live as long as the receiver — the network thread uses it.
+            pairingMgr = std::make_unique<PairingManager>();
+            pairingMgr->initialize();
+            receiver->setPairingManager(pairingMgr.get());
 
             if (!receiver->connect(macIP))
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());
@@ -423,6 +406,21 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         gLatestNV12.width,
                         gLatestNV12.height);
                     gHasNewNV12 = false;
+                }
+            }
+
+            // Phase 14: first-time pairing — ask for the PIN in a dialog above the
+            // display window. Modal, but nothing is streaming before pairing completes.
+            uint32_t pinRequest = 0;
+            if (receiver && receiver->takePinRequest(pinRequest)) {
+                std::string pin;
+                bool entered = PromptForPIN(window.GetHandle(), pin,
+                    [&receiver, pinRequest] { return receiver->isPinRequestCurrent(pinRequest); });
+                if (entered) {
+                    receiver->submitPIN(pinRequest, pin);
+                } else if (receiver->isPinRequestCurrent(pinRequest)) {
+                    printf("[Pairing] Cancelled — disconnected. Restart the receiver to pair again.\n");
+                    receiver->disconnect();
                 }
             }
 

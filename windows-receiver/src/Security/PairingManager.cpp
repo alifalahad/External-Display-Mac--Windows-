@@ -19,8 +19,12 @@
 PairingManager::PairingManager() {}
 
 void PairingManager::initialize() {
-    loadOrCreateDeviceId();
     loadPairing();
+    if (isPaired()) {
+        loadOrCreateDeviceId();
+    } else {
+        createDeviceId();
+    }
     std::cout << "[Pairing] Device ID: " << m_deviceId.substr(0, 16) << "..." << std::endl;
     if (isPaired()) {
         std::cout << "[Pairing] Paired with: " << m_pairedServerName << std::endl;
@@ -66,15 +70,6 @@ bool PairingManager::generateRandom(uint8_t* buffer, size_t size) {
         BCryptGenRandom(nullptr, buffer, (ULONG)size, BCRYPT_USE_SYSTEM_PREFERRED_RNG));
 }
 
-// ── PIN Request ─────────────────────────────────────────────────────────────
-
-bool PairingManager::requestPIN(std::string& outPIN) {
-    if (m_pinRequestCallback) {
-        return m_pinRequestCallback(outPIN);
-    }
-    return false;
-}
-
 // ── Pairing Data Persistence ────────────────────────────────────────────────
 
 void PairingManager::savePairing(const std::string& serverName,
@@ -91,7 +86,9 @@ void PairingManager::clearPairing() {
 
     std::string path = getPairingFilePath();
     DeleteFileA(path.c_str());
-    std::cout << "[Pairing] Pairing data cleared" << std::endl;
+    createDeviceId();
+    std::cout << "[Pairing] Pairing data cleared (new device ID: "
+              << m_deviceId.substr(0, 16) << "...)" << std::endl;
 }
 
 std::string PairingManager::getPairingFilePath() const {
@@ -155,7 +152,10 @@ void PairingManager::loadOrCreateDeviceId() {
         std::getline(file, m_deviceId);
         if (!m_deviceId.empty()) return;
     }
+    createDeviceId();
+}
 
+void PairingManager::createDeviceId() {
     // Generate a new device ID (random UUID-like string)
     uint8_t randomBytes[16];
     if (generateRandom(randomBytes, 16)) {

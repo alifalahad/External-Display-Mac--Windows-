@@ -21,6 +21,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Clipboard/ClipboardSync.cpp
     src/Discovery/ServiceDiscovery.cpp
     src/Security/PairingManager.cpp
+    src/UI/PinPrompt.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

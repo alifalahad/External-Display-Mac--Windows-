@@ -34,10 +34,14 @@ bool StreamReceiver::connect(const std::string& hostIP) {
 void StreamReceiver::disconnect() {
     m_running.store(false);
     m_state.store(State::Disconnected);
+    m_pinWantedFor.store(0);
 
-    if (m_tcpSocket != INVALID_SOCKET) {
-        closesocket(m_tcpSocket);
-        m_tcpSocket = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lock(m_sendMutex);
+        if (m_tcpSocket != INVALID_SOCKET) {
+            closesocket(m_tcpSocket);
+            m_tcpSocket = INVALID_SOCKET;
+        }
     }
     if (m_udpSocket != INVALID_SOCKET) {
         closesocket(m_udpSocket);
@@ -66,6 +70,8 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
             continue;
         }
         std::cout << "[Net] TCP connected" << std::endl;
+        m_connectionId.fetch_add(1);
+        m_pinWantedFor.store(0);
 
         // Step 2: Bind UDP socket
         if (!udpBind()) {
@@ -96,7 +102,8 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         m_udpThread = std::thread(&StreamReceiver::udpReceiveLoop, this);
 
         // Step 5: TCP receive loop (control messages)
-        while (m_running.load()) {
+        bool keepConnection = true;
+        while (m_running.load() && keepConnection) {
             exdp::ProtocolHeader header;
             std::vector<uint8_t> payload;
 
@@ -132,13 +139,13 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                     }
                     break;
                 case exdp::MessageType::PairChallenge:
-                    handlePairChallenge(payload);
+                    keepConnection = handlePairChallenge(payload);
                     break;
                 case exdp::MessageType::PairAccept:
                     handlePairAccept(payload);
                     break;
                 case exdp::MessageType::PairReject:
-                    handlePairReject();
+                    keepConnection = handlePairReject();
                     break;
                 default:
                     break;
@@ -156,9 +163,13 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
         }
 
         // Cleanup sockets for potential reconnect
-        if (m_tcpSocket != INVALID_SOCKET) {
-            closesocket(m_tcpSocket);
-            m_tcpSocket = INVALID_SOCKET;
+        m_pinWantedFor.store(0);
+        {
+            std::lock_guard<std::mutex> lock(m_sendMutex);
+            if (m_tcpSocket != INVALID_SOCKET) {
+                closesocket(m_tcpSocket);
+                m_tcpSocket = INVALID_SOCKET;
+            }
         }
         if (m_udpSocket != INVALID_SOCKET) {
             closesocket(m_udpSocket);
@@ -212,6 +223,9 @@ bool StreamReceiver::tcpConnect(const std::string& hostIP) {
 }
 
 void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen) {
+    // Serialize whole messages so concurrent senders can't interleave bytes
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_tcpSocket == INVALID_SOCKET) return;
     auto msg = exdp::buildMessage(type, 0, m_sequence++, 0, payload, payloadLen);
     send(m_tcpSocket, (const char*)msg.data(), (int)msg.size(), 0);
 }
@@ -501,28 +515,18 @@ void StreamReceiver::sendQualityReport() {
 
 // ── Pairing Handlers ───────────────────────────────────────────────────────────
 
-void StreamReceiver::handlePairChallenge(const std::vector<uint8_t>& payload) {
-    if (payload.size() < sizeof(exdp::PairChallengePayload)) return;
+bool StreamReceiver::handlePairChallenge(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::PairChallengePayload)) return true;
 
     exdp::PairChallengePayload challenge;
     memcpy(&challenge, payload.data(), sizeof(challenge));
 
     if (challenge.type == exdp::PAIR_PIN) {
-        // First-time pairing — need to get PIN from user
-        std::cout << "[Pairing] PIN required for first-time pairing" << std::endl;
-
-        std::string pin;
-        if (m_pairingManager && m_pairingManager->requestPIN(pin)) {
-            // Send PIN response
-            exdp::PairResponsePayload response{};
-            response.type = exdp::PAIR_PIN;
-            strncpy_s((char*)response.data, sizeof(response.data),
-                      pin.c_str(), sizeof(response.data) - 1);
-            tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
-            std::cout << "[Pairing] PIN sent" << std::endl;
-        } else {
-            std::cerr << "[Pairing] Failed to get PIN from user" << std::endl;
-        }
+        // First-time pairing — the UI thread shows the PIN dialog. Don't block
+        // here: this thread must keep answering heartbeat PINGs meanwhile.
+        std::cout << "[Pairing] PIN required — enter the PIN shown in the Mac app" << std::endl;
+        m_pinWantedFor.store(m_connectionId.load());
+        m_pinRequestNew.store(true);
 
     } else if (challenge.type == exdp::PAIR_HMAC) {
         // Already paired — compute HMAC response
@@ -538,14 +542,41 @@ void StreamReceiver::handlePairChallenge(const std::vector<uint8_t>& payload) {
                 std::cerr << "[Pairing] HMAC computation failed" << std::endl;
             }
         } else {
-            std::cerr << "[Pairing] Server expects paired device but we have no key" << std::endl;
-            // Server will send PairReject, we'll reconnect and be treated as new device
+            // Mac remembers this device ID but we lost the key. Switch to a fresh
+            // device ID and reconnect so the Mac falls back to PIN pairing.
+            std::cerr << "[Pairing] Mac expects a paired device but we have no key — re-pairing" << std::endl;
+            if (m_pairingManager) m_pairingManager->clearPairing();
+            return false;
         }
     }
+    return true;
+}
+
+bool StreamReceiver::takePinRequest(uint32_t& outRequestId) {
+    if (!m_pinRequestNew.exchange(false)) return false;
+    outRequestId = m_pinWantedFor.load();
+    return outRequestId != 0;
+}
+
+void StreamReceiver::submitPIN(uint32_t requestId, const std::string& pin) {
+    // Claim the request so a double submit or a stale dialog can't send twice
+    uint32_t expected = requestId;
+    if (requestId == 0 || !m_pinWantedFor.compare_exchange_strong(expected, 0)) {
+        std::cout << "[Pairing] PIN request expired — waiting for a new one" << std::endl;
+        return;
+    }
+
+    exdp::PairResponsePayload response{};
+    response.type = exdp::PAIR_PIN;
+    strncpy_s((char*)response.data, sizeof(response.data),
+              pin.c_str(), sizeof(response.data) - 1);
+    tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
+    std::cout << "[Pairing] PIN sent" << std::endl;
 }
 
 void StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
     if (payload.size() < sizeof(exdp::PairAcceptPayload)) return;
+    m_pinWantedFor.store(0);
 
     exdp::PairAcceptPayload accept;
     memcpy(&accept, payload.data(), sizeof(accept));
@@ -559,14 +590,16 @@ void StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
     }
 }
 
-void StreamReceiver::handlePairReject() {
-    std::cerr << "[Pairing] \xe2\x9d\x8c Pairing rejected by Mac" << std::endl;
+bool StreamReceiver::handlePairReject() {
+    std::cerr << "[Pairing] \xe2\x9d\x8c Pairing rejected by Mac (wrong PIN or unknown key)" << std::endl;
+    m_pinWantedFor.store(0);
 
     // Clear any stored pairing that might be invalid
     if (m_pairingManager) {
         m_pairingManager->clearPairing();
     }
 
-    // Disconnect — user needs to retry
-    m_running.store(false);
+    // Drop this connection; auto-reconnect gets a fresh PIN from the Mac
+    std::cerr << "[Pairing] Reconnecting for a new PIN..." << std::endl;
+    return false;
 }

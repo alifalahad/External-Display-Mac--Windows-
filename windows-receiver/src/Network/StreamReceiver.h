@@ -78,6 +78,20 @@ public:
     /// Request a keyframe from the sender (Phase 15: for decoder recovery)
     void requestKeyframe() { tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
 
+    // ── Pairing (PIN is entered on the UI thread, never on the network thread) ──
+
+    /// Returns true once per PIN challenge. outRequestId identifies the
+    /// connection the PIN belongs to.
+    bool takePinRequest(uint32_t& outRequestId);
+
+    /// True while the Mac is still waiting for the PIN of that request
+    bool isPinRequestCurrent(uint32_t requestId) const {
+        return requestId != 0 && m_pinWantedFor.load() == requestId;
+    }
+
+    /// Send the PIN typed by the user. Ignored if the request went stale.
+    void submitPIN(uint32_t requestId, const std::string& pin);
+
     // ── Stats ───────────────────────────────────────────────────────────────
 
     struct Stats {
@@ -143,10 +157,10 @@ private:
                              const uint8_t* data, size_t dataLen);
     void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe);
 
-    /// Handle pairing messages
-    void handlePairChallenge(const std::vector<uint8_t>& payload);
+    /// Handle pairing messages. Return false when the connection must be dropped.
+    bool handlePairChallenge(const std::vector<uint8_t>& payload);
     void handlePairAccept(const std::vector<uint8_t>& payload);
-    void handlePairReject();
+    bool handlePairReject();
 
     // ── State ───────────────────────────────────────────────────────────────
 
@@ -156,7 +170,12 @@ private:
     int m_reconnectAttempts = 0;    // Phase 15: exponential backoff counter
     bool m_isReconnect = false;     // Phase 15: true after first connection cycle
 
-    PairingManager* m_pairingManager = nullptr;  // Not owned
+    PairingManager* m_pairingManager = nullptr;  // Not owned — must outlive this receiver
+
+    // PIN handshake state, shared between network and UI threads
+    std::atomic<uint32_t> m_connectionId{0};    // incremented per TCP connection
+    std::atomic<uint32_t> m_pinWantedFor{0};    // connection awaiting a PIN (0 = none)
+    std::atomic<bool> m_pinRequestNew{false};   // not yet picked up by the UI
 
     SOCKET m_tcpSocket = INVALID_SOCKET;
     SOCKET m_udpSocket = INVALID_SOCKET;
@@ -168,7 +187,8 @@ private:
     StreamInfoCallback m_streamInfoCallback;
     ClipboardCallback m_clipboardCallback;
 
-    uint32_t m_sequence = 0;
+    std::mutex m_sendMutex;   // TCP sends come from network, UI and clipboard paths
+    uint32_t m_sequence = 0;  // guarded by m_sendMutex
 
     // ── Fragment Reassembly ─────────────────────────────────────────────────
 

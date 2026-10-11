@@ -12,14 +12,15 @@
 #include <string>
 #include <cstdint>
 #include <vector>
-#include <functional>
 
 class PairingManager {
 public:
     PairingManager();
     ~PairingManager() = default;
 
-    /// Initialize: loads existing pairing data and generates device ID
+    /// Initialize: loads existing pairing data and the device ID.
+    /// An unpaired receiver always gets a fresh device ID, so a Mac that still
+    /// remembers an old key falls back to PIN pairing instead of HMAC.
     void initialize();
 
     /// Get this device's unique ID (generated on first run, persisted)
@@ -41,21 +42,13 @@ public:
     /// Generate random bytes using Windows CNG
     static bool generateRandom(uint8_t* buffer, size_t size);
 
-    /// Callback for requesting PIN from user (called from network thread)
-    using PINRequestCallback = std::function<bool(std::string& outPIN)>;
-    void setPINRequestCallback(PINRequestCallback cb) { m_pinRequestCallback = std::move(cb); }
-
-    /// Request PIN from user (calls the callback)
-    bool requestPIN(std::string& outPIN);
-
-    /// Remove stored pairing (unpair)
+    /// Remove stored pairing (unpair) and switch to a fresh device ID
     void clearPairing();
 
 private:
     std::string m_deviceId;            // Persistent unique device identifier
     std::vector<uint8_t> m_pairingKey; // 32-byte pairing key
     std::string m_pairedServerName;    // Name of paired Mac server
-    PINRequestCallback m_pinRequestCallback;
 
     /// File path for pairing data
     std::string getPairingFilePath() const;
@@ -67,6 +60,7 @@ private:
 
     /// Load/save device ID
     void loadOrCreateDeviceId();
+    void createDeviceId();
 
     /// Convert bytes to hex string and back
     static std::string bytesToHex(const uint8_t* data, size_t len);
