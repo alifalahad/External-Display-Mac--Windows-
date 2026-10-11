@@ -21,7 +21,8 @@ import QuartzCore
 enum SenderState: Equatable {
     case idle
     case listening
-    case connected(String)    // peer name
+    case pairing(String)      // peer connected, waiting for PIN / HMAC verification
+    case connected(String)    // peer name (authenticated)
     case streaming(String)    // peer name
     case error(String)
 
@@ -29,6 +30,7 @@ enum SenderState: Equatable {
         switch self {
         case .idle:             return "Idle"
         case .listening:        return "Listening on port \(ProtocolConstants.tcpPort)…"
+        case .pairing(let p):   return "Authenticating \(p)…"
         case .connected(let p): return "Connected: \(p)"
         case .streaming(let p): return "Streaming to \(p)"
         case .error(let e):     return "Error: \(e)"
@@ -103,9 +105,12 @@ final class StreamSender: ObservableObject {
     /// Pairing manager for secure authentication
     var pairingManager: PairingManager?
 
-    // Pairing state for the current connection
+    // Pairing state for the current connection (networkQueue only)
     private var pendingDeviceId: String?
     private var pendingDeviceName: String?
+    /// True once the current peer passed PIN or HMAC verification.
+    /// Nothing except the pairing handshake is accepted or sent before this.
+    private var isAuthenticated = false
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -179,6 +184,7 @@ final class StreamSender: ObservableObject {
         udpConnection?.cancel()
         udpConnection = nil
         remoteHost = nil
+        resetAuthentication()
         sequenceNumber = 0
         frameSequenceNumber = 0
         DispatchQueue.main.async { [weak self] in
@@ -216,6 +222,7 @@ final class StreamSender: ObservableObject {
     private func handleNewTCPConnection(_ connection: NWConnection) {
         print("[Net] New TCP connection from \(connection.endpoint)")
         tcpConnection = connection
+        resetAuthentication()
 
         // Extract remote host for UDP
         if case .hostPort(let host, _) = connection.endpoint {
@@ -334,6 +341,18 @@ final class StreamSender: ObservableObject {
             return
         }
 
+        // Before authentication only the handshake and keepalives are allowed —
+        // never inject input or clipboard data from an unverified peer.
+        if !isAuthenticated {
+            switch msgType {
+            case .hello, .pairResponse, .ping, .pong, .disconnect:
+                break
+            default:
+                print("[Net] Dropping \(msgType) from unauthenticated peer")
+                return
+            }
+        }
+
         switch msgType {
         case .hello:
             handleHello(payload)
@@ -385,6 +404,10 @@ final class StreamSender: ObservableObject {
             print("[Net] Invalid HELLO payload")
             return
         }
+        guard !isAuthenticated else {
+            print("[Net] Ignoring repeated HELLO on an authenticated connection")
+            return
+        }
 
         print("[Net] HELLO from: \(hello.receiverName), UDP port: \(hello.udpPort), device: \(hello.deviceId.prefix(16))")
         remoteUDPPort = hello.udpPort
@@ -393,33 +416,34 @@ final class StreamSender: ObservableObject {
         pendingDeviceId = hello.deviceId
         pendingDeviceName = hello.receiverName
 
-        // Check pairing status
-        if let pm = pairingManager, !hello.deviceId.isEmpty {
-            if pm.isPaired(deviceId: hello.deviceId) {
-                // Already paired — send HMAC challenge
-                let nonce = pm.generateNonce()
-                var challenge = PairChallengePayload()
-                challenge.type = PairChallengeType.hmac.rawValue
-                challenge.nonce = nonce
-                sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
-                print("[Pairing] Sent HMAC challenge to '\(hello.receiverName)'")
-            } else {
-                // Not paired — generate PIN and show in UI
-                let pin = pm.generatePIN(forDevice: hello.receiverName)
-                var challenge = PairChallengePayload()
-                challenge.type = PairChallengeType.pin.rawValue
-                challenge.nonce = Data(repeating: 0, count: 32)  // unused for PIN
-                sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
-                print("[Pairing] Sent PIN challenge to '\(hello.receiverName)' — PIN: \(pin)")
-            }
+        // Every receiver must authenticate. A missing device ID means an old or
+        // broken receiver build — reject instead of silently skipping pairing.
+        guard let pm = pairingManager, !hello.deviceId.isEmpty else {
+            print("[Pairing] ❌ HELLO without device ID from '\(hello.receiverName)' — rejecting")
+            sendControlMessage(type: .pairReject, payload: Data())
+            return
+        }
+
+        if pm.isPaired(deviceId: hello.deviceId) {
+            // Already paired — send HMAC challenge
+            let nonce = pm.generateNonce()
+            var challenge = PairChallengePayload()
+            challenge.type = PairChallengeType.hmac.rawValue
+            challenge.nonce = nonce
+            sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
+            print("[Pairing] Sent HMAC challenge to '\(hello.receiverName)'")
         } else {
-            // No pairing manager — skip pairing (backward compat)
-            let welcomePayload = Data()
-            sendControlMessage(type: .welcome, payload: welcomePayload)
+            // Not paired — generate PIN and show in UI
+            let pin = pm.generatePIN(forDevice: hello.receiverName)
+            var challenge = PairChallengePayload()
+            challenge.type = PairChallengeType.pin.rawValue
+            challenge.nonce = Data(repeating: 0, count: 32)  // unused for PIN
+            sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
+            print("[Pairing] Sent PIN challenge to '\(hello.receiverName)' — PIN: \(pin)")
         }
 
         DispatchQueue.main.async { [weak self] in
-            self?.state = .connected(hello.receiverName)
+            self?.state = .pairing(hello.receiverName)
         }
     }
 
@@ -447,8 +471,11 @@ final class StreamSender: ObservableObject {
 
                 // Now send WELCOME to proceed
                 sendControlMessage(type: .welcome, payload: Data())
+                markAuthenticated(deviceName)
                 print("[Pairing] ✅ PIN accepted — paired with '\(deviceName)'")
             } else {
+                // One attempt per PIN: the receiver reconnects and gets a fresh one
+                pm.cancelPairing()
                 sendControlMessage(type: .pairReject, payload: Data())
                 print("[Pairing] ❌ PIN rejected from '\(deviceName)'")
             }
@@ -465,12 +492,29 @@ final class StreamSender: ObservableObject {
 
                 // Now send WELCOME to proceed
                 sendControlMessage(type: .welcome, payload: Data())
+                markAuthenticated(deviceName)
                 print("[Pairing] ✅ HMAC verified — auto-authenticated '\(deviceName)'")
             } else {
                 sendControlMessage(type: .pairReject, payload: Data())
                 print("[Pairing] ❌ HMAC failed from '\(deviceName)'")
             }
         }
+    }
+
+    /// Peer verified — switch to .connected, which the engine observes to start streaming
+    private func markAuthenticated(_ peerName: String) {
+        isAuthenticated = true
+        DispatchQueue.main.async { [weak self] in
+            self?.state = .connected(peerName)
+        }
+    }
+
+    /// Forget the previous peer's authentication and hide any PIN still on screen
+    private func resetAuthentication() {
+        isAuthenticated = false
+        pendingDeviceId = nil
+        pendingDeviceName = nil
+        pairingManager?.cancelPairing()
     }
 
     /// Handle client disconnect — only if the disconnected connection is still current
@@ -488,6 +532,7 @@ final class StreamSender: ObservableObject {
         udpConnection?.cancel()
         udpConnection = nil
         remoteHost = nil
+        resetAuthentication()
         print("[Net] Client disconnected — waiting for reconnection...")
         DispatchQueue.main.async { [weak self] in
             self?.state = .listening
@@ -529,12 +574,24 @@ final class StreamSender: ObservableObject {
 
     // ── Streaming Control ───────────────────────────────────────────────────
 
-    /// Begin streaming: open UDP channel and send START_STREAM
+    /// Begin streaming: open UDP channel and send START_STREAM.
+    /// Called from the main thread; connection state lives on networkQueue.
     func startStreaming() {
+        networkQueue.async { [weak self] in
+            self?.startStreamingOnNetworkQueue()
+        }
+    }
+
+    private func startStreamingOnNetworkQueue() {
         guard tcpConnection != nil, let host = remoteHost else {
             print("[Net] Cannot start streaming — not connected")
             return
         }
+        guard isAuthenticated else {
+            print("[Net] Cannot start streaming — peer not authenticated")
+            return
+        }
+        guard udpConnection == nil else { return }  // already streaming
 
         // Open UDP connection to receiver
         let udpParams = NWParameters.udp
@@ -563,13 +620,7 @@ final class StreamSender: ObservableObject {
         streamStartTime = CACurrentMediaTime()
         frameSequenceNumber = 0
 
-        let peerName: String
-        if case .connected(let name) = state {
-            peerName = name
-        } else {
-            peerName = "Unknown"
-        }
-
+        let peerName = pendingDeviceName ?? "Receiver"
         DispatchQueue.main.async { [weak self] in
             self?.state = .streaming(peerName)
         }

@@ -46,7 +46,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         // Wire pairing manager to sender immediately so it's ready
         // before any connections arrive (fixes: PIN not asked)
         sender.pairingManager = pairingManager
+
+        // ContentView only observes the engine; re-publish nested PIN changes
+        // so the PIN appears the moment it is generated.
+        pairingCancellable = pairingManager.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
     }
+
+    private var pairingCancellable: AnyCancellable?
 
     // ── Internals ───────────────────────────────────────────────────────────
 

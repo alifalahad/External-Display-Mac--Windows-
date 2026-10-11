@@ -362,7 +362,7 @@ struct ContentView: View {
                         .font(.title3)
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Pairing PIN")
+                        Text("Pairing PIN — enter it on the Windows receiver")
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.secondary)
 

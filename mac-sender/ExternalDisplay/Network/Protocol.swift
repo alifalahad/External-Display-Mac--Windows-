@@ -159,21 +159,13 @@ struct HelloPayload {
     static func deserialize(from data: Data) -> HelloPayload? {
         guard data.count >= 66 else { return nil }
         var h = HelloPayload()
-        h.receiverName = data.prefix(64).withUnsafeBytes { buf in
-            String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
-        }
+        let base = data.startIndex
+        h.receiverName = data.subdata(in: base..<base + 64).nullTerminatedUTF8String()
         var offset = 64
         h.udpPort = data.readLE(at: &offset)
-        // Read optional device ID (added in Phase 14)
-        print("[Net] HELLO payload size: \(data.count) bytes (need 130 for deviceId)")
+        // Device ID (added in Phase 14) — empty if the receiver is too old to send it
         if data.count >= 130 {
-            let idBytes = data.subdata(in: 66..<130)
-            let firstBytes = idBytes.prefix(8).map { String(format: "%02x", $0) }.joined(separator: " ")
-            print("[Net] deviceId bytes[0..7]: \(firstBytes)")
-            h.deviceId = idBytes.withUnsafeBytes { buf in
-                String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
-            }
-            print("[Net] parsed deviceId: '\(h.deviceId)'")
+            h.deviceId = data.subdata(in: base + 66..<base + 130).nullTerminatedUTF8String()
         }
         return h
     }
@@ -239,9 +231,7 @@ struct PairResponsePayload {
 
     /// Extract PIN string from data_ field
     var pinString: String {
-        data_.withUnsafeBytes { buf in
-            String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
-        }
+        data_.nullTerminatedUTF8String()
     }
 }
 
@@ -400,8 +390,7 @@ enum CRC32 {
 
 extension Data {
     mutating func appendLE<T: FixedWidthInteger>(_ value: T) {
-        var le = value.littleEndian
-        append(UnsafeBufferPointer(start: &le, count: 1))
+        Swift.withUnsafeBytes(of: value.littleEndian) { append(contentsOf: $0) }
     }
 
     func readLE<T: FixedWidthInteger>(at offset: inout Int) -> T {
@@ -410,5 +399,12 @@ extension Data {
             .withUnsafeBytes { $0.load(as: T.self) }
         offset += size
         return T(littleEndian: value)
+    }
+
+    /// Decode a fixed-size, null-padded UTF-8 field without reading past its end
+    /// (String(cString:) would overrun if the peer omits the terminator).
+    func nullTerminatedUTF8String() -> String {
+        let bytes = prefix { $0 != 0 }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }

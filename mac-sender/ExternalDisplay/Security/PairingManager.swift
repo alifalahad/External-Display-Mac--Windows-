@@ -136,14 +136,12 @@ final class PairingManager: ObservableObject {
             return false
         }
 
-        // Compute expected HMAC-SHA256(nonce, pairingKey)
+        // Verify HMAC-SHA256(nonce, pairingKey) — constant-time comparison
         let key = SymmetricKey(data: device.pairingKey)
-        let expectedHMAC = HMAC<SHA256>.authenticationCode(for: nonce, using: key)
-        let expectedData = Data(expectedHMAC)
 
         pendingNonce = nil  // Consume the nonce
 
-        if receivedHMAC == expectedData {
+        if HMAC<SHA256>.isValidAuthenticationCode(receivedHMAC, authenticating: nonce, using: key) {
             print("[Pairing] ✅ HMAC verified for '\(device.name)'")
             return true
         } else {
