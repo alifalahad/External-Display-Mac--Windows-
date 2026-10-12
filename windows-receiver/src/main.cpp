@@ -8,6 +8,7 @@
 // Usage:
 //   ExternalDisplayReceiver.exe              → auto-discover Mac sender
 //   ExternalDisplayReceiver.exe 192.168.1.5  → connect to Mac sender directly
+//   --gpu=high | --gpu=low | --gpu=default   → which GPU renders (hybrid laptops)
 //
 // Controls:
 //   ESC  — Exit
@@ -25,6 +26,7 @@
 #include "Discovery/ServiceDiscovery.h"
 #include "Security/PairingManager.h"
 #include "UI/PinPrompt.h"
+#include "App/CrashHandler.h"
 
 #include <Windows.h>
 #include <chrono>
@@ -33,6 +35,7 @@
 #include <string>
 #include <mutex>
 #include <deque>
+#include <sstream>
 
 // Console helpers
 static FILE* gConsoleFile = nullptr;
@@ -43,7 +46,40 @@ static void InitConsole() {
         freopen_s(&gConsoleFile, "CONOUT$", "w", stderr);
         freopen_s(&gConsoleInput, "CONIN$", "r", stdin);  // Console input for sender selection
         SetConsoleTitleW(L"External Display Receiver - Stats");
+        SetConsoleOutputCP(CP_UTF8);  // log lines contain UTF-8 (names, arrows)
+
+        // QuickEdit pauses ALL console output while text is selected — the
+        // render loop then blocks inside printf and the display freezes.
+        HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD mode = 0;
+        if (GetConsoleMode(input, &mode)) {
+            SetConsoleMode(input, (mode & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
     }
+}
+
+/// Phase 15: find the Mac again via mDNS (its IP may have changed).
+/// Prefers the service we connected to before; returns "" if nothing answers.
+static std::string RediscoverMac(const std::string& serviceName) {
+    ServiceDiscovery discovery;
+    std::mutex foundMutex;
+    std::string foundIP;
+    discovery.setDiscoveryCallback(
+        [&](const DiscoveredService& svc) {
+            if (svc.ipAddress.empty()) return;
+            if (!serviceName.empty() && svc.name != serviceName) return;
+            std::lock_guard<std::mutex> lock(foundMutex);
+            foundIP = svc.ipAddress;
+        });
+    discovery.startBrowsing();
+    for (int i = 0; i < 50; i++) {  // up to 5 s
+        Sleep(100);
+        std::lock_guard<std::mutex> lock(foundMutex);
+        if (!foundIP.empty()) break;
+    }
+    discovery.stopBrowsing();
+    std::lock_guard<std::mutex> lock(foundMutex);
+    return foundIP;
 }
 static void CleanupConsole() {
     if (gConsoleFile) { fclose(gConsoleFile); gConsoleFile = nullptr; }
@@ -121,12 +157,22 @@ static uint32_t gPendingWidth = 0, gPendingHeight = 0, gPendingFPS = 0;
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                    _In_ LPSTR lpCmdLine, _In_ int) {
     InitConsole();
+    InstallCrashHandler();
 
+    // Arguments: [mac-ip] [--gpu=high|low|default]
     std::string macIP;
-    if (lpCmdLine && strlen(lpCmdLine) > 0) {
-        macIP = lpCmdLine;
-        while (!macIP.empty() && macIP.back() == ' ') macIP.pop_back();
-        while (!macIP.empty() && macIP.front() == ' ') macIP.erase(macIP.begin());
+    std::string macServiceName;  // mDNS name, used to find the Mac again if its IP changes
+    GpuPreference gpuPreference = GpuPreference::Default;
+    {
+        std::istringstream args(lpCmdLine ? lpCmdLine : "");
+        std::string arg;
+        while (args >> arg) {
+            if (arg == "--gpu=high")         gpuPreference = GpuPreference::HighPerformance;
+            else if (arg == "--gpu=low")     gpuPreference = GpuPreference::MinimumPower;
+            else if (arg == "--gpu=default") gpuPreference = GpuPreference::Default;
+            else if (arg.rfind("--", 0) == 0) printf("Ignoring unknown option: %s\n", arg.c_str());
+            else macIP = arg;
+        }
     }
 
     // ── Auto-Discovery Mode ─────────────────────────────────────────────
@@ -200,6 +246,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (foundServices.size() == 1) {
                 // Auto-select the only sender
                 macIP = foundServices[0].ipAddress;
+                macServiceName = foundServices[0].name;
                 printf("\nAuto-connecting to: %s (%s)\n\n",
                     foundServices[0].name.c_str(), macIP.c_str());
             } else {
@@ -222,6 +269,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     choice = 1;
                 }
                 macIP = foundServices[choice - 1].ipAddress;
+                macServiceName = foundServices[choice - 1].name;
                 printf("\nConnecting to: %s (%s)\n\n",
                     foundServices[choice - 1].name.c_str(), macIP.c_str());
             }
@@ -246,9 +294,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             window.GetWidth(), window.GetHeight(),
             window.IsFullscreen() ? "Fullscreen" : "Windowed");
 
-        D3D11Renderer renderer(
-            window.GetHandle(), window.GetWidth(), window.GetHeight());
-        wprintf(L"GPU:    %s\n", renderer.GetAdapterName().c_str());
+        printf("GPUs:\n");
+        D3D11Renderer::LogAdapters();
+        auto renderer = std::make_unique<D3D11Renderer>(
+            window.GetHandle(), window.GetWidth(), window.GetHeight(), gpuPreference);
+        wprintf(L"GPU:    %s (rendering)\n", renderer->GetAdapterName().c_str());
         printf("VSync:  Enabled (60 Hz target)\n\n");
 
         // Declared before the receiver so it outlives the receiver's network thread
@@ -292,6 +342,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             pairingMgr = std::make_unique<PairingManager>();
             pairingMgr->initialize();
             receiver->setPairingManager(pairingMgr.get());
+            receiver->setHostResolver([macServiceName] { return RediscoverMac(macServiceName); });
 
             if (!receiver->connect(macIP))
                 fprintf(stderr, "Failed to connect to %s\n", macIP.c_str());
@@ -329,8 +380,39 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
 
         while (window.ProcessMessages()) {
             if (window.WasResized()) {
-                renderer.Resize(window.GetWidth(), window.GetHeight());
+                renderer->Resize(window.GetWidth(), window.GetHeight());
                 window.ClearResizedFlag();
+            }
+
+            // Phase 15: GPU removed/reset (driver update, TDR, hybrid GPU switch)
+            // or a failed resize — rebuild the renderer instead of crashing.
+            if (renderer->IsDeviceLost()) {
+                printf("[Renderer] Recreating renderer...\n");
+                renderer.reset();  // release the old swap chain first
+                for (int attempt = 1; !renderer; attempt++) {
+                    try {
+                        renderer = std::make_unique<D3D11Renderer>(
+                            window.GetHandle(), window.GetWidth(), window.GetHeight(), gpuPreference);
+                    } catch (const std::exception& e) {
+                        if (attempt >= 10) throw;
+                        printf("[Renderer] Recreate failed (%s), retrying...\n", e.what());
+                        Sleep(500);
+                    }
+                }
+                wprintf(L"[Renderer] Recovered on %s\n", renderer->GetAdapterName().c_str());
+                {
+                    // Re-upload the last frame so a static screen isn't left black
+                    std::lock_guard<std::mutex> lock(gNV12Mutex);
+                    gHasNewNV12 = !gLatestNV12.yPlane.empty();
+                }
+                if (receiver) receiver->requestKeyframe();
+            }
+
+            // Phase 15: laptop woke up — the old TCP connection is dead, don't
+            // wait for the 15 s timeout
+            if (window.TakeResumeEvent() && receiver) {
+                printf("[Power] Resumed from sleep — reconnecting now\n");
+                receiver->forceReconnect();
             }
 
             // Handle pending stream restart on main thread (thread-safe)
@@ -352,6 +434,10 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
 
                     decoder->shutdown();
                     decoder->initialize(gPendingWidth, gPendingHeight);
+
+                    // The decoder can only start from an IDR frame — ask for one
+                    // now that it is ready (earlier ones were flushed above)
+                    if (receiver) receiver->requestKeyframe();
 
                     float aspect = (float)gPendingWidth / (float)gPendingHeight;
                     window.SetVideoAspectRatio(aspect);
@@ -399,7 +485,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (networkMode) {
                 std::lock_guard<std::mutex> lock(gNV12Mutex);
                 if (gHasNewNV12) {
-                    renderer.UpdateFrameNV12(
+                    renderer->UpdateFrameNV12(
                         gLatestNV12.yPlane.data(),
                         gLatestNV12.uvPlane.data(),
                         gLatestNV12.stride,
@@ -433,7 +519,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             auto now = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(now - startTime).count();
             stats.BeginFrame();
-            renderer.Render(elapsed, (float)frameCounter, window.ShowStats() ? &stats : nullptr);
+            renderer->Render(elapsed, (float)frameCounter, window.ShowStats() ? &stats : nullptr);
             stats.EndFrame();
             frameCounter++;
 
@@ -453,9 +539,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         case StreamReceiver::State::Reconnecting: stateStr = "Reconnecting"; break;
                         case StreamReceiver::State::Error:        stateStr = "Error"; break;
                     }
-                    printf("  Net: %s | Recv: %llu bytes, %llu pkts, %llu frames (%llu dropped)\n",
-                        stateStr, ns.bytesReceived, ns.packetsReceived,
-                        ns.framesReceived, ns.framesDropped);
+                    printf("  Net: %s | Recv: %llu bytes, %llu pkts (%llu lost), %llu frames (%llu dropped) | Keyframe req: %llu\n",
+                        stateStr, ns.bytesReceived, ns.packetsReceived, ns.packetsLost,
+                        ns.framesReceived, ns.framesDropped, ns.keyframeRequests);
                     if (decoder) {
                         auto ds = decoder->getStats();
                         size_t q;

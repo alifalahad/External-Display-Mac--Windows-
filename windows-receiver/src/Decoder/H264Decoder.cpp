@@ -95,7 +95,10 @@ bool H264Decoder::configureOutput() {
         outputType->GetGUID(MF_MT_SUBTYPE, &subtype);
         if (subtype == MFVideoFormat_NV12) {
             hr = m_decoder->SetOutputType(0, outputType, 0);
-            if (SUCCEEDED(hr)) found = true;
+            if (SUCCEEDED(hr)) {
+                found = true;
+                updateFrameSizeFrom(outputType);
+            }
             outputType->Release();
             if (found) break;
         } else {
@@ -104,6 +107,31 @@ bool H264Decoder::configureOutput() {
     }
     if (found) std::cout << "[Decoder] Output configured: NV12" << std::endl;
     return found;
+}
+
+void H264Decoder::updateFrameSizeFrom(IMFMediaType* outputType) {
+    // The real picture size comes from the bitstream (SPS). It can differ from
+    // START_STREAM if the Mac restarted capture at another resolution.
+    UINT32 w = 0, h = 0;
+    MFVideoArea aperture{};
+    bool hasAperture = SUCCEEDED(outputType->GetBlob(
+        MF_MT_MINIMUM_DISPLAY_APERTURE, reinterpret_cast<UINT8*>(&aperture),
+        sizeof(aperture), nullptr));
+    if (hasAperture && aperture.Area.cx > 0 && aperture.Area.cy > 0) {
+        w = (UINT32)aperture.Area.cx;
+        h = (UINT32)aperture.Area.cy;
+    } else if (FAILED(MFGetAttributeSize(outputType, MF_MT_FRAME_SIZE, &w, &h))) {
+        return;
+    } else if (w == m_width && h == ((m_height + 15) & ~15u)) {
+        return;  // just macroblock padding (e.g. 1088 for 1080) — keep display size
+    }
+
+    if (w > 0 && h > 0 && (w != m_width || h != m_height)) {
+        std::cout << "[Decoder] Stream size changed: " << m_width << "x" << m_height
+                  << " -> " << w << "x" << h << std::endl;
+        m_width = w;
+        m_height = h;
+    }
 }
 
 bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {

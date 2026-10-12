@@ -68,6 +68,18 @@ void ClipboardSync::stop() {
 void ClipboardSync::poll() {
     if (!m_clipboardWindow) return;
 
+    std::string remote;
+    bool hasRemote = false;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        if (m_hasPendingRemote) {
+            remote.swap(m_pendingRemote);
+            m_hasPendingRemote = false;
+            hasRemote = true;
+        }
+    }
+    if (hasRemote) applyRemoteClipboard(remote);
+
     // Process pending messages for our hidden clipboard window
     MSG msg;
     while (PeekMessageW(&msg, m_clipboardWindow, 0, 0, PM_REMOVE)) {
@@ -123,8 +135,13 @@ void ClipboardSync::onClipboardUpdate() {
 // ── Receive from Mac ────────────────────────────────────────────────────────
 
 void ClipboardSync::receiveRemoteClipboard(const std::string& utf8Text) {
-    if (utf8Text.empty()) return;
+    if (utf8Text.empty() || utf8Text.size() > MAX_TEXT_SIZE) return;
+    std::lock_guard<std::mutex> lock(m_pendingMutex);
+    m_pendingRemote = utf8Text;  // only the newest text matters
+    m_hasPendingRemote = true;
+}
 
+void ClipboardSync::applyRemoteClipboard(const std::string& utf8Text) {
     size_t hash = std::hash<std::string>{}(utf8Text);
 
     // Dedup: don't set if it's the same as what we just sent

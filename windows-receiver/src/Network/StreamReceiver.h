@@ -4,11 +4,16 @@
 // Connects to the Mac sender via TCP (control) and receives H.264 video
 // data over UDP. Reassembles fragmented frames.
 //
+// Fault tolerance (Phase 15):
+//   - connect timeout, exponential backoff (1→8 s), immediate retry on resume
+//   - dead-peer detection: no TCP data for 15 s (Mac pings every 5 s)
+//   - mDNS re-discovery when the Mac's IP changes
+//   - UDP packet-loss detection → rate-limited keyframe requests
+//
 // Usage:
 //   StreamReceiver receiver;
 //   receiver.setFrameCallback([](const uint8_t* data, size_t len, bool key) { ... });
 //   receiver.connect("192.168.1.x");
-//   // ... in main loop: receiver.poll();
 //   receiver.disconnect();
 // =============================================================================
 
@@ -25,6 +30,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -48,6 +54,10 @@ public:
     /// Called when stream parameters are received from sender
     using StreamInfoCallback = std::function<void(uint32_t width, uint32_t height, uint32_t fps)>;
 
+    /// Called on the network thread after repeated connect failures (the Mac's
+    /// IP may have changed). Returns the Mac's current IP, or "" if not found.
+    using HostResolver = std::function<std::string()>;
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     StreamReceiver();
@@ -59,6 +69,10 @@ public:
 
     /// Disconnect and clean up
     void disconnect();
+
+    /// Drop the current connection and reconnect without backoff
+    /// (e.g. after the laptop resumes from sleep). Safe from any thread.
+    void forceReconnect();
 
     /// Get current connection state
     State getState() const { return m_state.load(); }
@@ -75,7 +89,10 @@ public:
     /// Set pairing manager for secure authentication
     void setPairingManager(PairingManager* pm) { m_pairingManager = pm; }
 
-    /// Request a keyframe from the sender (Phase 15: for decoder recovery)
+    /// Set the re-discovery hook used when the Mac is unreachable
+    void setHostResolver(HostResolver resolver) { m_hostResolver = std::move(resolver); }
+
+    /// Request a keyframe from the sender (decoder reset / recovery)
     void requestKeyframe() { tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
 
     // ── Pairing (PIN is entered on the UI thread, never on the network thread) ──
@@ -97,9 +114,11 @@ public:
     struct Stats {
         uint64_t bytesReceived = 0;
         uint64_t packetsReceived = 0;
+        uint64_t packetsLost = 0;      // gaps in the UDP packet sequence
         uint64_t framesReceived = 0;
         uint64_t framesDropped = 0;    // incomplete fragments
         uint64_t fragmentsReceived = 0;
+        uint64_t keyframeRequests = 0;
     };
 
     Stats getStats() const {
@@ -134,16 +153,25 @@ public:
 private:
     // ── Network Thread ──────────────────────────────────────────────────────
 
-    void networkThread(const std::string& hostIP);
+    void networkThread(std::string hostIP);
+    void runConnectionLoop(std::string hostIP);
+
+    /// Sleep before the next connection attempt (exponential backoff,
+    /// interrupted by forceReconnect / disconnect)
+    void waitBeforeReconnect();
 
     /// TCP control channel operations
     bool tcpConnect(const std::string& hostIP);
     void tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen);
     bool tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload);
+    bool recvExact(uint8_t* dst, size_t len);
+    void closeTcpSocket();
+    void closeUdpSocket();
 
     /// UDP data channel operations
     bool udpBind();
     void udpReceiveLoop();
+    void trackUdpSequence(uint32_t sequence);
 
     /// Handle control messages
     void handleWelcome(const std::vector<uint8_t>& payload);
@@ -157,6 +185,9 @@ private:
                              const uint8_t* data, size_t dataLen);
     void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe);
 
+    /// Ask the Mac for a keyframe after loss (at most once per interval)
+    void requestKeyframeAfterLoss();
+
     /// Handle pairing messages. Return false when the connection must be dropped.
     bool handlePairChallenge(const std::vector<uint8_t>& payload);
     void handlePairAccept(const std::vector<uint8_t>& payload);
@@ -167,10 +198,12 @@ private:
     std::atomic<State> m_state{State::Disconnected};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_autoReconnect{true};
-    int m_reconnectAttempts = 0;    // Phase 15: exponential backoff counter
-    bool m_isReconnect = false;     // Phase 15: true after first connection cycle
+    std::atomic<bool> m_skipBackoff{false};     // set by forceReconnect()
+    int m_reconnectAttempts = 0;                // backoff counter (network thread)
+    int m_failedConnects = 0;                   // consecutive TCP connect failures
 
     PairingManager* m_pairingManager = nullptr;  // Not owned — must outlive this receiver
+    HostResolver m_hostResolver;
 
     // PIN handshake state, shared between network and UI threads
     std::atomic<uint32_t> m_connectionId{0};    // incremented per TCP connection
@@ -187,8 +220,26 @@ private:
     StreamInfoCallback m_streamInfoCallback;
     ClipboardCallback m_clipboardCallback;
 
-    std::mutex m_sendMutex;   // TCP sends come from network, UI and clipboard paths
+    std::mutex m_sendMutex;   // TCP sends come from network, UI and UDP threads
     uint32_t m_sequence = 0;  // guarded by m_sendMutex
+
+    // Dead-peer detection (network thread only)
+    std::chrono::steady_clock::time_point m_lastRxTime;
+
+    static constexpr int      CONNECT_TIMEOUT_MS  = 3000;
+    static constexpr int      PEER_TIMEOUT_MS     = 15000;   // Mac pings every 5 s
+    static constexpr int      MAX_BACKOFF_MS      = 8000;
+    static constexpr int      REDISCOVER_AFTER    = 3;       // failed connects
+    static constexpr uint32_t MAX_CONTROL_PAYLOAD = 4 * 1024 * 1024;
+    static constexpr uint16_t MAX_FRAGMENTS       = 8192;    // ~11 MB frame
+    static constexpr int      KEYFRAME_REQUEST_INTERVAL_MS = 500;
+
+    // ── UDP loss detection (UDP thread only) ────────────────────────────────
+
+    std::atomic<bool> m_udpSequenceReset{false};  // set on START_STREAM (sender restarts numbering)
+    bool m_haveUdpSequence = false;
+    uint32_t m_expectedUdpSequence = 0;
+    std::chrono::steady_clock::time_point m_lastLossKeyframeRequest{};
 
     // ── Fragment Reassembly ─────────────────────────────────────────────────
 
@@ -202,7 +253,7 @@ private:
     std::mutex m_fragmentMutex;
     std::map<uint32_t, PendingFrame> m_pendingFrames;
 
-    /// Clean up old incomplete frames (keep only last N)
+    /// Drop incomplete frames that can no longer complete
     void cleanupOldFrames(uint32_t currentFrameSeq);
 
     // ── Stats ───────────────────────────────────────────────────────────────
@@ -219,6 +270,7 @@ private:
     uint64_t m_prevFramesReceived = 0;
     uint64_t m_prevFramesDropped = 0;
     uint64_t m_prevPacketsReceived = 0;
+    uint64_t m_prevPacketsLost = 0;
     std::chrono::steady_clock::time_point m_lastQualityReport;
     static constexpr float QUALITY_REPORT_INTERVAL = 2.0f;  // seconds
 };

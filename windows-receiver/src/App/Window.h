@@ -49,6 +49,9 @@ public:
     bool WasResized() const      { return resized_; }
     void ClearResizedFlag()      { resized_ = false; }
 
+    // True once after the system resumes from sleep (Phase 15: reconnect immediately)
+    bool TakeResumeEvent()       { bool r = resumed_; resumed_ = false; return r; }
+
 private:
     void RegisterWindowClass();
     void CreateFullscreenWindow(const wchar_t* title);
@@ -62,6 +65,7 @@ private:
     bool fullscreen_ = true;
     bool resized_    = false;
     bool showStats_  = true;
+    bool resumed_    = false;
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;

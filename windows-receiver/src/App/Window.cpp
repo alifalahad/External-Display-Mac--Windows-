@@ -169,6 +169,12 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     switch (msg) {
+    case WM_POWERBROADCAST:
+        if (self && (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)) {
+            self->resumed_ = true;
+        }
+        return TRUE;
+
     case WM_SIZE:
         if (self && wp != SIZE_MINIMIZED) {
             int newWidth  = LOWORD(lp);

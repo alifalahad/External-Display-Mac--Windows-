@@ -8,6 +8,7 @@
 
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_6.h>
 #include <stdexcept>
 #include <string>
 #include <cstdio>
@@ -31,10 +32,10 @@ static void ThrowIfFailed(HRESULT hr, const char* operation) {
 // Construction
 // =============================================================================
 
-D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height)
+D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height, GpuPreference gpuPreference)
     : hwnd_(hwnd), width_(width), height_(height)
 {
-    CreateDeviceAndSwapChain(hwnd, width, height);
+    CreateDeviceAndSwapChain(hwnd, width, height, gpuPreference);
     CreateRenderTarget();
     CompileShaders();
     CreateConstantBuffer();
@@ -46,7 +47,53 @@ D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height)
 // Device & Swap Chain
 // =============================================================================
 
-void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height) {
+void D3D11Renderer::LogAdapters() {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return;
+
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
+        if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+            wprintf(L"  GPU %u: %s (%llu MB VRAM)%s\n", i, desc.Description,
+                    (unsigned long long)(desc.DedicatedVideoMemory / (1024 * 1024)),
+                    i == 0 ? L"  <- Windows default" : L"");
+        }
+        adapter.Reset();
+    }
+}
+
+void D3D11Renderer::CheckDeviceLost(HRESULT hr, const char* operation) {
+    if (hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET) return;
+    if (!deviceLost_) {
+        HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : hr;
+        printf("[Renderer] GPU device lost during %s (0x%08lX, reason 0x%08lX)\n",
+               operation, (unsigned long)hr, (unsigned long)reason);
+    }
+    deviceLost_ = true;
+}
+
+void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
+                                              GpuPreference pref) {
+    // 0. Pick the adapter. Default (nullptr) = Windows' choice, which on hybrid
+    //    laptops is the integrated GPU that drives the built-in panel.
+    ComPtr<IDXGIAdapter1> chosenAdapter;
+    if (pref != GpuPreference::Default) {
+        ComPtr<IDXGIFactory6> factory6;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory6)))) {
+            factory6->EnumAdapterByGpuPreference(
+                0,
+                pref == GpuPreference::HighPerformance
+                    ? DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE
+                    : DXGI_GPU_PREFERENCE_MINIMUM_POWER,
+                IID_PPV_ARGS(&chosenAdapter));
+        }
+        if (!chosenAdapter) {
+            printf("[Renderer] GPU preference needs Windows 10 1803+ — using default adapter\n");
+        }
+    }
+
     // 1. Create D3D11 device with BGRA support (needed for D2D interop)
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #ifdef _DEBUG
@@ -61,8 +108,8 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height) {
 
     D3D_FEATURE_LEVEL featureLevel;
     HRESULT hr = D3D11CreateDevice(
-        nullptr,                    // default adapter
-        D3D_DRIVER_TYPE_HARDWARE,
+        chosenAdapter.Get(),        // nullptr = default adapter
+        chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
         nullptr,                    // no software rasterizer
         flags,
         featureLevels,
@@ -292,15 +339,26 @@ void D3D11Renderer::Resize(int width, int height) {
     // Release D3D11 render target
     ReleaseRenderTarget();
 
-    // Resize swap chain buffers
+    // Resize swap chain buffers. Failure must not kill the app: flag the
+    // device as lost and let the owner rebuild the renderer.
     HRESULT hr = swapChain_->ResizeBuffers(
         0, static_cast<UINT>(width), static_cast<UINT>(height),
         DXGI_FORMAT_UNKNOWN, 0
     );
-    ThrowIfFailed(hr, "ResizeBuffers");
+    if (FAILED(hr)) {
+        printf("[Renderer] ResizeBuffers failed (0x%08lX) — recreating renderer\n",
+               (unsigned long)hr);
+        deviceLost_ = true;
+        return;
+    }
 
     // Recreate render target
-    CreateRenderTarget();
+    try {
+        CreateRenderTarget();
+    } catch (const std::exception& e) {
+        printf("[Renderer] %s — recreating renderer\n", e.what());
+        deviceLost_ = true;
+    }
 }
 
 // =============================================================================
@@ -308,6 +366,8 @@ void D3D11Renderer::Resize(int width, int height) {
 // =============================================================================
 
 void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats) {
+    if (deviceLost_ || !rtv_) return;  // owner recreates the renderer
+
     // ── 1. Update constant buffer ───────────────────────────────────────────
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = context_->Map(constantBuffer_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -493,7 +553,8 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     }
 
     // ── 5. Present (VSync) ──────────────────────────────────────────────────
-    swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
+    hr = swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
+    CheckDeviceLost(hr, "Present");
 }
 
 // =============================================================================
@@ -611,6 +672,7 @@ void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
 void D3D11Renderer::UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
                                      int nv12Stride, uint32_t frameWidth,
                                      uint32_t frameHeight) {
+    if (deviceLost_) return;
     EnsureNV12Textures(frameWidth, frameHeight);
     if (!yTexture_ || !uvTexture_) return;
 

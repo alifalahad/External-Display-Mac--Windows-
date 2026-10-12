@@ -6,6 +6,35 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <exception>
+
+using Clock = std::chrono::steady_clock;
+
+namespace {
+
+/// Wait up to timeoutMs for the socket to become readable.
+/// Returns >0 readable, 0 timeout, SOCKET_ERROR on error.
+int WaitReadable(SOCKET s, int timeoutMs) {
+    fd_set readSet;
+    FD_ZERO(&readSet);
+    FD_SET(s, &readSet);
+    timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+    return select(0, &readSet, nullptr, nullptr, &tv);
+}
+
+/// This PC's name as UTF-8 — shown on the Mac so multiple receivers are distinguishable
+std::string ComputerNameUTF8() {
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW(name, &size)) return "Windows Receiver";
+    int len = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 1) return "Windows Receiver";
+    std::string out((size_t)len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, name, -1, out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+} // namespace
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
@@ -36,67 +65,90 @@ void StreamReceiver::disconnect() {
     m_state.store(State::Disconnected);
     m_pinWantedFor.store(0);
 
-    {
-        std::lock_guard<std::mutex> lock(m_sendMutex);
-        if (m_tcpSocket != INVALID_SOCKET) {
-            closesocket(m_tcpSocket);
-            m_tcpSocket = INVALID_SOCKET;
-        }
-    }
-    if (m_udpSocket != INVALID_SOCKET) {
-        closesocket(m_udpSocket);
-        m_udpSocket = INVALID_SOCKET;
-    }
+    closeTcpSocket();
+    closeUdpSocket();
 
     if (m_networkThread.joinable()) m_networkThread.join();
     if (m_udpThread.joinable()) m_udpThread.join();
 }
 
-void StreamReceiver::networkThread(const std::string& hostIP) {
+void StreamReceiver::forceReconnect() {
+    m_skipBackoff.store(true);
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_tcpSocket != INVALID_SOCKET) {
+        // The network thread sees EOF, cleans up and reconnects immediately
+        shutdown(m_tcpSocket, SD_BOTH);
+    }
+}
+
+// ── Network Thread ──────────────────────────────────────────────────────────
+
+void StreamReceiver::networkThread(std::string hostIP) {
+    // An exception escaping a std::thread calls std::terminate — log it instead
+    try {
+        runConnectionLoop(std::move(hostIP));
+    } catch (const std::exception& e) {
+        std::cerr << "[Net] Fatal error in network thread: " << e.what() << std::endl;
+        m_state.store(State::Error);
+    }
+}
+
+void StreamReceiver::runConnectionLoop(std::string host) {
     while (m_running.load()) {
-        std::cout << "[Net] Connecting to " << hostIP << ":" << exdp::TCP_PORT << std::endl;
+        std::cout << "[Net] Connecting to " << host << ":" << exdp::TCP_PORT << std::endl;
         m_state.store(State::Connecting);
 
-        // Step 1: Connect TCP
-        if (!tcpConnect(hostIP)) {
-            if (!m_running.load() || !m_autoReconnect.load()) {
+        // Step 1: Connect TCP (bounded by CONNECT_TIMEOUT_MS)
+        if (!tcpConnect(host)) {
+            if (!m_running.load()) break;
+            if (!m_autoReconnect.load()) {
                 m_state.store(State::Error);
                 return;
             }
-            std::cout << "[Net] Connection failed, retrying in 3s..." << std::endl;
-            m_state.store(State::Reconnecting);
-            for (int i = 0; i < 30 && m_running.load(); i++)
-                Sleep(100);  // 3s in 100ms chunks (interruptible)
+            // Phase 15: the Mac may have a new IP (DHCP renew, other network)
+            m_failedConnects++;
+            if (m_hostResolver && m_failedConnects % REDISCOVER_AFTER == 0) {
+                std::cout << "[Net] Mac unreachable at " << host
+                          << " — searching the network (mDNS)..." << std::endl;
+                std::string found = m_hostResolver();
+                if (!found.empty() && found != host) {
+                    std::cout << "[Net] Mac found at new address " << found << std::endl;
+                    host = found;
+                    continue;
+                }
+            }
+            waitBeforeReconnect();
             continue;
         }
+        m_failedConnects = 0;
         std::cout << "[Net] TCP connected" << std::endl;
         m_connectionId.fetch_add(1);
         m_pinWantedFor.store(0);
+        m_lastRxTime = Clock::now();
 
         // Step 2: Bind UDP socket
         if (!udpBind()) {
-            m_state.store(State::Error);
-            return;
+            closeTcpSocket();
+            if (!m_running.load()) break;
+            waitBeforeReconnect();
+            continue;
         }
         std::cout << "[Net] UDP bound on port " << exdp::UDP_PORT << std::endl;
 
         // Step 3: Send HELLO (with device ID for pairing)
         exdp::HelloPayload hello{};
-        strncpy_s(hello.receiverName, "Windows Receiver", sizeof(hello.receiverName) - 1);
+        strncpy_s(hello.receiverName, ComputerNameUTF8().c_str(), sizeof(hello.receiverName) - 1);
         hello.udpPort = exdp::UDP_PORT;
         if (m_pairingManager) {
             strncpy_s(hello.deviceId, m_pairingManager->getDeviceId().c_str(),
                       sizeof(hello.deviceId) - 1);
         }
         tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
-        std::cout << "[Net] HELLO sent (device: " << (m_pairingManager ? m_pairingManager->getDeviceId().substr(0, 16) : "none") << "...)" << std::endl;
+        std::cout << "[Net] HELLO sent as '" << hello.receiverName << "' (device: "
+                  << (m_pairingManager ? m_pairingManager->getDeviceId().substr(0, 16) : "none")
+                  << "...)" << std::endl;
 
         m_state.store(State::Connected);
-        m_reconnectAttempts = 0;  // Phase 15: reset backoff on successful connection
-        m_lastQualityReport = std::chrono::steady_clock::now();
-        m_prevFramesReceived = 0;
-        m_prevFramesDropped = 0;
-        m_prevPacketsReceived = 0;
 
         // Step 4: Start UDP receive thread
         m_udpThread = std::thread(&StreamReceiver::udpReceiveLoop, this);
@@ -123,11 +175,10 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                 case exdp::MessageType::StopStream:
                     handleStopStream();
                     break;
-                case exdp::MessageType::Ping: {
-                    // Phase 15: Respond to server heartbeat
+                case exdp::MessageType::Ping:
+                    // Heartbeat — the Mac drops us after 15 s without a PONG
                     tcpSendMessage(exdp::MessageType::Pong, nullptr, 0);
                     break;
-                }
                 case exdp::MessageType::Disconnect:
                     std::cout << "[Net] Disconnect received" << std::endl;
                     m_running.store(false);
@@ -150,55 +201,45 @@ void StreamReceiver::networkThread(const std::string& hostIP) {
                 default:
                     break;
             }
-
-            // Periodically send quality reports while streaming
-            if (m_state.load() == State::Streaming) {
-                auto now = std::chrono::steady_clock::now();
-                float elapsed = std::chrono::duration<float>(now - m_lastQualityReport).count();
-                if (elapsed >= QUALITY_REPORT_INTERVAL) {
-                    sendQualityReport();
-                    m_lastQualityReport = now;
-                }
-            }
         }
 
         // Cleanup sockets for potential reconnect
         m_pinWantedFor.store(0);
-        {
-            std::lock_guard<std::mutex> lock(m_sendMutex);
-            if (m_tcpSocket != INVALID_SOCKET) {
-                closesocket(m_tcpSocket);
-                m_tcpSocket = INVALID_SOCKET;
-            }
-        }
-        if (m_udpSocket != INVALID_SOCKET) {
-            closesocket(m_udpSocket);
-            m_udpSocket = INVALID_SOCKET;
-        }
+        closeTcpSocket();
+        closeUdpSocket();
         if (m_udpThread.joinable()) m_udpThread.join();
 
-        // Auto-reconnect if enabled (Phase 15: exponential backoff)
-        if (m_running.load() && m_autoReconnect.load()) {
-            m_isReconnect = true;
-            m_reconnectAttempts++;
-            // Backoff: 3s, 6s, 12s, 24s, max 30s
-            int delaySec = (std::min)(3 * (1 << (std::min)(m_reconnectAttempts - 1, 3)), 30);
-            std::cout << "[Net] Reconnecting in " << delaySec << "s... (attempt " << m_reconnectAttempts << ")" << std::endl;
-            m_state.store(State::Reconnecting);
-            for (int i = 0; i < delaySec * 10 && m_running.load(); i++)
-                Sleep(100);  // Sleep in 100ms chunks for clean shutdown
-        }
+        if (!m_running.load() || !m_autoReconnect.load()) break;
+        waitBeforeReconnect();
     }
 
     m_state.store(State::Disconnected);
     std::cout << "[Net] Network thread exiting" << std::endl;
 }
 
+void StreamReceiver::waitBeforeReconnect() {
+    m_state.store(State::Reconnecting);
+    if (m_skipBackoff.exchange(false)) {
+        std::cout << "[Net] Reconnecting now" << std::endl;
+        return;
+    }
+
+    // Phase 15: exponential backoff 1 s, 2 s, 4 s, 8 s (cap)
+    m_reconnectAttempts++;
+    int delayMs = (std::min)(1000 << (std::min)(m_reconnectAttempts - 1, 3), MAX_BACKOFF_MS);
+    std::cout << "[Net] Reconnecting in " << delayMs / 1000 << "s (attempt "
+              << m_reconnectAttempts << ")" << std::endl;
+    for (int waited = 0; waited < delayMs && m_running.load(); waited += 100) {
+        if (m_skipBackoff.exchange(false)) break;
+        Sleep(100);
+    }
+}
+
 // ── TCP Operations ──────────────────────────────────────────────────────────
 
 bool StreamReceiver::tcpConnect(const std::string& hostIP) {
-    m_tcpSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (m_tcpSocket == INVALID_SOCKET) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) {
         std::cerr << "[Net] TCP socket creation failed" << std::endl;
         return false;
     }
@@ -206,20 +247,63 @@ bool StreamReceiver::tcpConnect(const std::string& hostIP) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(exdp::TCP_PORT);
-    inet_pton(AF_INET, hostIP.c_str(), &addr.sin_addr);
-
-    if (::connect(m_tcpSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "[Net] TCP connect failed: " << WSAGetLastError() << std::endl;
-        closesocket(m_tcpSocket);
-        m_tcpSocket = INVALID_SOCKET;
+    if (inet_pton(AF_INET, hostIP.c_str(), &addr.sin_addr) != 1) {
+        std::cerr << "[Net] Invalid IPv4 address: " << hostIP << std::endl;
+        closesocket(s);
         return false;
     }
 
+    // Non-blocking connect so an unreachable Mac fails in seconds, not ~21 s
+    u_long nonBlocking = 1;
+    ioctlsocket(s, FIONBIO, &nonBlocking);
+
+    bool connected = false;
+    if (::connect(s, (sockaddr*)&addr, sizeof(addr)) == 0) {
+        connected = true;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set writeSet, errorSet;
+        FD_ZERO(&writeSet);
+        FD_ZERO(&errorSet);
+        FD_SET(s, &writeSet);
+        FD_SET(s, &errorSet);
+        timeval tv{ CONNECT_TIMEOUT_MS / 1000, (CONNECT_TIMEOUT_MS % 1000) * 1000 };
+        int ready = select(0, nullptr, &writeSet, &errorSet, &tv);
+        connected = ready > 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errorSet);
+        if (ready == 0) std::cerr << "[Net] TCP connect timed out" << std::endl;
+    }
+
+    if (!connected) {
+        std::cerr << "[Net] TCP connect failed: " << WSAGetLastError() << std::endl;
+        closesocket(s);
+        return false;
+    }
+
+    nonBlocking = 0;
+    ioctlsocket(s, FIONBIO, &nonBlocking);
+
     // Set TCP_NODELAY for low latency control messages
     BOOL nodelay = TRUE;
-    setsockopt(m_tcpSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
 
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    m_tcpSocket = s;
     return true;
+}
+
+void StreamReceiver::closeTcpSocket() {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_tcpSocket != INVALID_SOCKET) {
+        closesocket(m_tcpSocket);
+        m_tcpSocket = INVALID_SOCKET;
+    }
+}
+
+void StreamReceiver::closeUdpSocket() {
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    if (m_udpSocket != INVALID_SOCKET) {
+        closesocket(m_udpSocket);
+        m_udpSocket = INVALID_SOCKET;
+    }
 }
 
 void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen) {
@@ -230,132 +314,201 @@ void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload,
     send(m_tcpSocket, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
-bool StreamReceiver::tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload) {
-    // Set a timeout so we can check m_running periodically
-    DWORD timeout = 500; // 500ms
-    setsockopt(m_tcpSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+bool StreamReceiver::recvExact(uint8_t* dst, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        if (!m_running.load()) return false;
 
-    // Read header
-    uint8_t headerBuf[exdp::HEADER_SIZE];
-    int totalRead = 0;
-    while (totalRead < exdp::HEADER_SIZE) {
-        int n = recv(m_tcpSocket, (char*)headerBuf + totalRead,
-                     exdp::HEADER_SIZE - totalRead, 0);
-        if (n == 0) return false; // Connection closed
-        if (n == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (err == WSAETIMEDOUT) {
-                if (!m_running.load()) return false;
-                continue; // Retry
+        // select() instead of SO_RCVTIMEO: a timed-out blocking recv leaves a
+        // Winsock TCP socket in an indeterminate state.
+        int ready = WaitReadable(m_tcpSocket, 500);
+        if (ready == SOCKET_ERROR) return false;
+        if (ready == 0) {
+            auto silentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - m_lastRxTime).count();
+            if (silentMs > PEER_TIMEOUT_MS) {
+                std::cerr << "[Net] No data from Mac for " << silentMs / 1000
+                          << "s — connection presumed dead" << std::endl;
+                return false;
             }
-            return false;
+            continue;
         }
-        totalRead += n;
+
+        int n = recv(m_tcpSocket, (char*)dst + got, (int)(len - got), 0);
+        if (n <= 0) return false;  // closed or error
+        got += (size_t)n;
+        m_lastRxTime = Clock::now();
     }
+    return true;
+}
+
+bool StreamReceiver::tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload) {
+    uint8_t headerBuf[exdp::HEADER_SIZE];
+    if (!recvExact(headerBuf, exdp::HEADER_SIZE)) return false;
 
     if (!exdp::parseHeader(headerBuf, exdp::HEADER_SIZE, header)) {
+        std::cerr << "[Net] Bad message header (stream out of sync)" << std::endl;
+        return false;
+    }
+    // Never trust the length field: a corrupt value would allocate gigabytes
+    if (header.payloadLength > MAX_CONTROL_PAYLOAD) {
+        std::cerr << "[Net] Control payload too large (" << header.payloadLength
+                  << " bytes) — dropping connection" << std::endl;
         return false;
     }
 
-    // Read payload
     payload.resize(header.payloadLength);
-    totalRead = 0;
-    while (totalRead < (int)header.payloadLength) {
-        int n = recv(m_tcpSocket, (char*)payload.data() + totalRead,
-                     (int)header.payloadLength - totalRead, 0);
-        if (n <= 0) return false;
-        totalRead += n;
+    if (header.payloadLength > 0 && !recvExact(payload.data(), header.payloadLength)) {
+        return false;
     }
-
     return true;
 }
 
 // ── UDP Operations ──────────────────────────────────────────────────────────
 
 bool StreamReceiver::udpBind() {
-    m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (m_udpSocket == INVALID_SOCKET) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) {
         std::cerr << "[Net] UDP socket creation failed" << std::endl;
         return false;
     }
 
     // Allow reuse
     BOOL reuseAddr = TRUE;
-    setsockopt(m_udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuseAddr, sizeof(reuseAddr));
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuseAddr, sizeof(reuseAddr));
 
     // Increase receive buffer size for burst traffic
     int rcvBufSize = 4 * 1024 * 1024; // 4 MB
-    setsockopt(m_udpSocket, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBufSize, sizeof(rcvBufSize));
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&rcvBufSize, sizeof(rcvBufSize));
+
+    // Timeout so the loop can check m_running and send quality reports
+    DWORD timeout = 100;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(exdp::UDP_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(m_udpSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
         std::cerr << "[Net] UDP bind failed: " << WSAGetLastError() << std::endl;
-        closesocket(m_udpSocket);
-        m_udpSocket = INVALID_SOCKET;
+        closesocket(s);
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(m_sendMutex);
+    m_udpSocket = s;
     return true;
 }
 
 void StreamReceiver::udpReceiveLoop() {
-    std::vector<uint8_t> buffer(65536);
+    try {
+        std::vector<uint8_t> buffer(65536);
+        SOCKET s = m_udpSocket;
 
-    // Set timeout for periodic m_running check
-    DWORD timeout = 100; // 100ms
-    setsockopt(m_udpSocket, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-
-    while (m_running.load()) {
-        sockaddr_in from{};
-        int fromLen = sizeof(from);
-        int n = recvfrom(m_udpSocket, (char*)buffer.data(), (int)buffer.size(), 0,
-                         (sockaddr*)&from, &fromLen);
-
-        if (n <= 0) {
-            if (WSAGetLastError() == WSAETIMEDOUT) continue;
-            break;
-        }
-
-        if (n < exdp::HEADER_SIZE) continue;
-
-        // Parse header
-        exdp::ProtocolHeader header;
-        if (!exdp::parseHeader(buffer.data(), n, header)) continue;
-
+        m_haveUdpSequence = false;
+        m_lastQualityReport = Clock::now();
         {
             std::lock_guard<std::mutex> lock(m_statsMutex);
-            m_stats.bytesReceived += n;
-            m_stats.packetsReceived++;
+            m_prevFramesReceived = m_stats.framesReceived;
+            m_prevFramesDropped = m_stats.framesDropped;
+            m_prevPacketsReceived = m_stats.packetsReceived;
+            m_prevPacketsLost = m_stats.packetsLost;
         }
 
-        auto type = static_cast<exdp::MessageType>(header.type);
-        const uint8_t* payload = buffer.data() + exdp::HEADER_SIZE;
-        size_t payloadLen = n - exdp::HEADER_SIZE;
+        while (m_running.load()) {
+            sockaddr_in from{};
+            int fromLen = sizeof(from);
+            int n = recvfrom(s, (char*)buffer.data(), (int)buffer.size(), 0,
+                             (sockaddr*)&from, &fromLen);
 
-        if (type == exdp::MessageType::VideoFrame) {
-            handleVideoFrame(header, payload, payloadLen);
-        } else if (type == exdp::MessageType::VideoFragment) {
-            handleVideoFragment(header, payload, payloadLen);
+            if (n == SOCKET_ERROR) {
+                int err = WSAGetLastError();
+                if (err != WSAETIMEDOUT && err != WSAECONNRESET) break;  // socket closed
+            } else if (n >= exdp::HEADER_SIZE) {
+                exdp::ProtocolHeader header;
+                if (exdp::parseHeader(buffer.data(), n, header)) {
+                    {
+                        std::lock_guard<std::mutex> lock(m_statsMutex);
+                        m_stats.bytesReceived += n;
+                        m_stats.packetsReceived++;
+                    }
+                    trackUdpSequence(header.sequence);
+
+                    auto type = static_cast<exdp::MessageType>(header.type);
+                    const uint8_t* payload = buffer.data() + exdp::HEADER_SIZE;
+                    size_t payloadLen = (size_t)n - exdp::HEADER_SIZE;
+
+                    if (type == exdp::MessageType::VideoFrame) {
+                        handleVideoFrame(header, payload, payloadLen);
+                    } else if (type == exdp::MessageType::VideoFragment) {
+                        handleVideoFragment(header, payload, payloadLen);
+                    }
+                }
+            }
+
+            // Periodic quality report (also while the screen is static)
+            if (m_state.load() == State::Streaming) {
+                auto now = Clock::now();
+                float elapsed = std::chrono::duration<float>(now - m_lastQualityReport).count();
+                if (elapsed >= QUALITY_REPORT_INTERVAL) {
+                    sendQualityReport();
+                    m_lastQualityReport = now;
+                }
+            }
         }
+    } catch (const std::exception& e) {
+        std::cerr << "[Net] Fatal error in UDP thread: " << e.what() << std::endl;
     }
 
     std::cout << "[Net] UDP receive loop exiting" << std::endl;
 }
 
+void StreamReceiver::trackUdpSequence(uint32_t sequence) {
+    // The Mac numbers every UDP packet consecutively; a gap means packets were lost
+    if (m_udpSequenceReset.exchange(false)) m_haveUdpSequence = false;
+    if (!m_haveUdpSequence) {
+        m_haveUdpSequence = true;
+        m_expectedUdpSequence = sequence + 1;
+        return;
+    }
+
+    int32_t gap = (int32_t)(sequence - m_expectedUdpSequence);
+    if (gap == 0) {
+        m_expectedUdpSequence = sequence + 1;
+    } else if (gap > 0 && gap < 10000) {
+        {
+            std::lock_guard<std::mutex> lock(m_statsMutex);
+            m_stats.packetsLost += (uint64_t)gap;
+        }
+        m_expectedUdpSequence = sequence + 1;
+        // Later P-frames reference the lost data — refresh with a keyframe
+        requestKeyframeAfterLoss();
+    } else if (gap < 0 && gap > -1000) {
+        // Late / reordered packet — already counted as lost, nothing to do
+    } else {
+        m_expectedUdpSequence = sequence + 1;  // sender restarted numbering
+    }
+}
+
+void StreamReceiver::requestKeyframeAfterLoss() {
+    if (m_state.load() != State::Streaming) return;
+    auto now = Clock::now();
+    if (now - m_lastLossKeyframeRequest <
+        std::chrono::milliseconds(KEYFRAME_REQUEST_INTERVAL_MS)) return;
+    m_lastLossKeyframeRequest = now;
+
+    requestKeyframe();
+    std::lock_guard<std::mutex> lock(m_statsMutex);
+    m_stats.keyframeRequests++;
+}
+
 // ── Control Message Handlers ────────────────────────────────────────────────
 
-void StreamReceiver::handleWelcome(const std::vector<uint8_t>& payload) {
+void StreamReceiver::handleWelcome(const std::vector<uint8_t>&) {
+    // The keyframe is requested by the UI thread once the decoder is ready
+    // (requesting it here races with the decoder reset on START_STREAM).
     std::cout << "[Net] WELCOME received" << std::endl;
-
-    // Phase 15: Request keyframe after reconnection so video resumes immediately
-    if (m_isReconnect) {
-        std::cout << "[Net] Reconnected — requesting keyframe for immediate video resume" << std::endl;
-        tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0);
-    }
 }
 
 void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
@@ -368,6 +521,8 @@ void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
               << " @ " << info.fps << " FPS, " << (info.bitrate / 1000000) << " Mbps"
               << std::endl;
 
+    m_udpSequenceReset.store(true);
+    m_reconnectAttempts = 0;  // fully recovered — reset backoff
     m_state.store(State::Streaming);
 
     if (m_streamInfoCallback) {
@@ -397,52 +552,59 @@ void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
     exdp::FragmentHeader fragHeader;
     memcpy(&fragHeader, data, sizeof(fragHeader));
 
+    // Reject nonsensical fragment headers instead of building huge frames
+    if (fragHeader.fragmentTotal == 0 || fragHeader.fragmentTotal > MAX_FRAGMENTS ||
+        fragHeader.fragmentIndex >= fragHeader.fragmentTotal) {
+        return;
+    }
+
     const uint8_t* fragData = data + sizeof(exdp::FragmentHeader);
     size_t fragDataLen = dataLen - sizeof(exdp::FragmentHeader);
-
     bool isKeyframe = (header.flags & exdp::FLAG_KEYFRAME) != 0;
 
-    std::lock_guard<std::mutex> lock(m_fragmentMutex);
-
-    // Get or create pending frame
-    auto& frame = m_pendingFrames[fragHeader.frameSequence];
-    if (frame.totalFragments == 0) {
-        frame.totalFragments = fragHeader.fragmentTotal;
-        frame.isKeyframe = isKeyframe;
-    }
-
-    // Store fragment
-    frame.fragments[fragHeader.fragmentIndex] =
-        std::vector<uint8_t>(fragData, fragData + fragDataLen);
-    frame.receivedCount++;
-
+    std::vector<uint8_t> fullFrame;
+    bool complete = false;
+    bool keyframe = false;
     {
-        std::lock_guard<std::mutex> slock(m_statsMutex);
-        m_stats.fragmentsReceived++;
-    }
+        std::lock_guard<std::mutex> lock(m_fragmentMutex);
 
-    // Check if frame is complete
-    if (frame.receivedCount >= frame.totalFragments) {
-        // Reassemble in order
-        std::vector<uint8_t> fullFrame;
-        for (uint16_t i = 0; i < frame.totalFragments; i++) {
-            auto it = frame.fragments.find(i);
-            if (it != frame.fragments.end()) {
-                fullFrame.insert(fullFrame.end(), it->second.begin(), it->second.end());
-            }
+        auto& frame = m_pendingFrames[fragHeader.frameSequence];
+        if (frame.totalFragments == 0) {
+            frame.totalFragments = fragHeader.fragmentTotal;
+            frame.isKeyframe = isKeyframe;
+        } else if (frame.totalFragments != fragHeader.fragmentTotal) {
+            return;  // inconsistent with earlier fragments
         }
 
-        bool keyframe = frame.isKeyframe;
-        m_pendingFrames.erase(fragHeader.frameSequence);
+        bool inserted = frame.fragments.emplace(
+            fragHeader.fragmentIndex,
+            std::vector<uint8_t>(fragData, fragData + fragDataLen)).second;
+        if (!inserted) return;  // duplicate datagram
+        frame.receivedCount++;
 
-        // Unlock before callback
-        // (Note: can't unlock since we're using lock_guard, but the callback
-        //  should be fast — it just queues the frame for decoding)
-        deliverFrame(fullFrame, keyframe);
+        {
+            std::lock_guard<std::mutex> slock(m_statsMutex);
+            m_stats.fragmentsReceived++;
+        }
+
+        if (frame.receivedCount == frame.totalFragments) {
+            // Every index 0..total-1 is present (indices are unique and < total)
+            size_t totalSize = 0;
+            for (auto& [idx, bytes] : frame.fragments) totalSize += bytes.size();
+            fullFrame.reserve(totalSize);
+            for (auto& [idx, bytes] : frame.fragments) {
+                fullFrame.insert(fullFrame.end(), bytes.begin(), bytes.end());
+            }
+            keyframe = frame.isKeyframe;
+            complete = true;
+            m_pendingFrames.erase(fragHeader.frameSequence);
+        }
+
+        cleanupOldFrames(fragHeader.frameSequence);
     }
 
-    // Cleanup old incomplete frames
-    cleanupOldFrames(fragHeader.frameSequence);
+    // Deliver outside the fragment lock
+    if (complete) deliverFrame(fullFrame, keyframe);
 }
 
 void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe) {
@@ -457,39 +619,38 @@ void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool is
 }
 
 void StreamReceiver::cleanupOldFrames(uint32_t currentFrameSeq) {
-    // Remove frames that are more than 10 sequences behind
-    // (they're too old and missing fragments — drop them)
-    std::vector<uint32_t> toRemove;
-    for (auto& [seq, frame] : m_pendingFrames) {
-        if (currentFrameSeq > seq && (currentFrameSeq - seq) > 10) {
-            toRemove.push_back(seq);
+    // Called with m_fragmentMutex held.
+    bool dropped = false;
+    for (auto it = m_pendingFrames.begin(); it != m_pendingFrames.end(); ) {
+        int32_t age = (int32_t)(currentFrameSeq - it->first);
+        if (age > 10) {
+            // Too old and still missing fragments — it will never complete
+            it = m_pendingFrames.erase(it);
+            dropped = true;
+            std::lock_guard<std::mutex> lock(m_statsMutex);
+            m_stats.framesDropped++;
+        } else if (age < -1000) {
+            // Left over from before the sender restarted its frame numbering
+            it = m_pendingFrames.erase(it);
+        } else {
+            ++it;
         }
     }
-    for (auto seq : toRemove) {
-        m_pendingFrames.erase(seq);
-        std::lock_guard<std::mutex> lock(m_statsMutex);
-        m_stats.framesDropped++;
-    }
+    if (dropped) requestKeyframeAfterLoss();
 }
 
 // ── Quality Reporting ───────────────────────────────────────────────────────
 
 void StreamReceiver::sendQualityReport() {
-    Stats currentStats;
-    {
-        std::lock_guard<std::mutex> lock(m_statsMutex);
-        currentStats = m_stats;
-    }
+    Stats currentStats = getStats();
 
-    // Calculate packet loss since last report
-    uint64_t newFrames = currentStats.framesReceived - m_prevFramesReceived;
+    // Packet loss since last report, from UDP sequence gaps
+    uint64_t newPackets = currentStats.packetsReceived - m_prevPacketsReceived;
+    uint64_t newLost = currentStats.packetsLost - m_prevPacketsLost;
+    uint64_t expected = newPackets + newLost;
+    uint32_t lossPercent100 = expected > 0 ? (uint32_t)((newLost * 10000) / expected) : 0;
+
     uint64_t newDropped = currentStats.framesDropped - m_prevFramesDropped;
-    uint64_t totalExpected = newFrames + newDropped;
-
-    uint32_t lossPercent100 = 0;  // × 100 for precision
-    if (totalExpected > 0) {
-        lossPercent100 = (uint32_t)((newDropped * 10000) / totalExpected);
-    }
 
     // Queue depth from fragment reassembly
     uint32_t queueDepth = 0;
@@ -498,7 +659,6 @@ void StreamReceiver::sendQualityReport() {
         queueDepth = (uint32_t)m_pendingFrames.size();
     }
 
-    // Build and send quality report
     exdp::QualityReportPayload report;
     report.packetLossPercent = lossPercent100;
     report.rttMs = 0;  // TODO: measure from Ping/Pong
@@ -507,10 +667,10 @@ void StreamReceiver::sendQualityReport() {
 
     tcpSendMessage(exdp::MessageType::QualityReport, &report, sizeof(report));
 
-    // Update prev counters
     m_prevFramesReceived = currentStats.framesReceived;
     m_prevFramesDropped = currentStats.framesDropped;
     m_prevPacketsReceived = currentStats.packetsReceived;
+    m_prevPacketsLost = currentStats.packetsLost;
 }
 
 // ── Pairing Handlers ───────────────────────────────────────────────────────────

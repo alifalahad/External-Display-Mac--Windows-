@@ -16,9 +16,14 @@
 
 class FrameStats;
 
+/// Which GPU renders on hybrid (Intel + NVIDIA/AMD) laptops.
+/// Default = the adapter Windows picks (normally the one wired to the panel).
+enum class GpuPreference { Default, HighPerformance, MinimumPower };
+
 class D3D11Renderer {
 public:
-    D3D11Renderer(HWND hwnd, int width, int height);
+    D3D11Renderer(HWND hwnd, int width, int height,
+                  GpuPreference gpuPreference = GpuPreference::Default);
     ~D3D11Renderer() = default; // ComPtr handles cleanup
 
     // Render one frame: test pattern + optional stats overlay
@@ -37,11 +42,19 @@ public:
     // Whether we have a video frame to display
     bool HasVideoFrame() const { return hasVideoFrame_; }
 
+    // GPU removed/reset (driver update, TDR, hybrid GPU switch) or swap chain
+    // could not be resized. The owner must destroy and recreate the renderer.
+    bool IsDeviceLost() const { return deviceLost_; }
+
+    // Print every GPU adapter (helps diagnose hybrid-GPU selection)
+    static void LogAdapters();
+
 private:
     template<typename T>
     using ComPtr = Microsoft::WRL::ComPtr<T>;
 
-    void CreateDeviceAndSwapChain(HWND hwnd, int width, int height);
+    void CreateDeviceAndSwapChain(HWND hwnd, int width, int height, GpuPreference pref);
+    void CheckDeviceLost(HRESULT hr, const char* operation);
     void CreateRenderTarget();
     void CompileShaders();
     void CreateConstantBuffer();
@@ -83,6 +96,7 @@ private:
     uint32_t nv12Width_  = 0;
     uint32_t nv12Height_ = 0;
     bool hasVideoFrame_ = false;
+    bool deviceLost_ = false;
     void CreateNV12Resources();
     void EnsureNV12Textures(uint32_t width, uint32_t height);
 

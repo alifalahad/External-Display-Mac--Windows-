@@ -56,6 +56,7 @@ private:
     bool configureInput();
     bool configureOutput();
     bool processOutput();
+    void updateFrameSizeFrom(IMFMediaType* outputType);
 
     IMFTransform* m_decoder = nullptr;
     uint32_t m_width = 0;

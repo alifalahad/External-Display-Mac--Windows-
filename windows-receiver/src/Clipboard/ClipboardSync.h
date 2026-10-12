@@ -34,10 +34,11 @@ public:
     /// Set callback for local clipboard changes
     void setClipboardCallback(ClipboardCallback cb) { m_callback = std::move(cb); }
 
-    /// Receive clipboard text from Mac — sets it on the Windows clipboard
+    /// Receive clipboard text from Mac (any thread). Applied on the next poll(),
+    /// on the thread that owns the clipboard window.
     void receiveRemoteClipboard(const std::string& utf8Text);
 
-    /// Poll from main thread (processes clipboard window messages)
+    /// Poll from main thread (applies remote text, processes clipboard window messages)
     void poll();
 
     bool isRunning() const { return m_running.load(); }
@@ -54,6 +55,14 @@ private:
 
     /// Set clipboard text from UTF-8 string
     void setClipboardTextUTF8(const std::string& text);
+
+    /// Put remote text on the Windows clipboard (main thread)
+    void applyRemoteClipboard(const std::string& utf8Text);
+
+    // Remote text waiting for the main thread
+    std::mutex m_pendingMutex;
+    std::string m_pendingRemote;
+    bool m_hasPendingRemote = false;
 
     // ── State ───────────────────────────────────────────────────────────────
 

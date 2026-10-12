@@ -13,6 +13,7 @@ endif()
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
     src/App/Window.cpp
+    src/App/CrashHandler.cpp
     src/Renderer/D3D11Renderer.cpp
     src/Performance/FrameStats.cpp
     src/Network/StreamReceiver.cpp
@@ -40,6 +41,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     mfuuid
     ole32
     bcrypt
+    dbghelp
+    user32
+    gdi32
 )
 
 # Enable UNICODE
@@ -53,4 +57,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 # MSVC-specific settings
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+    # Release builds also get a .pdb so crash reports show function names + lines
+    target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(${PROJECT_NAME} PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
 endif()
