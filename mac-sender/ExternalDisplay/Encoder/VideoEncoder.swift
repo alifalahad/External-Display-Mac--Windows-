@@ -37,6 +37,14 @@ final class VideoEncoder {
 
     private var session: VTCompressionSession?
 
+    /// Keyframe request + session-reset flags (set from any thread, consumed in encode)
+    private let controlLock = NSLock()
+    private var forceNextKeyframe = false
+    private var sessionNeedsReset = false
+
+    /// Bitrate currently in effect (adaptive quality may change it at runtime)
+    private var currentBitrateBps: Int
+
     /// Track encode start times keyed by PTS value, for latency measurement
     private var encodeStartTimes: [CMTimeValue: Double] = [:]
     private let timeLock = NSLock()
@@ -55,6 +63,7 @@ final class VideoEncoder {
 
     init(config: EncoderConfig) throws {
         self.config = config
+        self.currentBitrateBps = config.bitrateBps
         try createSession()
     }
 
@@ -104,13 +113,8 @@ final class VideoEncoder {
         setProperty(kVTCompressionPropertyKey_ProfileLevel,
                      value: config.profile.vtProfileLevel)
 
-        // Bitrate
-        setProperty(kVTCompressionPropertyKey_AverageBitRate,
-                     value: config.bitrateBps as CFNumber)
-
-        // Data rate limit (peak bitrate)
-        setProperty(kVTCompressionPropertyKey_DataRateLimits,
-                     value: config.dataRateLimit as CFArray)
+        // Bitrate + peak limit
+        applyBitrate(currentBitrateBps)
 
         // Keyframe interval
         setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -131,14 +135,16 @@ final class VideoEncoder {
                      value: kCFBooleanTrue as Any)
 
         // ── Check if hardware encoder was selected ──────────────────────────
-        var usingHardware: CFBoolean = kCFBooleanFalse
-        let hwStatus = VTSessionCopyProperty(
-            session,
-            key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-            allocator: kCFAllocatorDefault,
-            valueOut: &usingHardware
-        )
-        if hwStatus == noErr {
+        var usingHardware: CFBoolean?
+        let hwStatus = withUnsafeMutablePointer(to: &usingHardware) {
+            VTSessionCopyProperty(
+                session,
+                key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                allocator: kCFAllocatorDefault,
+                valueOut: $0
+            )
+        }
+        if hwStatus == noErr, let usingHardware {
             isHardwareAccelerated = CFBooleanGetValue(usingHardware)
         }
 
@@ -157,24 +163,17 @@ final class VideoEncoder {
 
     /// Dynamically change the encoder bitrate (VT supports this without restart)
     func updateBitrate(_ newBps: Int) {
-        guard let session = session else { return }
-
-        // Update average bitrate
-        VTSessionSetProperty(session,
-            key: kVTCompressionPropertyKey_AverageBitRate,
-            value: newBps as CFNumber)
-
-        // Update peak bitrate (2× average, over 1 second window)
-        let peakBytesPerSec = Int(Double(newBps) * 2.0 / 8.0)
-        let dataRateLimit: [CFNumber] = [
-            peakBytesPerSec as CFNumber,
-            1 as CFNumber
-        ]
-        VTSessionSetProperty(session,
-            key: kVTCompressionPropertyKey_DataRateLimits,
-            value: dataRateLimit as CFArray)
-
+        currentBitrateBps = newBps
+        applyBitrate(newBps)
         print("[Encoder] Bitrate updated: \(newBps / 1_000_000) Mbps")
+    }
+
+    private func applyBitrate(_ bps: Int) {
+        // Average bitrate, peak = 2× average over a 1 second window
+        setProperty(kVTCompressionPropertyKey_AverageBitRate, value: bps as CFNumber)
+        let peakBytesPerSec = Int(Double(bps) * 2.0 / 8.0)
+        let dataRateLimit: [CFNumber] = [peakBytesPerSec as CFNumber, 1 as CFNumber]
+        setProperty(kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimit as CFArray)
     }
 
     // ── Encode a Frame ──────────────────────────────────────────────────────
@@ -182,7 +181,22 @@ final class VideoEncoder {
     /// Feed a CVPixelBuffer to the encoder. Called from the capture queue.
     /// The pixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally.
     func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, duration: CMTime) {
+        controlLock.lock()
+        let needsReset = sessionNeedsReset
+        sessionNeedsReset = false
+        var forceKeyframe = forceNextKeyframe
+        forceNextKeyframe = false
+        controlLock.unlock()
+
+        if needsReset {
+            recreateSession()
+            forceKeyframe = true
+        }
         guard let session = session else { return }
+
+        let frameProperties: CFDictionary? = forceKeyframe
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+            : nil
 
         // Record encode start time for latency measurement
         let startTime = CACurrentMediaTime()
@@ -193,12 +207,12 @@ final class VideoEncoder {
         if firstEncodeTime == 0 { firstEncodeTime = startTime }
 
         // Encode with block-based output handler
-        VTCompressionSessionEncodeFrame(
+        let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
             duration: duration,
-            frameProperties: nil,
+            frameProperties: frameProperties,
             infoFlagsOut: nil
         ) { [weak self] status, infoFlags, sampleBuffer in
             self?.handleEncodedFrame(
@@ -206,6 +220,37 @@ final class VideoEncoder {
                 sampleBuffer: sampleBuffer,
                 originalPTS: presentationTime
             )
+        }
+        if status != noErr {
+            handleEncodeFailure(status)
+        }
+    }
+
+    /// Phase 15: the hardware encoder session can be invalidated (sleep/wake,
+    /// GPU reset, media server restart). Rebuild it on the next frame.
+    private func handleEncodeFailure(_ status: OSStatus) {
+        print("[Encoder] Encode error: \(status)")
+        if status == kVTInvalidSessionErr {
+            controlLock.lock()
+            sessionNeedsReset = true
+            controlLock.unlock()
+        }
+    }
+
+    /// Tear down and recreate the compression session (capture queue only)
+    private func recreateSession() {
+        print("[Encoder] ♻️ Recreating compression session")
+        if let old = session {
+            VTCompressionSessionInvalidate(old)
+            session = nil
+        }
+        do {
+            try createSession()
+        } catch {
+            print("[Encoder] Session recreation failed: \(error) — retrying on next frame")
+            controlLock.lock()
+            sessionNeedsReset = true
+            controlLock.unlock()
         }
     }
 
@@ -218,7 +263,7 @@ final class VideoEncoder {
     ) {
         guard status == noErr, let sampleBuffer = sampleBuffer else {
             if status != noErr {
-                print("[Encoder] Encode error: \(status)")
+                handleEncodeFailure(status)
             }
             return
         }
@@ -300,11 +345,12 @@ final class VideoEncoder {
 
     // ── Force Keyframe ──────────────────────────────────────────────────────
 
-    /// Request the next frame to be encoded as a keyframe
+    /// Request the next encoded frame to be an IDR keyframe (thread-safe).
+    /// (Flushing with CompleteFrames does NOT produce a keyframe.)
     func forceKeyframe() {
-        guard let session = session else { return }
-        // Flush pending frames to force a clean break, next frame will be a keyframe
-        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        controlLock.lock()
+        forceNextKeyframe = true
+        controlLock.unlock()
     }
 
     // ── Flush & Stop ────────────────────────────────────────────────────────

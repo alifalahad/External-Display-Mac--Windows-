@@ -76,14 +76,20 @@ final class StreamSender: ObservableObject {
     private let heartbeatInterval: TimeInterval = 5.0   // Send Ping every 5s
     private let heartbeatTimeout: TimeInterval = 15.0    // Dead if no Pong in 15s
 
-    /// Called when reconnection happens (encoder can force keyframe)
-    var onReconnection: (() -> Void)?
+    /// Called when the receiver needs a keyframe (stream start, packet loss,
+    /// decoder reset). Invoked on the network queue.
+    var onKeyframeRequest: (() -> Void)?
+
+    /// Largest control payload accepted (clipboard text is the biggest, ≤ 1 MB).
+    /// Anything larger means a corrupted or hostile stream.
+    private let maxControlPayload = 4 * 1024 * 1024
 
     // ── Stream state ────────────────────────────────────────────────────────
 
     private var remoteHost: NWEndpoint.Host?
     private var remoteUDPPort: UInt16 = ProtocolConstants.udpPort
-    private var sequenceNumber: UInt32 = 0
+    private var sequenceNumber: UInt32 = 0          // TCP control messages
+    private var udpPacketSequence: UInt32 = 0       // UDP video packets — gaps = loss
     private var frameSequenceNumber: UInt32 = 0
     private var streamStartTime: Double = 0
 
@@ -117,7 +123,28 @@ final class StreamSender: ObservableObject {
     /// Start listening for incoming connections
     func startListening() {
         guard case .idle = state else { return }
+        networkQueue.async { [weak self] in
+            self?.createListener()
+        }
+    }
 
+    /// Phase 15: a listener fails when the network interface goes away
+    /// (Wi-Fi switch, sleep). Recreate it so the receiver can find us again.
+    private func scheduleListenerRestart() {
+        tcpListener?.cancel()
+        tcpListener = nil
+        print("[Net] Restarting listener in 2s…")
+        networkQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, self.tcpListener == nil, self.listenerWanted else { return }
+            self.createListener()
+        }
+    }
+
+    /// False after shutdown() — prevents a pending restart from resurrecting the listener
+    private var listenerWanted = false
+
+    private func createListener() {
+        listenerWanted = true
         do {
             let params = NWParameters.tcp
             params.acceptLocalOnly = false
@@ -143,6 +170,7 @@ final class StreamSender: ObservableObject {
                     DispatchQueue.main.async {
                         self?.state = .error("Listener: \(error.localizedDescription)")
                     }
+                    self?.scheduleListenerRestart()
                 default:
                     break
                 }
@@ -173,6 +201,7 @@ final class StreamSender: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 self?.state = .error("Listen failed: \(error.localizedDescription)")
             }
+            scheduleListenerRestart()
         }
     }
 
@@ -201,6 +230,7 @@ final class StreamSender: ObservableObject {
 
     /// Full shutdown — stop everything including the listener
     func shutdown() {
+        listenerWanted = false
         stopStreaming()
         tcpConnection?.cancel()
         tcpConnection = nil
@@ -282,6 +312,11 @@ final class StreamSender: ObservableObject {
             }
 
             let payloadLen = Int(header.payloadLength)
+            guard payloadLen <= self.maxControlPayload else {
+                print("[Net] ❌ Control payload too large (\(payloadLen) bytes) — dropping connection")
+                self.handleDisconnect(for: connection)
+                return
+            }
 
             if payloadLen == 0 {
                 // No payload — dispatch immediately
@@ -362,8 +397,7 @@ final class StreamSender: ObservableObject {
             // Phase 15: Update heartbeat timestamp
             lastPongReceived = CACurrentMediaTime()
         case .keyframeReq:
-            print("[Net] Keyframe requested by receiver")
-            onReconnection?()  // Signal encoder to force keyframe
+            onKeyframeRequest?()
         case .qualityReport:
             handleQualityReport(payload)
         case .inputEvent:
@@ -619,6 +653,7 @@ final class StreamSender: ObservableObject {
 
         streamStartTime = CACurrentMediaTime()
         frameSequenceNumber = 0
+        udpPacketSequence = 0
 
         let peerName = pendingDeviceName ?? "Receiver"
         DispatchQueue.main.async { [weak self] in
@@ -628,13 +663,28 @@ final class StreamSender: ObservableObject {
         print("[Net] Streaming started: \(streamWidth)×\(streamHeight) @ \(streamFPS) FPS")
     }
 
+    /// Phase 15: capture restarted (possibly at a new resolution) — tell the
+    /// receiver so it rebuilds its decoder, then it requests a keyframe.
+    func restartStreamIfActive() {
+        networkQueue.async { [weak self] in
+            guard let self = self, self.isAuthenticated, self.udpConnection != nil else { return }
+            var startPayload = StartStreamPayload()
+            startPayload.width = self.streamWidth
+            startPayload.height = self.streamHeight
+            startPayload.fps = self.streamFPS
+            startPayload.bitrate = self.streamBitrate
+            self.sendControlMessage(type: .startStream, payload: startPayload.serialize())
+            print("[Net] Stream parameters re-sent: \(self.streamWidth)×\(self.streamHeight)")
+        }
+    }
+
     func stopStreaming() {
         guard state.isStreaming else { return }
         sendControlMessage(type: .stopStream, payload: Data())
         udpConnection?.cancel()
         udpConnection = nil
 
-        if let host = remoteHost {
+        if remoteHost != nil {
             let peerName: String
             if case .streaming(let name) = state {
                 peerName = name
@@ -664,7 +714,7 @@ final class StreamSender: ObservableObject {
             var header = ProtocolHeader()
             header.type = MessageType.videoFrame.rawValue
             header.flags = flags
-            header.sequence = nextSequence()
+            header.sequence = nextUDPSequence()
             header.timestamp = timestamp
             header.payloadLength = UInt32(annexBData.count)
 
@@ -702,7 +752,7 @@ final class StreamSender: ObservableObject {
                 var header = ProtocolHeader()
                 header.type = MessageType.videoFragment.rawValue
                 header.flags = flags
-                header.sequence = nextSequence()
+                header.sequence = nextUDPSequence()
                 header.timestamp = timestamp
                 header.payloadLength = UInt32(8 + fragmentData.count)
 
@@ -772,11 +822,20 @@ final class StreamSender: ObservableObject {
         return sequenceNumber
     }
 
+    /// Consecutive per-packet counter on the UDP channel (encoder callback thread only)
+    private func nextUDPSequence() -> UInt32 {
+        udpPacketSequence &+= 1
+        return udpPacketSequence
+    }
+
     // ── Clipboard ───────────────────────────────────────────────────────────
 
     /// Send clipboard text data to the Windows receiver
     func sendClipboardData(_ data: Data) {
-        guard state.isStreaming else { return }
-        sendControlMessage(type: .clipboardData, payload: data)
+        // Called from the main thread; connection state lives on networkQueue
+        networkQueue.async { [weak self] in
+            guard let self = self, self.isAuthenticated, self.udpConnection != nil else { return }
+            self.sendControlMessage(type: .clipboardData, payload: data)
+        }
     }
 }

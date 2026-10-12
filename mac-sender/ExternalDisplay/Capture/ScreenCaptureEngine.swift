@@ -62,6 +62,18 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     private var encoder: VideoEncoder?
     private var frameCounter: UInt64 = 0
 
+    // ── Keyframe recovery (capture queue only) ──────────────────────────────
+    /// Last complete frame — re-encoded on keyframe requests, because
+    /// ScreenCaptureKit delivers nothing while the screen is static.
+    private var lastPixelBuffer: CVPixelBuffer?
+    private var lastEncodedPTS = CMTime.invalid
+    private var lastKeyframeRequest: Double = 0
+    private let minKeyframeRequestInterval = 0.1  // seconds
+
+    // ── Capture auto-restart (main thread) ──────────────────────────────────
+    private var captureRestartTask: Task<Void, Never>?
+    private var captureRestartAttempts = 0
+
     /// Dedicated queue for frame processing — high priority, serial
     private let captureQueue = DispatchQueue(
         label: "com.externaldisplay.capture",
@@ -164,9 +176,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 self?.isEncoding = true
             }
 
-            // Phase 15: Wire keyframe request handler for reconnection
-            sender.onReconnection = { [weak enc] in
-                enc?.forceKeyframe()
+            // Phase 15: receiver asks for a keyframe (stream start, packet loss, decoder reset)
+            sender.onKeyframeRequest = { [weak self] in
+                self?.requestKeyframe()
             }
 
             // Phase 15: Set up sleep/wake observer
@@ -185,6 +197,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     func stopEncoder() {
         encoder?.stop()
         encoder = nil
+        captureQueue.async { [weak self] in
+            // The old frame may have a different size than the next encoder expects
+            self?.lastPixelBuffer = nil
+            self?.lastEncodedPTS = .invalid
+        }
         qualityController = nil
         inputInjector = nil
         clipboardSync?.stop()
@@ -192,7 +209,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         sender.onQualityReport = nil
         sender.onInputEvent = nil
         sender.onClipboardData = nil
-        sender.onReconnection = nil
+        sender.onKeyframeRequest = nil
         removeSleepWakeObserver()
         DispatchQueue.main.async { [weak self] in
             self?.isEncoding = false
@@ -237,7 +254,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     // ── Start Capture ───────────────────────────────────────────────────────
 
-    func startCapture() async {
+    @discardableResult
+    func startCapture() async -> Bool {
         // ── Determine which display to capture ──────────────────────────────
         let display: SCDisplay
 
@@ -257,14 +275,14 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                     await MainActor.run {
                         self.errorMessage = "Virtual display not found in ScreenCaptureKit. Refresh displays."
                     }
-                    return
+                    return false
                 }
             }
         } else {
             // No virtual display — use selected physical display
             guard selectedDisplayIndex < availableDisplays.count else {
                 await MainActor.run { self.errorMessage = "No display selected" }
-                return
+                return false
             }
             display = availableDisplays[selectedDisplayIndex]
         }
@@ -334,8 +352,14 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Watch for connection state changes — auto-start streaming
             setupSenderObserver()
 
+            // After an auto-restart the receiver may still be streaming —
+            // resend stream parameters (resolution may have changed)
+            sender.restartStreamIfActive()
+            await MainActor.run { self.captureRestartAttempts = 0 }
+
             let modeStr = virtualDisplayManager.isActive ? "Virtual" : "Physical"
             print("[Capture] Started (\(modeStr)): \(display.width)×\(display.height) @ 60 FPS")
+            return true
 
         } catch {
             await MainActor.run {
@@ -343,13 +367,20 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 self.isCapturing = false
             }
             print("[Capture] Error: \(error)")
+            return false
         }
     }
 
     // ── Stop Capture ────────────────────────────────────────────────────────
 
     func stopCapture() {
-        guard let stream = stream else { return }
+        // A pending auto-restart must not bring capture back after the user stopped it
+        captureRestartTask?.cancel()
+        captureRestartTask = nil
+        captureRestartAttempts = 0
+
+        let stream = self.stream
+        guard stream != nil || isCapturing else { return }
         self.stream = nil
 
         // Stop network sender and encoder
@@ -359,7 +390,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
         Task {
             do {
-                try await stream.stopCapture()
+                try await stream?.stopCapture()
             } catch {
                 print("[Capture] Stop error: \(error)")
             }
@@ -393,6 +424,97 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
     }
 
+    // ── Keyframe Requests (Phase 15) ────────────────────────────────────────
+
+    /// Force an IDR frame now. The last captured frame is re-encoded so the
+    /// receiver recovers even when the screen is static (no new SCK frames).
+    func requestKeyframe() {
+        captureQueue.async { [weak self] in
+            guard let self = self, let encoder = self.encoder else { return }
+            let now = CACurrentMediaTime()
+            guard now - self.lastKeyframeRequest >= self.minKeyframeRequestInterval else { return }
+            self.lastKeyframeRequest = now
+
+            encoder.forceKeyframe()
+            if let pixelBuffer = self.lastPixelBuffer {
+                let pts = CMClockGetTime(CMClockGetHostTimeClock())
+                self.encodeFrame(pixelBuffer, pts: pts)
+            }
+            print("[Engine] Keyframe forced")
+        }
+    }
+
+    /// Encode on the capture queue with strictly increasing timestamps
+    private func encodeFrame(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        if lastEncodedPTS.isValid && CMTimeCompare(pts, lastEncodedPTS) <= 0 { return }
+        lastEncodedPTS = pts
+        encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts,
+                        duration: CMTime(value: 1, timescale: 60))
+    }
+
+    // ── Capture Auto-Restart (Phase 15) ─────────────────────────────────────
+
+    /// ScreenCaptureKit stopped on its own (display removed, virtual display
+    /// gone, system interruption). Restart with backoff; keep the receiver connected.
+    @MainActor
+    private func handleCaptureStopped(_ failedStream: SCStream, error: Error) {
+        guard failedStream === stream else { return }  // stale or user-stopped
+
+        if let scError = error as? SCStreamError, scError.code == .userStopped {
+            print("[Capture] Stopped by user from system UI")
+            stopCapture()
+            errorMessage = "Capture stopped from the system menu"
+            return
+        }
+
+        stream = nil
+        captureRestartAttempts += 1
+        let delay = min(pow(2.0, Double(captureRestartAttempts - 1)), 10.0)
+        errorMessage = "Capture interrupted — restarting in \(Int(delay))s…"
+        print("[Capture] Restart attempt \(captureRestartAttempts) in \(delay)s")
+
+        captureRestartTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self = self, !Task.isCancelled else { return }
+            await self.restartCapture()
+        }
+    }
+
+    private func restartCapture() async {
+        await refreshDisplays()
+
+        // Virtual display vanished (e.g. WindowServer reset) — recreate it at the same size
+        let vdm = virtualDisplayManager
+        let vdMissing = await MainActor.run {
+            vdm.isActive && !self.availableDisplays.contains { $0.displayID == vdm.virtualDisplayID }
+        }
+        if vdMissing {
+            print("[Capture] Virtual display missing — recreating")
+            let (w, h) = await MainActor.run { (vdm.width, vdm.height) }
+            await MainActor.run {
+                vdm.destroyDisplay()
+                _ = vdm.createDisplay(width: w, height: h)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)  // let WindowServer register it
+            await refreshDisplays()
+        }
+
+        let restarted = await startCapture()
+        if !restarted {
+            await MainActor.run {
+                guard self.captureRestartTask?.isCancelled == false else { return }
+                self.captureRestartAttempts += 1
+                let delay = min(pow(2.0, Double(self.captureRestartAttempts - 1)), 10.0)
+                print("[Capture] Restart failed — retrying in \(delay)s")
+                self.captureRestartTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    guard let self = self, !Task.isCancelled else { return }
+                    await self.restartCapture()
+                }
+            }
+        }
+    }
+
     // ── Sleep/Wake Recovery (Phase 15) ──────────────────────────────────────
 
     private var sleepWakeObservers: [NSObjectProtocol] = []
@@ -407,7 +529,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             print("[Engine] ⏰ System wake detected — forcing keyframe for stream recovery")
 
             // Force keyframe so receiver can resume decoding immediately
-            self.encoder?.forceKeyframe()
+            self.requestKeyframe()
         }
 
         let sleepObs = NSWorkspace.shared.notificationCenter.addObserver(
@@ -481,9 +603,8 @@ extension ScreenCaptureEngine: SCStreamOutput {
         frameCounter += 1
 
         // ── Feed ALL frames to encoder (GPU→GPU, fast) ──────────────────────
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let duration = CMTime(value: 1, timescale: 60)
-        encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts, duration: duration)
+        lastPixelBuffer = pixelBuffer
+        encodeFrame(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
 
         // ── Throttled preview (every 2nd frame = ~30 FPS) ───────────────────
         // CGImage conversion is expensive (GPU→CPU). Encoder gets all frames;
@@ -517,9 +638,8 @@ extension ScreenCaptureEngine: SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         print("[Capture] Stream stopped with error: \(error)")
-        DispatchQueue.main.async { [weak self] in
-            self?.isCapturing = false
-            self?.errorMessage = "Capture stopped: \(error.localizedDescription)"
+        Task { @MainActor [weak self] in
+            self?.handleCaptureStopped(stream, error: error)
         }
     }
 }
