@@ -37,6 +37,7 @@ enum MessageType: UInt8 {
     case pong           = 0x21   // Both: latency reply
     case keyframeReq    = 0x30   // Win → Mac: request I-frame
     case qualityReport  = 0x50   // Win → Mac: network health report
+    case senderStats    = 0x51   // Mac → Win: sender-side performance (1 Hz)
     case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
     case clipboardData  = 0x70   // Both: clipboard text sync
     case pairChallenge  = 0x80   // Mac → Win: pairing challenge
@@ -55,6 +56,8 @@ enum MessageType: UInt8 {
 struct MessageFlags: OptionSet {
     let rawValue: UInt16
     static let keyframe = MessageFlags(rawValue: 1 << 0)
+    /// Video: the reassembled frame starts with a FrameTimingPrefix
+    static let timing   = MessageFlags(rawValue: 1 << 1)
 }
 
 // ── Protocol Header ────────────────────────────────────────────────────────
@@ -293,10 +296,10 @@ struct StartStreamPayload {
 /// QUALITY_REPORT payload (Windows → Mac, 20 bytes)
 struct QualityReportPayload {
     var packetLossPercent: UInt32 = 0   // Loss × 100 (e.g. 350 = 3.50%)
-    var rttMs: UInt32 = 0               // Round-trip time in ms
+    var rttMs: UInt32 = 0               // Round-trip time in ms (PING/PONG)
     var framesDropped: UInt32 = 0       // Frames dropped since last report
     var queueDepth: UInt32 = 0          // Current decode queue depth
-    var reserved: UInt32 = 0
+    var latencyUs: UInt32 = 0           // Avg capture→display latency (0 = unknown)
 
     static func deserialize(from data: Data) -> QualityReportPayload? {
         guard data.count >= 20 else { return nil }
@@ -306,8 +309,76 @@ struct QualityReportPayload {
         q.rttMs = data.readLE(at: &offset)
         q.framesDropped = data.readLE(at: &offset)
         q.queueDepth = data.readLE(at: &offset)
-        q.reserved = data.readLE(at: &offset)
+        q.latencyUs = data.readLE(at: &offset)
         return q
+    }
+}
+
+// ── Performance Payloads (Phase 16) ─────────────────────────────────────────
+
+/// Mac-side timestamps of one video frame, all in HostClock microseconds.
+/// Sent as a 40-byte prefix of the frame data when the packets carry
+/// MessageFlags.timing; the receiver strips it before decoding.
+///
+///   frameSequence(4) | flags(4) | captureUs(8) | encodeStartUs(8) |
+///   encodeEndUs(8) | sendUs(8)
+struct FrameTimingPrefix {
+    static let size = 40
+    static let flagCaptureTimeValid: UInt32 = 1 << 0
+
+    var frameSequence: UInt32 = 0
+    var flags: UInt32 = 0
+    var captureUs: UInt64 = 0       // when the frame was displayed (SCK displayTime)
+    var encodeStartUs: UInt64 = 0   // handed to VideoToolbox
+    var encodeEndUs: UInt64 = 0     // VideoToolbox output callback
+    var sendUs: UInt64 = 0          // packetization started
+
+    func serialize() -> Data {
+        var data = Data(capacity: Self.size)
+        data.appendLE(frameSequence)
+        data.appendLE(flags)
+        data.appendLE(captureUs)
+        data.appendLE(encodeStartUs)
+        data.appendLE(encodeEndUs)
+        data.appendLE(sendUs)
+        return data
+    }
+
+    static func deserialize(from data: Data) -> FrameTimingPrefix? {
+        guard data.count >= size else { return nil }
+        var p = FrameTimingPrefix()
+        var offset = data.startIndex
+        p.frameSequence = data.readLE(at: &offset)
+        p.flags = data.readLE(at: &offset)
+        p.captureUs = data.readLE(at: &offset)
+        p.encodeStartUs = data.readLE(at: &offset)
+        p.encodeEndUs = data.readLE(at: &offset)
+        p.sendUs = data.readLE(at: &offset)
+        return p
+    }
+}
+
+/// SENDER_STATS payload (Mac → Windows, 32 bytes, once per second)
+struct SenderStatsPayload {
+    static let size = 32
+    static let flagHardwareEncoder: UInt32 = 1 << 0
+
+    var captureFps100: UInt32 = 0     // capture FPS × 100
+    var encodeFps100: UInt32 = 0      // encoded FPS × 100
+    var cpuPercent100: UInt32 = 0     // sender process CPU, % of all cores × 100
+    var memoryMB: UInt32 = 0          // sender process physical footprint
+    var encoderKbps: UInt32 = 0       // measured encoder output, last second
+    var targetKbps: UInt32 = 0        // bitrate the encoder is asked for
+    var flags: UInt32 = 0
+    var reserved: UInt32 = 0
+
+    func serialize() -> Data {
+        var data = Data(capacity: Self.size)
+        for value in [captureFps100, encodeFps100, cpuPercent100, memoryMB,
+                      encoderKbps, targetKbps, flags, reserved] {
+            data.appendLE(value)
+        }
+        return data
     }
 }
 
@@ -365,24 +436,53 @@ struct InputEventPayload {
 // ── CRC32 ───────────────────────────────────────────────────────────────────
 
 enum CRC32 {
-    /// Standard CRC32 lookup table (IEEE 802.3 polynomial)
-    private static let table: [UInt32] = {
-        (0..<256).map { i -> UInt32 in
+    /// Slicing-by-8 tables for the IEEE 802.3 polynomial (table k at k*256).
+    /// Same result as the classic byte-at-a-time CRC-32, ~8× faster: computed
+    /// for every UDP packet (~3,600 packets/s at 40 Mbps).
+    private static let tables: [UInt32] = {
+        var t = [UInt32](repeating: 0, count: 256 * 8)
+        for i in 0..<256 {
             var crc = UInt32(i)
             for _ in 0..<8 {
                 crc = (crc & 1 != 0) ? (0xEDB88320 ^ (crc >> 1)) : (crc >> 1)
             }
-            return crc
+            t[i] = crc
         }
+        for i in 0..<256 {
+            for k in 1..<8 {
+                let prev = t[(k - 1) * 256 + i]
+                t[k * 256 + i] = (prev >> 8) ^ t[Int(prev & 0xFF)]
+            }
+        }
+        return t
     }()
 
     static func compute(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
-        for byte in data {
-            let index = Int((crc ^ UInt32(byte)) & 0xFF)
-            crc = (crc >> 8) ^ table[index]
+        data.withUnsafeBytes { raw -> UInt32 in
+            tables.withUnsafeBufferPointer { t -> UInt32 in
+                var crc: UInt32 = 0xFFFFFFFF
+                guard var p = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+                var remaining = raw.count
+                while remaining >= 8 {
+                    let lo = (UInt32(p[0]) | UInt32(p[1]) << 8 | UInt32(p[2]) << 16
+                              | UInt32(p[3]) << 24) ^ crc
+                    let hi = UInt32(p[4]) | UInt32(p[5]) << 8 | UInt32(p[6]) << 16
+                             | UInt32(p[7]) << 24
+                    crc = t[7 * 256 + Int(lo & 0xFF)] ^ t[6 * 256 + Int((lo >> 8) & 0xFF)]
+                        ^ t[5 * 256 + Int((lo >> 16) & 0xFF)] ^ t[4 * 256 + Int(lo >> 24)]
+                        ^ t[3 * 256 + Int(hi & 0xFF)] ^ t[2 * 256 + Int((hi >> 8) & 0xFF)]
+                        ^ t[256 + Int((hi >> 16) & 0xFF)] ^ t[Int(hi >> 24)]
+                    p += 8
+                    remaining -= 8
+                }
+                while remaining > 0 {
+                    crc = (crc >> 8) ^ t[Int((crc ^ UInt32(p[0])) & 0xFF)]
+                    p += 1
+                    remaining -= 1
+                }
+                return crc ^ 0xFFFFFFFF
+            }
         }
-        return crc ^ 0xFFFFFFFF
     }
 }
 
@@ -396,7 +496,7 @@ extension Data {
     func readLE<T: FixedWidthInteger>(at offset: inout Int) -> T {
         let size = MemoryLayout<T>.size
         let value = self.subdata(in: offset..<offset+size)
-            .withUnsafeBytes { $0.load(as: T.self) }
+            .withUnsafeBytes { $0.loadUnaligned(as: T.self) }
         offset += size
         return T(littleEndian: value)
     }

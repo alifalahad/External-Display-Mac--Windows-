@@ -48,7 +48,13 @@ struct NetworkStats {
     var bytesSent: UInt64 = 0
     var packetsSent: UInt64 = 0
     var framesSent: UInt64 = 0
-    var droppedFrames: UInt64 = 0
+    var sendMbps: Double = 0                 // last second
+    var sendLatency = LatencySummary()       // encoder output → packetization start
+
+    // Reported by the receiver (QUALITY_REPORT, every 2 s)
+    var receiverRttMs: Double? = nil
+    var receiverLatencyMs: Double? = nil     // capture → on screen, clock-synced
+    var receiverLossPercent: Double = 0
 }
 
 final class StreamSender: ObservableObject {
@@ -56,7 +62,14 @@ final class StreamSender: ObservableObject {
     // ── Published state ─────────────────────────────────────────────────────
 
     @Published var state: SenderState = .idle
-    @Published var networkStats = NetworkStats()
+
+    /// Counters are updated per packet on the network queue and read by the UI
+    /// through statsSnapshot() — never published per packet (that was ~3,600
+    /// main-thread dispatches per second at 40 Mbps).
+    private var counters = NetworkStats()
+    private var sendRate = RateMeter()
+    private var sendLatencies = RollingWindow(capacity: 120)
+    private let countersLock = NSLock()
 
     // ── Network objects ─────────────────────────────────────────────────────
 
@@ -146,7 +159,11 @@ final class StreamSender: ObservableObject {
     private func createListener() {
         listenerWanted = true
         do {
-            let params = NWParameters.tcp
+            // TCP_NODELAY: control messages are tiny (PONG, clipboard, START);
+            // Nagle would hold them back behind unacknowledged data.
+            let tcpOptions = NWProtocolTCP.Options()
+            tcpOptions.noDelay = true
+            let params = NWParameters(tls: nil, tcp: tcpOptions)
             params.acceptLocalOnly = false
             params.allowLocalEndpointReuse = true
 
@@ -224,8 +241,8 @@ final class StreamSender: ObservableObject {
             } else {
                 self.state = .idle
             }
-            self.networkStats = NetworkStats()
         }
+        resetCounters()
     }
 
     /// Full shutdown — stop everything including the listener
@@ -243,8 +260,8 @@ final class StreamSender: ObservableObject {
         frameSequenceNumber = 0
         DispatchQueue.main.async { [weak self] in
             self?.state = .idle
-            self?.networkStats = NetworkStats()
         }
+        resetCounters()
     }
 
     // ── TCP Connection Handling ─────────────────────────────────────────────
@@ -392,7 +409,7 @@ final class StreamSender: ObservableObject {
         case .hello:
             handleHello(payload)
         case .ping:
-            sendPong(sequence: header.sequence)
+            sendPong(sequence: header.sequence, echoTimestamp: header.timestamp)
         case .pong:
             // Phase 15: Update heartbeat timestamp
             lastPongReceived = CACurrentMediaTime()
@@ -425,6 +442,11 @@ final class StreamSender: ObservableObject {
             print("[Net] Invalid QualityReport payload")
             return
         }
+        countersLock.lock()
+        counters.receiverRttMs = report.rttMs > 0 ? Double(report.rttMs) : nil
+        counters.receiverLatencyMs = report.latencyUs > 0 ? Double(report.latencyUs) / 1000 : nil
+        counters.receiverLossPercent = Double(report.packetLossPercent) / 100
+        countersLock.unlock()
         onQualityReport?(report)
     }
 
@@ -699,82 +721,131 @@ final class StreamSender: ObservableObject {
 
     // ── Send Video Frame ────────────────────────────────────────────────────
 
-    /// Send an H.264 Annex B frame over UDP (with fragmentation if needed)
-    func sendVideoFrame(annexBData: Data, isKeyframe: Bool) {
-        guard let udp = udpConnection else { return }
+    /// Send an H.264 Annex B frame over UDP (fragmented if needed).
+    /// `frameData` must start with FrameTimingPrefix.size reserved bytes
+    /// (H264Converter reservedPrefix) — they are filled in here.
+    /// Called on VideoToolbox's callback thread; the work runs on the network
+    /// queue, which owns the UDP connection and the sequence counters.
+    func sendVideoFrame(frameData: Data, isKeyframe: Bool, timing: FrameTiming) {
+        networkQueue.async { [weak self] in
+            self?.sendVideoFrameOnNetworkQueue(frameData, isKeyframe: isKeyframe, timing: timing)
+        }
+    }
+
+    private func sendVideoFrameOnNetworkQueue(_ frameData: Data, isKeyframe: Bool, timing: FrameTiming) {
+        guard let udp = udpConnection, frameData.count > FrameTimingPrefix.size else { return }
 
         let frameSeq = frameSequenceNumber
-        frameSequenceNumber += 1
+        frameSequenceNumber &+= 1
+
+        // ── Phase 16: per-frame timestamps for the receiver's latency breakdown
+        var prefix = FrameTimingPrefix()
+        prefix.frameSequence = frameSeq
+        prefix.flags = timing.captureIsReal ? FrameTimingPrefix.flagCaptureTimeValid : 0
+        prefix.captureUs = timing.captureUs
+        prefix.encodeStartUs = timing.encodeStartUs
+        prefix.encodeEndUs = timing.encodeEndUs
+        prefix.sendUs = HostClock.nowUs()
+
+        var frame = frameData
+        frame.replaceSubrange(frame.startIndex..<frame.startIndex + FrameTimingPrefix.size,
+                              with: prefix.serialize())
 
         let timestamp = UInt64((CACurrentMediaTime() - streamStartTime) * 1_000_000)
-        let flags: UInt16 = isKeyframe ? MessageFlags.keyframe.rawValue : 0
+        var flags = MessageFlags.timing
+        if isKeyframe { flags.insert(.keyframe) }
 
-        if annexBData.count <= ProtocolConstants.maxFragmentPayload {
+        var packets = 0
+        var bytes = 0
+
+        if frame.count <= ProtocolConstants.maxFragmentPayload {
             // ── Single packet ───────────────────────────────────────────
             var header = ProtocolHeader()
             header.type = MessageType.videoFrame.rawValue
-            header.flags = flags
+            header.flags = flags.rawValue
             header.sequence = nextUDPSequence()
             header.timestamp = timestamp
-            header.payloadLength = UInt32(annexBData.count)
+            header.payloadLength = UInt32(frame.count)
 
             var packet = header.serialize()
-            packet.append(annexBData)
-
-            // Compute and set CRC
-            let crc = CRC32.compute(packet)
-            packet.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
-
-            udp.send(content: packet, completion: .contentProcessed { _ in })
-
-            DispatchQueue.main.async { [weak self] in
-                self?.networkStats.packetsSent += 1
-                self?.networkStats.bytesSent += UInt64(packet.count)
-                self?.networkStats.framesSent += 1
-            }
+            packet.append(frame)
+            sealAndSend(&packet, on: udp)
+            packets = 1
+            bytes = packet.count
         } else {
             // ── Fragmented ──────────────────────────────────────────────
             let maxDataPerFragment = ProtocolConstants.maxFragmentPayload
-            let fragmentCount = (annexBData.count + maxDataPerFragment - 1) / maxDataPerFragment
+            let fragmentCount = (frame.count + maxDataPerFragment - 1) / maxDataPerFragment
 
             for i in 0..<fragmentCount {
-                let offset = i * maxDataPerFragment
-                let end = min(offset + maxDataPerFragment, annexBData.count)
-                let fragmentData = annexBData.subdata(in: offset..<end)
+                let offset = frame.startIndex + i * maxDataPerFragment
+                let end = min(offset + maxDataPerFragment, frame.endIndex)
 
-                // Fragment header
                 var fragHeader = FragmentHeader()
                 fragHeader.frameSequence = frameSeq
                 fragHeader.fragmentIndex = UInt16(i)
                 fragHeader.fragmentTotal = UInt16(fragmentCount)
 
-                // Protocol header
                 var header = ProtocolHeader()
                 header.type = MessageType.videoFragment.rawValue
-                header.flags = flags
+                header.flags = flags.rawValue
                 header.sequence = nextUDPSequence()
                 header.timestamp = timestamp
-                header.payloadLength = UInt32(8 + fragmentData.count)
+                header.payloadLength = UInt32(8 + end - offset)
 
-                var packet = header.serialize()
+                var packet = Data(capacity: ProtocolConstants.headerSize + 8 + end - offset)
+                packet.append(header.serialize())
                 packet.append(fragHeader.serialize())
-                packet.append(fragmentData)
-
-                // CRC
-                let crc = CRC32.compute(packet)
-                packet.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
-
-                udp.send(content: packet, completion: .contentProcessed { _ in })
-
-                DispatchQueue.main.async { [weak self] in
-                    self?.networkStats.packetsSent += 1
-                    self?.networkStats.bytesSent += UInt64(packet.count)
-                }
+                packet.append(frame[offset..<end])
+                sealAndSend(&packet, on: udp)
+                packets += 1
+                bytes += packet.count
             }
+        }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.networkStats.framesSent += 1
-            }
+        let sendLatencyMs = prefix.sendUs >= timing.encodeEndUs
+            ? Double(prefix.sendUs - timing.encodeEndUs) / 1000 : 0
+        countersLock.lock()
+        counters.packetsSent += UInt64(packets)
+        counters.bytesSent += UInt64(bytes)
+        counters.framesSent += 1
+        sendRate.record(at: CACurrentMediaTime(), bytes: bytes)
+        sendLatencies.add(sendLatencyMs)
+        countersLock.unlock()
+    }
+
+    /// Fill in the CRC32 (computed with the CRC field zeroed) and send
+    private func sealAndSend(_ packet: inout Data, on udp: NWConnection) {
+        let crc = CRC32.compute(packet)
+        packet.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
+        udp.send(content: packet, completion: .contentProcessed { _ in })
+    }
+
+    // ── Stats ───────────────────────────────────────────────────────────────
+
+    /// Thread-safe copy of the counters, with rates over the last second
+    func statsSnapshot() -> NetworkStats {
+        countersLock.lock()
+        defer { countersLock.unlock() }
+        var snapshot = counters
+        snapshot.sendMbps = sendRate.megabitsPerSecond(now: CACurrentMediaTime())
+        snapshot.sendLatency = sendLatencies.summary()
+        return snapshot
+    }
+
+    private func resetCounters() {
+        countersLock.lock()
+        counters = NetworkStats()
+        sendRate.reset()
+        sendLatencies.reset()
+        countersLock.unlock()
+    }
+
+    /// Phase 16: sender-side performance for the receiver's diagnostics overlay
+    func sendSenderStats(_ stats: SenderStatsPayload) {
+        networkQueue.async { [weak self] in
+            guard let self = self, self.isAuthenticated, self.udpConnection != nil else { return }
+            self.sendControlMessage(type: .senderStats, payload: stats.serialize())
         }
     }
 
@@ -786,7 +857,7 @@ final class StreamSender: ObservableObject {
         var header = ProtocolHeader()
         header.type = type.rawValue
         header.sequence = nextSequence()
-        header.timestamp = UInt64(CACurrentMediaTime() * 1_000_000)
+        header.timestamp = HostClock.nowUs()
         header.payloadLength = UInt32(payload.count)
 
         var data = header.serialize()
@@ -803,14 +874,17 @@ final class StreamSender: ObservableObject {
         })
     }
 
-    private func sendPong(sequence: UInt32) {
+    /// PONG carries our clock in the header and echoes the PING's timestamp
+    /// in the payload — the receiver derives RTT and the Mac↔PC clock offset.
+    private func sendPong(sequence: UInt32, echoTimestamp: UInt64) {
         var header = ProtocolHeader()
         header.type = MessageType.pong.rawValue
         header.sequence = sequence
-        header.timestamp = UInt64(CACurrentMediaTime() * 1_000_000)
-        header.payloadLength = 0
+        header.timestamp = HostClock.nowUs()
+        header.payloadLength = 8
 
         var data = header.serialize()
+        data.appendLE(echoTimestamp)
         let crc = CRC32.compute(data)
         data.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
 
@@ -822,7 +896,7 @@ final class StreamSender: ObservableObject {
         return sequenceNumber
     }
 
-    /// Consecutive per-packet counter on the UDP channel (encoder callback thread only)
+    /// Consecutive per-packet counter on the UDP channel (network queue only)
     private func nextUDPSequence() -> UInt32 {
         udpPacketSequence &+= 1
         return udpPacketSequence

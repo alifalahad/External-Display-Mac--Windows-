@@ -7,10 +7,12 @@
 
 import Foundation
 import CoreGraphics
+import QuartzCore
 
 /// Snapshot of capture statistics at a point in time
 struct CaptureStats {
-    var fps: Double = 0
+    var fps: Double = 0                     // frames delivered in the last second
+    var latency = LatencySummary()          // displayTime → our callback
     var avgFrameTimeMs: Double = 0
     var minFrameTimeMs: Double = 999
     var maxFrameTimeMs: Double = 0
@@ -27,6 +29,8 @@ final class CaptureStatsTracker: @unchecked Sendable {
     // ── Rolling window ──────────────────────────────────────────────────────
     private let windowSize = 120  // ~2 seconds at 60 FPS
     private var frameTimes: [Double] = []
+    private var captureLatencies = RollingWindow(capacity: 120)
+    private var frameRate = RateMeter()
 
     // ── Counters ────────────────────────────────────────────────────────────
     private(set) var totalFrames: UInt64 = 0
@@ -42,11 +46,13 @@ final class CaptureStatsTracker: @unchecked Sendable {
     // ── API ─────────────────────────────────────────────────────────────────
 
     /// Record a captured frame's timing. Called from the capture queue.
-    func recordFrame(time: Double, width: Int, height: Int) {
+    func recordFrame(time: Double, width: Int, height: Int, captureLatencyMs: Double) {
         lock.lock()
         defer { lock.unlock() }
 
         if firstFrameTime == 0 { firstFrameTime = time }
+        captureLatencies.add(captureLatencyMs)
+        frameRate.record(at: time)
 
         totalFrames += 1
         currentWidth = width
@@ -83,10 +89,14 @@ final class CaptureStatsTracker: @unchecked Sendable {
             stats.uptime = lastFrameTime - firstFrameTime
         }
 
+        // Rate over the last second: drops to 0 on a static screen instead of
+        // freezing at the last busy value
+        stats.fps = frameRate.rate(now: CACurrentMediaTime())
+        stats.latency = captureLatencies.summary()
+
         if !frameTimes.isEmpty {
             let sum = frameTimes.reduce(0, +)
             let avg = sum / Double(frameTimes.count)
-            stats.fps = avg > 0 ? 1.0 / avg : 0
             stats.avgFrameTimeMs = avg * 1000
             stats.minFrameTimeMs = (frameTimes.min() ?? 0) * 1000
             stats.maxFrameTimeMs = (frameTimes.max() ?? 0) * 1000
@@ -100,6 +110,8 @@ final class CaptureStatsTracker: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         frameTimes.removeAll()
+        captureLatencies.reset()
+        frameRate.reset()
         totalFrames = 0
         droppedFrames = 0
         lastFrameTime = 0

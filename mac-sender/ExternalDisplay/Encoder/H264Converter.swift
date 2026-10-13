@@ -24,10 +24,13 @@ enum H264Converter {
     /// - Parameters:
     ///   - sampleBuffer: Encoded CMSampleBuffer from VTCompressionSession
     ///   - isKeyframe: Whether this sample is a keyframe (IDR)
+    ///   - reservedPrefix: zero bytes placed before the bitstream, filled in
+    ///     later by the caller (frame timing) without copying the frame again
     /// - Returns: Annex B encoded data ready for network transmission, or nil
     static func annexBData(
         from sampleBuffer: CMSampleBuffer,
-        isKeyframe: Bool
+        isKeyframe: Bool,
+        reservedPrefix: Int = 0
     ) -> Data? {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer)
@@ -35,7 +38,8 @@ enum H264Converter {
             return nil
         }
 
-        var result = Data()
+        var result = Data(capacity: reservedPrefix + CMBlockBufferGetDataLength(dataBuffer) + 256)
+        result.append(contentsOf: [UInt8](repeating: 0, count: reservedPrefix))
 
         // ── Prepend SPS + PPS on keyframes ──────────────────────────────────
         if isKeyframe {
@@ -110,10 +114,12 @@ enum H264Converter {
 
             // Write start code + NALU data
             result.append(contentsOf: startCode)
-            result.append(Data(bytes: bufferPtr + offset, count: Int(naluLength)))
+            (bufferPtr + offset).withMemoryRebound(to: UInt8.self, capacity: Int(naluLength)) {
+                result.append($0, count: Int(naluLength))
+            }
             offset += Int(naluLength)
         }
 
-        return result.isEmpty ? nil : result
+        return result.count > reservedPrefix ? result : nil
     }
 }

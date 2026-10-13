@@ -10,7 +10,8 @@
 // - No B-frames: allowFrameReordering=false for lowest latency
 // - Real-time priority: VT knows this is a live stream, not offline encode
 // - Block-based output handler: simpler than C callback + refcon
-// - Per-frame latency tracking via PTS-keyed timestamps
+// - Per-frame timestamps (capture, encode start/end) travel in the handler's
+//   closure, so no PTS-keyed lookup table is needed
 // =============================================================================
 
 import Foundation
@@ -24,8 +25,8 @@ final class VideoEncoder {
     // ── Public ──────────────────────────────────────────────────────────────
 
     /// Called on VT's internal thread for each encoded frame.
-    /// Parameters: (encodedSampleBuffer, isKeyframe, encodingLatencyMs)
-    var onEncodedFrame: ((CMSampleBuffer, Bool, Double) -> Void)?
+    /// Parameters: (encodedSampleBuffer, isKeyframe, timing)
+    var onEncodedFrame: ((CMSampleBuffer, Bool, FrameTiming) -> Void)?
 
     /// Current encoder configuration (read-only after init)
     let config: EncoderConfig
@@ -43,20 +44,15 @@ final class VideoEncoder {
     private var sessionNeedsReset = false
 
     /// Bitrate currently in effect (adaptive quality may change it at runtime)
-    private var currentBitrateBps: Int
-
-    /// Track encode start times keyed by PTS value, for latency measurement
-    private var encodeStartTimes: [CMTimeValue: Double] = [:]
-    private let timeLock = NSLock()
+    private var currentBitrateBps: Int   // guarded by statsLock after init
 
     // ── Stats ───────────────────────────────────────────────────────────────
 
     private var encodedFrameCount: UInt64 = 0
     private var encodedByteCount: UInt64 = 0
     private var keyframeCount: UInt64 = 0
-    private var latencies: [Double] = []
-    private let latencyWindowSize = 120
-    private var firstEncodeTime: Double = 0
+    private var latencies = RollingWindow(capacity: 120)   // ~2 s at 60 FPS
+    private var outputRate = RateMeter()                   // frames + bytes, last second
     private let statsLock = NSLock()
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -114,7 +110,10 @@ final class VideoEncoder {
                      value: config.profile.vtProfileLevel)
 
         // Bitrate + peak limit
-        applyBitrate(currentBitrateBps)
+        statsLock.lock()
+        let bitrate = currentBitrateBps
+        statsLock.unlock()
+        applyBitrate(bitrate)
 
         // Keyframe interval
         setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -163,7 +162,9 @@ final class VideoEncoder {
 
     /// Dynamically change the encoder bitrate (VT supports this without restart)
     func updateBitrate(_ newBps: Int) {
+        statsLock.lock()
         currentBitrateBps = newBps
+        statsLock.unlock()
         applyBitrate(newBps)
         print("[Encoder] Bitrate updated: \(newBps / 1_000_000) Mbps")
     }
@@ -180,7 +181,10 @@ final class VideoEncoder {
 
     /// Feed a CVPixelBuffer to the encoder. Called from the capture queue.
     /// The pixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally.
-    func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, duration: CMTime) {
+    /// `captureUs` is when the frame was on screen (HostClock); `captureIsReal`
+    /// is false when an old frame is re-encoded for a keyframe.
+    func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, duration: CMTime,
+                captureUs: UInt64, captureIsReal: Bool) {
         controlLock.lock()
         let needsReset = sessionNeedsReset
         sessionNeedsReset = false
@@ -198,13 +202,10 @@ final class VideoEncoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
             : nil
 
-        // Record encode start time for latency measurement
-        let startTime = CACurrentMediaTime()
-        timeLock.lock()
-        encodeStartTimes[presentationTime.value] = startTime
-        timeLock.unlock()
-
-        if firstEncodeTime == 0 { firstEncodeTime = startTime }
+        var timing = FrameTiming()
+        timing.captureUs = captureUs
+        timing.captureIsReal = captureIsReal
+        timing.encodeStartUs = HostClock.nowUs()
 
         // Encode with block-based output handler
         let status = VTCompressionSessionEncodeFrame(
@@ -215,11 +216,9 @@ final class VideoEncoder {
             frameProperties: frameProperties,
             infoFlagsOut: nil
         ) { [weak self] status, infoFlags, sampleBuffer in
-            self?.handleEncodedFrame(
-                status: status,
-                sampleBuffer: sampleBuffer,
-                originalPTS: presentationTime
-            )
+            var finished = timing
+            finished.encodeEndUs = HostClock.nowUs()
+            self?.handleEncodedFrame(status: status, sampleBuffer: sampleBuffer, timing: finished)
         }
         if status != noErr {
             handleEncodeFailure(status)
@@ -259,7 +258,7 @@ final class VideoEncoder {
     private func handleEncodedFrame(
         status: OSStatus,
         sampleBuffer: CMSampleBuffer?,
-        originalPTS: CMTime
+        timing: FrameTiming
     ) {
         guard status == noErr, let sampleBuffer = sampleBuffer else {
             if status != noErr {
@@ -267,16 +266,6 @@ final class VideoEncoder {
             }
             return
         }
-
-        // ── Measure encoding latency ────────────────────────────────────────
-        let endTime = CACurrentMediaTime()
-        var latencyMs: Double = 0
-
-        timeLock.lock()
-        if let startTime = encodeStartTimes.removeValue(forKey: originalPTS.value) {
-            latencyMs = (endTime - startTime) * 1000.0
-        }
-        timeLock.unlock()
 
         // ── Check if keyframe ───────────────────────────────────────────────
         let isKeyframe: Bool
@@ -302,14 +291,12 @@ final class VideoEncoder {
         encodedFrameCount += 1
         encodedByteCount += UInt64(dataSize)
         if isKeyframe { keyframeCount += 1 }
-        latencies.append(latencyMs)
-        if latencies.count > latencyWindowSize {
-            latencies.removeFirst()
-        }
+        latencies.add(timing.encodeLatencyMs)
+        outputRate.record(at: CACurrentMediaTime(), bytes: dataSize)
         statsLock.unlock()
 
         // ── Notify listener ─────────────────────────────────────────────────
-        onEncodedFrame?(sampleBuffer, isKeyframe, latencyMs)
+        onEncodedFrame?(sampleBuffer, isKeyframe, timing)
     }
 
     // ── Stats ───────────────────────────────────────────────────────────────
@@ -326,19 +313,13 @@ final class VideoEncoder {
         stats.isHardwareAccelerated = isHardwareAccelerated
         stats.isEncoding = session != nil
 
-        // Latency stats from rolling window
-        if !latencies.isEmpty {
-            let sum = latencies.reduce(0, +)
-            stats.avgEncodingLatencyMs = sum / Double(latencies.count)
-            stats.minEncodingLatencyMs = latencies.min() ?? 0
-            stats.maxEncodingLatencyMs = latencies.max() ?? 0
-        }
+        stats.latency = latencies.summary()
+        stats.targetBitrateMbps = Double(currentBitrateBps) / 1_000_000
 
-        // Output bitrate (total bytes / total time)
-        let elapsed = CACurrentMediaTime() - firstEncodeTime
-        if elapsed > 0 {
-            stats.outputBitrateMbps = Double(encodedByteCount) * 8.0 / elapsed / 1_000_000.0
-        }
+        // Rates over the last second (lifetime averages hide stalls)
+        let now = CACurrentMediaTime()
+        stats.encodedFps = outputRate.rate(now: now)
+        stats.outputBitrateMbps = outputRate.megabitsPerSecond(now: now)
 
         return stats
     }

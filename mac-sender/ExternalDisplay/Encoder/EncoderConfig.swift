@@ -75,10 +75,22 @@ struct EncoderStats {
     var encodedFrames: UInt64 = 0
     var encodedBytes: UInt64 = 0
     var keyframes: UInt64 = 0
-    var avgEncodingLatencyMs: Double = 0
-    var minEncodingLatencyMs: Double = 999
-    var maxEncodingLatencyMs: Double = 0
-    var outputBitrateMbps: Double = 0
+    var latency = LatencySummary()        // encode start → output, last ~2 s
+    var encodedFps: Double = 0            // last second
+    var outputBitrateMbps: Double = 0     // last second
+    var targetBitrateMbps: Double = 0
     var isHardwareAccelerated: Bool = false
     var isEncoding: Bool = false
+}
+
+/// Mac-side timestamps of one frame (HostClock microseconds)
+struct FrameTiming {
+    var captureUs: UInt64 = 0         // frame was on screen (SCK displayTime)
+    var captureIsReal = true          // false: re-encoded old frame (keyframe recovery)
+    var encodeStartUs: UInt64 = 0
+    var encodeEndUs: UInt64 = 0
+
+    var encodeLatencyMs: Double {
+        encodeEndUs >= encodeStartUs ? Double(encodeEndUs - encodeStartUs) / 1000 : 0
+    }
 }

@@ -286,29 +286,30 @@ struct ContentView: View {
 
     private var statsBar: some View {
         VStack(spacing: 4) {
-            // Row 1: Capture stats
+            // Row 1: Capture stats (refreshed once per second)
             HStack(spacing: 16) {
                 if engine.isCapturing {
                     Circle()
                         .fill(.red)
                         .frame(width: 8, height: 8)
 
-                    statItem("FPS", String(format: "%.1f", engine.stats.fps))
-                    statItem("Frame", String(format: "%.2f ms", engine.stats.avgFrameTimeMs))
-                    statItem("Min/Max",
-                        String(format: "%.1f / %.1f ms",
-                               engine.stats.minFrameTimeMs,
-                               engine.stats.maxFrameTimeMs))
+                    statItem("Capture", String(format: "%.1f FPS", engine.stats.fps))
+                    statItem("Latency", latencyText(engine.stats.latency))
                     statItem("Resolution",
                         "\(Int(engine.stats.resolution.width))×\(Int(engine.stats.resolution.height))")
                     statItem("Frames", "\(engine.stats.totalFrames)")
-                    statItem("Uptime", String(format: "%.1fs", engine.stats.uptime))
+                    statItem("Uptime", String(format: "%.0fs", engine.stats.uptime))
                 } else {
                     Text("Idle")
                         .foregroundStyle(.secondary)
                         .font(.system(.caption, design: .monospaced))
                 }
                 Spacer()
+                Toggle("Preview", isOn: $engine.previewEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(.caption)
+                    .help("The preview copies frames from the GPU; turn it off to save CPU and battery")
             }
 
             // Row 2: Encoder stats (when encoding)
@@ -320,14 +321,12 @@ struct ContentView: View {
 
                     statItem("H.264",
                         engine.encoderStats.isHardwareAccelerated ? "HW" : "SW")
-                    statItem("Enc Latency",
-                        String(format: "%.1f ms", engine.encoderStats.avgEncodingLatencyMs))
+                    statItem("Encode", String(format: "%.1f FPS", engine.encoderStats.encodedFps))
+                    statItem("Latency", latencyText(engine.encoderStats.latency))
                     statItem("Bitrate",
-                        String(format: "%.1f Mbps", engine.encoderStats.outputBitrateMbps))
-                    statItem("Encoded", "\(engine.encoderStats.encodedFrames)")
+                        String(format: "%.1f / %.0f Mbps", engine.encoderStats.outputBitrateMbps,
+                               engine.encoderStats.targetBitrateMbps))
                     statItem("Keyframes", "\(engine.encoderStats.keyframes)")
-                    statItem("Data",
-                        formatBytes(engine.encoderStats.encodedBytes))
 
                     Spacer()
                 }
@@ -344,12 +343,26 @@ struct ContentView: View {
                     statItem("Net", senderState.displayText)
 
                     if senderState.isStreaming {
-                        let ns = engine.sender.networkStats
-                        statItem("Sent", formatBytes(ns.bytesSent))
-                        statItem("Packets", "\(ns.packetsSent)")
-                        statItem("Frames", "\(ns.framesSent)")
+                        let ns = engine.networkStats
+                        statItem("Send", String(format: "%.1f Mbps", ns.sendMbps))
+                        statItem("RTT", ns.receiverRttMs.map { String(format: "%.0f ms", $0) } ?? "–")
+                        statItem("End-to-end",
+                                 ns.receiverLatencyMs.map { String(format: "%.1f ms", $0) } ?? "–")
+                        statItem("Loss", String(format: "%.2f%%", ns.receiverLossPercent))
                     }
 
+                    Spacer()
+                }
+            }
+
+            // Row 3b: this process
+            if engine.isCapturing {
+                HStack(spacing: 16) {
+                    Image(systemName: "gauge.with.dots.needle.33percent")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                    statItem("CPU", String(format: "%.1f%% of all cores", engine.processUsage.cpuPercent))
+                    statItem("Memory", String(format: "%.0f MB", engine.processUsage.memoryMB))
                     Spacer()
                 }
             }
@@ -403,9 +416,9 @@ struct ContentView: View {
         }
     }
 
-    private func formatBytes(_ bytes: UInt64) -> String {
-        if bytes < 1024 { return "\(bytes) B" }
-        if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
-        return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
+    /// "avg / p95 ms" — p95 shows the stutter an average hides
+    private func latencyText(_ summary: LatencySummary) -> String {
+        guard summary.samples > 0 else { return "–" }
+        return String(format: "%.1f / %.1f ms", summary.avgMs, summary.p95Ms)
     }
 }

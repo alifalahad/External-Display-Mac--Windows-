@@ -4,12 +4,13 @@
 // Captures a selected display at up to 60 FPS via ScreenCaptureKit, then
 // feeds CVPixelBuffer frames to:
 //   1. VideoToolbox H.264 hardware encoder (GPU→GPU, all frames)
-//   2. CIContext → CGImage preview (every 2nd frame, for UI)
+//   2. CIContext → CGImage preview (≤ 10 FPS, downscaled, optional)
 //
 // Key design decisions:
 // - CVPixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally
-// - Preview is throttled to ~30 FPS to reduce CPU load
+// - The preview is a GPU→CPU readback: throttled, downscaled, can be switched off
 // - Encoder runs at full capture rate for smooth output
+// - UI statistics are pulled once per second (diagnosticsTimer), never pushed per frame
 // =============================================================================
 
 import Foundation
@@ -26,6 +27,17 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     @Published var capturedFrame: CGImage?
     @Published var stats = CaptureStats()
     @Published var encoderStats = EncoderStats()
+    @Published var networkStats = NetworkStats()
+    @Published var processUsage = ProcessUsage()
+
+    /// Live preview in the window. Off saves a full-frame GPU→CPU readback.
+    @Published var previewEnabled = true {
+        didSet {
+            let enabled = previewEnabled
+            captureQueue.async { [weak self] in self?.previewEnabledOnCaptureQueue = enabled }
+            if !enabled { capturedFrame = nil }
+        }
+    }
     @Published var isCapturing = false
     @Published var isEncoding = false
     @Published var availableDisplays: [SCDisplay] = []
@@ -61,6 +73,16 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     private var stream: SCStream?
     private var encoder: VideoEncoder?
     private var frameCounter: UInt64 = 0
+
+    // ── Preview throttling (capture queue only) ─────────────────────────────
+    private var previewEnabledOnCaptureQueue = true
+    private var lastPreviewTime: Double = 0
+    private let previewInterval = 0.1        // ≤ 10 FPS
+    private let previewMaxWidth: CGFloat = 960
+
+    // ── Diagnostics (main thread) ───────────────────────────────────────────
+    private var diagnosticsTimer: DispatchSourceTimer?
+    private let processMetrics = ProcessMetrics()
 
     // ── Keyframe recovery (capture queue only) ──────────────────────────────
     /// Last complete frame — re-encoded on keyframe requests, because
@@ -108,11 +130,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             config.height = Int32(height)
             let enc = try VideoEncoder(config: config)
 
-            enc.onEncodedFrame = { [weak self] sampleBuffer, isKeyframe, latencyMs in
-                // Convert AVCC → Annex B and send over network
+            enc.onEncodedFrame = { [weak self] sampleBuffer, isKeyframe, timing in
+                // Convert AVCC → Annex B (with room for the timing prefix) and send
                 guard let self = self, self.sender.state.isStreaming else { return }
-                if let annexB = H264Converter.annexBData(from: sampleBuffer, isKeyframe: isKeyframe) {
-                    self.sender.sendVideoFrame(annexBData: annexB, isKeyframe: isKeyframe)
+                if let frame = H264Converter.annexBData(from: sampleBuffer, isKeyframe: isKeyframe,
+                                                       reservedPrefix: FrameTimingPrefix.size) {
+                    self.sender.sendVideoFrame(frameData: frame, isKeyframe: isKeyframe, timing: timing)
                 }
             }
 
@@ -352,6 +375,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Watch for connection state changes — auto-start streaming
             setupSenderObserver()
 
+            await MainActor.run { self.startDiagnosticsTimer() }
+
             // After an auto-restart the receiver may still be streaming —
             // resend stream parameters (resolution may have changed)
             sender.restartStreamIfActive()
@@ -387,6 +412,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         sender.stop()
         stopEncoder()
         senderCancellable = nil
+        diagnosticsTimer?.cancel()
+        diagnosticsTimer = nil
 
         Task {
             do {
@@ -438,18 +465,59 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             encoder.forceKeyframe()
             if let pixelBuffer = self.lastPixelBuffer {
                 let pts = CMClockGetTime(CMClockGetHostTimeClock())
-                self.encodeFrame(pixelBuffer, pts: pts)
+                // Old content: its real capture time would count the idle period as latency
+                self.encodeFrame(pixelBuffer, pts: pts, captureUs: HostClock.nowUs(), captureIsReal: false)
             }
             print("[Engine] Keyframe forced")
         }
     }
 
     /// Encode on the capture queue with strictly increasing timestamps
-    private func encodeFrame(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+    private func encodeFrame(_ pixelBuffer: CVPixelBuffer, pts: CMTime,
+                             captureUs: UInt64, captureIsReal: Bool) {
         if lastEncodedPTS.isValid && CMTimeCompare(pts, lastEncodedPTS) <= 0 { return }
         lastEncodedPTS = pts
         encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts,
-                        duration: CMTime(value: 1, timescale: 60))
+                        duration: CMTime(value: 1, timescale: 60),
+                        captureUs: captureUs, captureIsReal: captureIsReal)
+    }
+
+    // ── Diagnostics (Phase 16) ──────────────────────────────────────────────
+
+    /// Once per second: refresh the UI statistics and tell the receiver how the
+    /// sender is doing (its overlay shows capture/encode FPS and Mac CPU).
+    /// Main thread only
+    private func startDiagnosticsTimer() {
+        diagnosticsTimer?.cancel()
+        _ = processMetrics.sample()  // CPU baseline
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.refreshDiagnostics() }
+        timer.resume()
+        diagnosticsTimer = timer
+    }
+
+    /// Main thread only (diagnosticsTimer runs on the main queue)
+    private func refreshDiagnostics() {
+        let captureStats = statsTracker.currentStats()
+        let encStats = encoder?.currentStats() ?? EncoderStats()
+        let usage = processMetrics.sample()
+
+        stats = captureStats
+        encoderStats = encStats
+        networkStats = sender.statsSnapshot()
+        processUsage = usage
+
+        guard sender.state.isStreaming else { return }
+        var payload = SenderStatsPayload()
+        payload.captureFps100 = UInt32(max(captureStats.fps, 0) * 100)
+        payload.encodeFps100 = UInt32(max(encStats.encodedFps, 0) * 100)
+        payload.cpuPercent100 = UInt32(max(usage.cpuPercent, 0) * 100)
+        payload.memoryMB = UInt32(max(usage.memoryMB, 0))
+        payload.encoderKbps = UInt32(max(encStats.outputBitrateMbps, 0) * 1000)
+        payload.targetKbps = UInt32(max(encStats.targetBitrateMbps, 0) * 1000)
+        payload.flags = encStats.isHardwareAccelerated ? SenderStatsPayload.flagHardwareEncoder : 0
+        sender.sendSenderStats(payload)
     }
 
     // ── Capture Auto-Restart (Phase 15) ─────────────────────────────────────
@@ -598,36 +666,42 @@ extension ScreenCaptureEngine: SCStreamOutput {
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
         // ── Record timing ───────────────────────────────────────────────────
+        // displayTime = when this frame was on screen (mach absolute time)
+        let nowUs = HostClock.nowUs()
+        var captureUs = nowUs
+        if let displayTicks = (attachments[SCStreamFrameInfo.displayTime.rawValue] as? NSNumber)?.uint64Value,
+           displayTicks > 0 {
+            captureUs = min(HostClock.microseconds(fromMachTicks: displayTicks), nowUs)
+        }
         let captureTime = CACurrentMediaTime()
-        statsTracker.recordFrame(time: captureTime, width: width, height: height)
+        statsTracker.recordFrame(time: captureTime, width: width, height: height,
+                                 captureLatencyMs: Double(nowUs - captureUs) / 1000)
         frameCounter += 1
 
         // ── Feed ALL frames to encoder (GPU→GPU, fast) ──────────────────────
         lastPixelBuffer = pixelBuffer
-        encodeFrame(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        encodeFrame(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer),
+                    captureUs: captureUs, captureIsReal: true)
 
-        // ── Throttled preview (every 2nd frame = ~30 FPS) ───────────────────
-        // CGImage conversion is expensive (GPU→CPU). Encoder gets all frames;
-        // preview can afford to skip some for better overall performance.
-        let currentStats = statsTracker.currentStats()
-        let encStats = encoder?.currentStats()
+        // ── Throttled, downscaled preview ───────────────────────────────────
+        // CGImage creation is a GPU→CPU readback. At full size and 30 FPS that
+        // was ~16 MB per frame for a 2560×1600 display; 960 px wide at ≤ 10 FPS
+        // is ~2 MB per frame and plenty for a thumbnail.
+        guard previewEnabledOnCaptureQueue,
+              captureTime - lastPreviewTime >= previewInterval else { return }
+        lastPreviewTime = captureTime
 
-        if frameCounter % 2 == 0 {
-            let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-            guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-                return
-            }
-            DispatchQueue.main.async { [weak self] in
-                self?.capturedFrame = cgImage
-                self?.stats = currentStats
-                if let encStats { self?.encoderStats = encStats }
-            }
-        } else {
-            // Still update stats on non-preview frames
-            DispatchQueue.main.async { [weak self] in
-                self?.stats = currentStats
-                if let encStats { self?.encoderStats = encStats }
-            }
+        var ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        if ciImage.extent.width > previewMaxWidth {
+            let scale = previewMaxWidth / ciImage.extent.width
+            ciImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.previewEnabled else { return }
+            self.capturedFrame = cgImage
         }
     }
 }
