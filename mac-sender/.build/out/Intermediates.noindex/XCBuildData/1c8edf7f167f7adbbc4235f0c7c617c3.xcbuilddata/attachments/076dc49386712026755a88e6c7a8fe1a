@@ -16,6 +16,16 @@
     "swift-dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ScreenCaptureEngine.swiftdeps",
     "swiftmodule" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ScreenCaptureEngine~partial.swiftmodule"
   },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Clipboard/ClipboardSync.swift" : {
+    "const-values" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.swiftconstvalues",
+    "dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.d",
+    "diagnostics" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.dia",
+    "index-unit-output-path" : "/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.o",
+    "llvm-bc" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.bc",
+    "object" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.o",
+    "swift-dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync.swiftdeps",
+    "swiftmodule" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ClipboardSync~partial.swiftmodule"
+  },
   "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/ContentView.swift" : {
     "const-values" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ContentView.swiftconstvalues",
     "dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/ContentView.d",
@@ -125,5 +135,15 @@
     "object" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/CaptureStats.o",
     "swift-dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/CaptureStats.swiftdeps",
     "swiftmodule" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/CaptureStats~partial.swiftmodule"
+  },
+  "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/ExternalDisplay/Security/PairingManager.swift" : {
+    "const-values" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.swiftconstvalues",
+    "dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.d",
+    "diagnostics" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.dia",
+    "index-unit-output-path" : "/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.o",
+    "llvm-bc" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.bc",
+    "object" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.o",
+    "swift-dependencies" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager.swiftdeps",
+    "swiftmodule" : "/Users/alifalahad/Codes/External Display (Mac->Windows)/mac-sender/.build/out/Intermediates.noindex/ExternalDisplay.build/Debug/ExternalDisplay-p.build/Objects-normal/arm64/PairingManager~partial.swiftmodule"
   }
 }

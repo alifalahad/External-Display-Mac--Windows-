@@ -53,6 +53,7 @@
               "OTHER_SWIFT_FLAGS" : "$(inherited)",
               "OTHER_SWIFT_FLAGS[__destination_platform=YES]" : "$(inherited)",
               "STRIP_INSTALLED_PRODUCT" : "NO",
+              "SWIFTC_DISABLE_SANDBOX" : "YES",
               "SWIFT_FORCE_STATIC_LINK_STDLIB" : "NO",
               "TOOLCHAINS" : "com.apple.dt.toolchain.XcodeDefault $(inherited)"
             }
@@ -111,6 +112,7 @@
           "OTHER_SWIFT_FLAGS" : "$(inherited)",
           "OTHER_SWIFT_FLAGS[__destination_platform=YES]" : "$(inherited)",
           "STRIP_INSTALLED_PRODUCT" : "NO",
+          "SWIFTC_DISABLE_SANDBOX" : "YES",
           "SWIFT_FORCE_STATIC_LINK_STDLIB" : "NO",
           "TOOLCHAINS" : "com.apple.dt.toolchain.XcodeDefault $(inherited)"
         }
