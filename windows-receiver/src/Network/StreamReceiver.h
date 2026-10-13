@@ -10,9 +10,15 @@
 //   - mDNS re-discovery when the Mac's IP changes
 //   - UDP packet-loss detection → rate-limited keyframe requests
 //
+// Performance (Phase 16):
+//   - strips the per-frame timing prefix into a FrameTimeline
+//   - PING/PONG clock sync (1 Hz) → RTT, Mac↔PC clock offset
+//   - interarrival jitter, frames expected from Mac frame numbers
+//   - keeps the latest SENDER_STATS for the diagnostics overlay
+//
 // Usage:
 //   StreamReceiver receiver;
-//   receiver.setFrameCallback([](const uint8_t* data, size_t len, bool key) { ... });
+//   receiver.setFrameCallback([](const uint8_t* data, size_t len, const FrameTimeline& t) { ... });
 //   receiver.connect("192.168.1.x");
 //   receiver.disconnect();
 // =============================================================================
@@ -21,6 +27,8 @@
 
 #include "Protocol.h"
 #include "../Security/PairingManager.h"
+#include "../Performance/ClockSync.h"
+#include "../Performance/PipelineMetrics.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <functional>
@@ -48,8 +56,8 @@ public:
     };
 
     /// Called on the receive thread when a complete H.264 frame is ready.
-    /// Parameters: (h264Data, dataLength, isKeyframe)
-    using FrameCallback = std::function<void(const uint8_t*, size_t, bool)>;
+    /// The timeline has the Mac timestamps and the arrival times filled in.
+    using FrameCallback = std::function<void(const uint8_t*, size_t, const FrameTimeline&)>;
 
     /// Called when stream parameters are received from sender
     using StreamInfoCallback = std::function<void(uint32_t width, uint32_t height, uint32_t fps)>;
@@ -119,12 +127,25 @@ public:
         uint64_t framesDropped = 0;    // incomplete fragments
         uint64_t fragmentsReceived = 0;
         uint64_t keyframeRequests = 0;
+        uint64_t framesExpected = 0;   // from Mac frame numbers (gaps = whole frames lost)
+        double   jitterMs = 0;         // RFC 3550 interarrival jitter
     };
 
     Stats getStats() const {
         std::lock_guard<std::mutex> lock(m_statsMutex);
         return m_stats;
     }
+
+    // ── Performance (Phase 16) ──────────────────────────────────────────────
+
+    /// Mac↔PC clock offset and RTT from PING/PONG
+    ClockSync::Estimate clockEstimate() const { return m_clockSync.estimate(); }
+
+    /// Latest SENDER_STATS from the Mac (valid = false if none in the last 3 s)
+    SenderSample senderStats() const;
+
+    /// Average capture→display latency to report back to the Mac (0 = unknown)
+    void setReportedLatencyUs(uint32_t us) { m_reportedLatencyUs.store(us); }
 
     // ── Input Forwarding ────────────────────────────────────────────────────
 
@@ -162,7 +183,8 @@ private:
 
     /// TCP control channel operations
     bool tcpConnect(const std::string& hostIP);
-    void tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen);
+    void tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen,
+                        uint64_t timestamp = 0);
     bool tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload);
     bool recvExact(uint8_t* dst, size_t len);
     void closeTcpSocket();
@@ -178,12 +200,18 @@ private:
     void handleStartStream(const std::vector<uint8_t>& payload);
     void handleStopStream();
 
-    /// Handle video data
+    /// Handle video data (rxUs = arrival time of this packet, PipelineClock)
     void handleVideoFrame(const exdp::ProtocolHeader& header,
-                          const uint8_t* data, size_t dataLen);
+                          const uint8_t* data, size_t dataLen, int64_t rxUs);
     void handleVideoFragment(const exdp::ProtocolHeader& header,
-                             const uint8_t* data, size_t dataLen);
-    void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe);
+                             const uint8_t* data, size_t dataLen, int64_t rxUs);
+    void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe, bool hasTiming,
+                      int64_t firstPacketUs, int64_t completeUs);
+
+    /// Phase 16: clock sync and sender statistics
+    void sendClockPing();
+    void handlePong(const exdp::ProtocolHeader& header, const std::vector<uint8_t>& payload);
+    void handleSenderStats(const std::vector<uint8_t>& payload);
 
     /// Ask the Mac for a keyframe after loss (at most once per interval)
     void requestKeyframeAfterLoss();
@@ -247,6 +275,8 @@ private:
         uint16_t totalFragments = 0;
         uint16_t receivedCount = 0;
         bool isKeyframe = false;
+        bool hasTiming = false;
+        int64_t firstPacketUs = 0;
         std::map<uint16_t, std::vector<uint8_t>> fragments;
     };
 
@@ -273,4 +303,26 @@ private:
     uint64_t m_prevPacketsLost = 0;
     std::chrono::steady_clock::time_point m_lastQualityReport;
     static constexpr float QUALITY_REPORT_INTERVAL = 2.0f;  // seconds
+
+    // ── Performance (Phase 16) ──────────────────────────────────────────────
+
+    ClockSync m_clockSync;                          // thread-safe
+    std::atomic<bool> m_pingBurst{false};           // START_STREAM: converge quickly
+    std::chrono::steady_clock::time_point m_nextPing{};  // UDP thread
+    int m_fastPingsLeft = 0;                        // UDP thread
+    static constexpr int CLOCK_PING_INTERVAL_MS = 1000;
+    static constexpr int CLOCK_PING_BURST_MS = 200;
+    static constexpr int CLOCK_PING_BURST = 5;
+
+    std::atomic<uint32_t> m_reportedLatencyUs{0};
+
+    // Frame accounting (UDP thread)
+    std::atomic<bool> m_frameSeqReset{false};
+    bool m_haveFrameSeq = false;
+    uint32_t m_lastFrameSeq = 0;
+    JitterEstimator m_jitter;
+
+    mutable std::mutex m_senderMutex;
+    SenderSample m_senderSample;
+    std::chrono::steady_clock::time_point m_senderSampleTime{};
 };

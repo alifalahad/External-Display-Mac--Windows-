@@ -9,16 +9,21 @@
 //   ExternalDisplayReceiver.exe              → auto-discover Mac sender
 //   ExternalDisplayReceiver.exe 192.168.1.5  → connect to Mac sender directly
 //   --gpu=high | --gpu=low | --gpu=default   → which GPU renders (hybrid laptops)
+//   --bench=SECONDS                          → record a benchmark, write
+//                                              bench-*.csv / -summary.txt, exit
 //
 // Controls:
 //   ESC  — Exit
 //   F11  — Toggle fullscreen / windowed
-//   F2   — Toggle stats overlay
+//   F2   — Toggle diagnostics overlay
 // =============================================================================
 
 #include "App/Window.h"
 #include "Renderer/D3D11Renderer.h"
 #include "Performance/FrameStats.h"
+#include "Performance/PipelineMetrics.h"
+#include "Performance/PipelineClock.h"
+#include "Performance/SystemMonitor.h"
 #include "Network/StreamReceiver.h"
 #include "Decoder/H264Decoder.h"
 #include "Input/InputCapture.h"
@@ -36,6 +41,7 @@
 #include <mutex>
 #include <deque>
 #include <sstream>
+#include <ctime>
 
 // Console helpers
 static FILE* gConsoleFile = nullptr;
@@ -95,19 +101,23 @@ struct NV12Frame {
     int stride;
     uint32_t width;
     uint32_t height;
+    FrameTimeline timeline;
 };
 
 static std::mutex gNV12Mutex;
 static NV12Frame gLatestNV12;
 static bool gHasNewNV12 = false;
+static uint64_t gNV12Overwritten = 0;   // decoded but replaced before upload (guarded by gNV12Mutex)
 
 static void QueueNV12Frame(const uint8_t* yData, const uint8_t* uvData,
-                            int stride, uint32_t width, uint32_t height) {
+                            int stride, uint32_t width, uint32_t height,
+                            const FrameTimeline& timeline) {
     uint32_t evenH = (height + 1) & ~1;
     size_t ySize  = (size_t)stride * evenH;
     size_t uvSize = (size_t)stride * (evenH / 2);
 
     std::lock_guard<std::mutex> lock(gNV12Mutex);
+    if (gHasNewNV12) gNV12Overwritten++;   // latest frame wins
     if (gLatestNV12.yPlane.size() != ySize)   gLatestNV12.yPlane.resize(ySize);
     if (gLatestNV12.uvPlane.size() != uvSize) gLatestNV12.uvPlane.resize(uvSize);
 
@@ -116,6 +126,7 @@ static void QueueNV12Frame(const uint8_t* yData, const uint8_t* uvData,
     gLatestNV12.stride = stride;
     gLatestNV12.width = width;
     gLatestNV12.height = height;
+    gLatestNV12.timeline = timeline;
     gHasNewNV12 = true;
 }
 
@@ -123,27 +134,70 @@ static void QueueNV12Frame(const uint8_t* yData, const uint8_t* uvData,
 
 struct H264InputFrame {
     std::vector<uint8_t> data;
-    bool isKeyframe;
+    FrameTimeline timeline;
 };
 
 static std::mutex gInputMutex;
 static std::deque<H264InputFrame> gInputQueue;
+static uint64_t gInputDropped = 0;   // trimmed from the queue (guarded by gInputMutex)
 static const size_t MAX_INPUT_QUEUE = 4;
 
-static void QueueH264Frame(const uint8_t* data, size_t len, bool keyframe) {
+static void QueueH264Frame(const uint8_t* data, size_t len, const FrameTimeline& timeline) {
     std::lock_guard<std::mutex> lock(gInputMutex);
     if (gInputQueue.size() >= MAX_INPUT_QUEUE) {
         int lastKey = -1;
         for (int i = (int)gInputQueue.size() - 1; i >= 0; i--) {
-            if (gInputQueue[i].isKeyframe) { lastKey = i; break; }
+            if (gInputQueue[i].timeline.keyframe) { lastKey = i; break; }
         }
         if (lastKey > 0) {
             gInputQueue.erase(gInputQueue.begin(), gInputQueue.begin() + lastKey);
+            gInputDropped += (uint64_t)lastKey;
         } else if (gInputQueue.size() >= MAX_INPUT_QUEUE * 2) {
+            gInputDropped += gInputQueue.size() - MAX_INPUT_QUEUE;
             gInputQueue.erase(gInputQueue.begin(), gInputQueue.end() - MAX_INPUT_QUEUE);
         }
     }
-    gInputQueue.push_back({std::vector<uint8_t>(data, data + len), keyframe});
+    gInputQueue.push_back({std::vector<uint8_t>(data, data + len), timeline});
+}
+
+// ── Decode bookkeeping (main thread only) ───────────────────────────────────
+// The decoder hands back the sample time we gave it; it identifies which input
+// frame a decoded picture belongs to.
+
+static constexpr int64_t kSampleTimeStep = 166667;   // 100 ns units, 1/60 s
+static std::deque<std::pair<int64_t, FrameTimeline>> gDecoding;   // sample time → timeline
+static int64_t gNextSampleTime = 0;
+
+static FrameTimeline TakeDecodingTimeline(int64_t sampleTime) {
+    // Exact match; older inputs that produced no picture are discarded
+    for (size_t i = 0; i < gDecoding.size(); i++) {
+        if (gDecoding[i].first == sampleTime) {
+            FrameTimeline t = gDecoding[i].second;
+            gDecoding.erase(gDecoding.begin(), gDecoding.begin() + (std::ptrdiff_t)i + 1);
+            return t;
+        }
+    }
+    // Time not passed through: no B-frames, so pictures come out in input order
+    if (gDecoding.empty()) return FrameTimeline{};
+    FrameTimeline t = gDecoding.front().second;
+    gDecoding.pop_front();
+    return t;
+}
+
+// ── Presented frames waiting for scan-out (main thread only) ────────────────
+
+struct PendingDisplay {
+    uint32_t presentCount;
+    FrameTimeline timeline;
+};
+
+static std::string BenchmarkBasePath() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_s(&local, &now);
+    char name[64];
+    std::strftime(name, sizeof(name), "bench-%Y%m%d-%H%M%S", &local);
+    return name;
 }
 
 // ── Pending stream restart (set by network thread, handled by main thread) ──
@@ -159,10 +213,11 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
     InitConsole();
     InstallCrashHandler();
 
-    // Arguments: [mac-ip] [--gpu=high|low|default]
+    // Arguments: [mac-ip] [--gpu=high|low|default] [--bench=SECONDS]
     std::string macIP;
     std::string macServiceName;  // mDNS name, used to find the Mac again if its IP changes
     GpuPreference gpuPreference = GpuPreference::Default;
+    int benchSeconds = 0;
     {
         std::istringstream args(lpCmdLine ? lpCmdLine : "");
         std::string arg;
@@ -170,6 +225,13 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             if (arg == "--gpu=high")         gpuPreference = GpuPreference::HighPerformance;
             else if (arg == "--gpu=low")     gpuPreference = GpuPreference::MinimumPower;
             else if (arg == "--gpu=default") gpuPreference = GpuPreference::Default;
+            else if (arg.rfind("--bench=", 0) == 0) {
+                benchSeconds = atoi(arg.c_str() + 8);
+                if (benchSeconds <= 0) {
+                    printf("--bench needs a duration in seconds, e.g. --bench=60\n");
+                    benchSeconds = 0;
+                }
+            }
             else if (arg.rfind("--", 0) == 0) printf("Ignoring unknown option: %s\n", arg.c_str());
             else macIP = arg;
         }
@@ -326,15 +388,17 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
 
             // Network thread: queue H.264 frames (don't decode here)
             receiver->setFrameCallback(
-                [](const uint8_t* data, size_t len, bool key) {
-                    QueueH264Frame(data, len, key);
+                [](const uint8_t* data, size_t len, const FrameTimeline& timeline) {
+                    QueueH264Frame(data, len, timeline);
                 });
 
-            // Decoder: output raw NV12 Y+UV planes for GPU upload
+            // Decoder (main thread): output raw NV12 Y+UV planes for GPU upload
             decoder->setRawNV12Callback(
                 [](const uint8_t* yData, const uint8_t* uvData,
-                   int stride, uint32_t w, uint32_t h) {
-                    QueueNV12Frame(yData, uvData, stride, w, h);
+                   int stride, uint32_t w, uint32_t h, int64_t sampleTime) {
+                    FrameTimeline timeline = TakeDecodingTimeline(sampleTime);
+                    timeline.decodeEndUs = PipelineClock::NowUs();
+                    QueueNV12Frame(yData, uvData, stride, w, h, timeline);
                 });
 
             // Set up pairing manager for secure authentication.
@@ -372,10 +436,44 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             printf("Controls: ESC=quit, F11=fullscreen, F2=stats, F3=toggle input\n\n");
         }
 
+        // ── Performance instrumentation (Phase 16) ──────────────────────────
+        SystemMonitor systemMonitor;
+        PipelineMetrics metrics;
+        BenchmarkRecorder bench;
+        std::deque<PendingDisplay> pendingDisplay;
+        bool frameStatsUsable = true;       // DXGI frame statistics match our presents
+        bool frameStatsSeen = false;        // at least one present matched to its vblank
+        int64_t lastFrameStatsOkUs = 0;
+        uint64_t presentsTracked = 0;
+        int64_t lastTickUs = PipelineClock::NowUs();
+        int64_t lastOverlayUs = 0;
+        int64_t lastConsoleUs = lastTickUs;
+        uint64_t skippedReported = 0;
+        std::wstring overlayText;
+        uint32_t streamWidth = 0, streamHeight = 0;
+        if (benchSeconds > 0) {
+            printf("Benchmark: %d s, starts with the first video frame%s\n\n", benchSeconds,
+                   networkMode ? "" : " (needs a Mac connection)");
+        }
+
+        auto finishFrame = [&](const FrameTimeline& t) {
+            StageTimes stages = metrics.onFrameDisplayed(t, receiver ? receiver->clockEstimate()
+                                                                     : ClockSync::Estimate{});
+            if (benchSeconds > 0 && !bench.active() && bench.basePath().empty()) {
+                std::string base = BenchmarkBasePath();
+                if (bench.start(base, benchSeconds, PipelineClock::NowUs())) {
+                    printf("[Bench] Recording %d s to %s-*.csv\n", benchSeconds, base.c_str());
+                } else {
+                    printf("[Bench] Cannot create %s-*.csv — benchmark disabled\n", base.c_str());
+                    benchSeconds = 0;
+                }
+            }
+            bench.recordFrame(t, stages);
+        };
+
         // ── Main loop ───────────────────────────────────────────────────────
         FrameStats stats(60.0f);
         auto startTime = std::chrono::high_resolution_clock::now();
-        auto lastStatsPrint = startTime;
         uint64_t frameCounter = 0;
 
         while (window.ProcessMessages()) {
@@ -399,7 +497,10 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         Sleep(500);
                     }
                 }
-                wprintf(L"[Renderer] Recovered on %s\n", renderer->GetAdapterName().c_str());
+                wprintf(L"[Renderer] Recovered on %ls\n", renderer->GetAdapterName().c_str());
+                // The new swap chain numbers its presents from scratch
+                for (const auto& p : pendingDisplay) finishFrame(p.timeline);
+                pendingDisplay.clear();
                 {
                     // Re-upload the last frame so a static screen isn't left black
                     std::lock_guard<std::mutex> lock(gNV12Mutex);
@@ -431,6 +532,10 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         std::lock_guard<std::mutex> nv(gNV12Mutex);
                         gHasNewNV12 = false;
                     }
+                    gDecoding.clear();
+                    pendingDisplay.clear();
+                    streamWidth = gPendingWidth;
+                    streamHeight = gPendingHeight;
 
                     decoder->shutdown();
                     decoder->initialize(gPendingWidth, gPendingHeight);
@@ -454,9 +559,16 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 static int consecutiveDecodeFailures = 0;
                 while (!gInputQueue.empty() && decoded < 2) {
                     auto& frame = gInputQueue.front();
-                    bool ok = decoder->decode(frame.data.data(), frame.data.size());
+                    const int64_t sampleTime = gNextSampleTime;
+                    gNextSampleTime += kSampleTimeStep;
+                    frame.timeline.decodeStartUs = PipelineClock::NowUs();
+                    gDecoding.emplace_back(sampleTime, frame.timeline);
+                    if (gDecoding.size() > 32) gDecoding.pop_front();   // decoder never answered
+
+                    bool ok = decoder->decode(frame.data.data(), frame.data.size(), sampleTime);
                     gInputQueue.pop_front();
                     decoded++;
+                    if (ok) metrics.onFrameDecoded();
 
                     // Phase 15: Track decoder failures for auto-recovery
                     if (!ok) {
@@ -469,6 +581,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                                                gPendingHeight > 0 ? gPendingHeight : 1080);
                             consecutiveDecodeFailures = 0;
                             gInputQueue.clear();
+                            gDecoding.clear();
                             // Request keyframe from server
                             if (receiver) {
                                 receiver->requestKeyframe();
@@ -482,6 +595,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             }
 
             // Upload latest NV12 frame to GPU
+            bool uploadedFrame = false;
+            FrameTimeline uploadedTimeline;
             if (networkMode) {
                 std::lock_guard<std::mutex> lock(gNV12Mutex);
                 if (gHasNewNV12) {
@@ -492,6 +607,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         gLatestNV12.width,
                         gLatestNV12.height);
                     gHasNewNV12 = false;
+                    uploadedFrame = true;
+                    uploadedTimeline = gLatestNV12.timeline;
                 }
             }
 
@@ -519,46 +636,182 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             auto now = std::chrono::high_resolution_clock::now();
             float elapsed = std::chrono::duration<float>(now - startTime).count();
             stats.BeginFrame();
-            renderer->Render(elapsed, (float)frameCounter, window.ShowStats() ? &stats : nullptr);
+            renderer->Render(elapsed, (float)frameCounter, window.ShowStats() ? &overlayText : nullptr);
             stats.EndFrame();
             frameCounter++;
+            metrics.onLoopIteration();
+            const int64_t nowUs = PipelineClock::NowUs();
 
-            // Stats every 2 seconds
-            float sincePrint = std::chrono::duration<float>(now - lastStatsPrint).count();
-            if (sincePrint >= 2.0f) {
-                wprintf(L"%s", stats.FormatStats().c_str());
-                if (networkMode && receiver) {
-                    auto ns = receiver->getStats();
-                    auto state = receiver->getState();
-                    const char* stateStr = "?";
-                    switch (state) {
-                        case StreamReceiver::State::Disconnected: stateStr = "Disconnected"; break;
-                        case StreamReceiver::State::Connecting:   stateStr = "Connecting"; break;
-                        case StreamReceiver::State::Connected:    stateStr = "Connected"; break;
-                        case StreamReceiver::State::Streaming:    stateStr = "Streaming"; break;
-                        case StreamReceiver::State::Reconnecting: stateStr = "Reconnecting"; break;
-                        case StreamReceiver::State::Error:        stateStr = "Error"; break;
+            // ── Phase 16: follow each new video frame until it is on screen ──
+            if (uploadedFrame) {
+                uploadedTimeline.presentUs = nowUs;
+                uint32_t presentCount = 0;
+                if (frameStatsUsable && renderer->GetLastPresentCount(presentCount)) {
+                    if (lastFrameStatsOkUs == 0) lastFrameStatsOkUs = nowUs;
+                    presentsTracked++;
+                    pendingDisplay.push_back({ presentCount, uploadedTimeline });
+                    if (pendingDisplay.size() > 8) {   // statistics stalled: give up on the oldest
+                        finishFrame(pendingDisplay.front().timeline);
+                        pendingDisplay.pop_front();
                     }
-                    printf("  Net: %s | Recv: %llu bytes, %llu pkts (%llu lost), %llu frames (%llu dropped) | Keyframe req: %llu\n",
-                        stateStr, ns.bytesReceived, ns.packetsReceived, ns.packetsLost,
-                        ns.framesReceived, ns.framesDropped, ns.keyframeRequests);
-                    if (decoder) {
-                        auto ds = decoder->getStats();
+                } else {
+                    finishFrame(uploadedTimeline);   // no scan-out time available
+                }
+            }
+            if (!pendingDisplay.empty()) {
+                uint32_t shownCount = 0;
+                int64_t shownUs = 0;
+                bool statsOk = renderer->GetLastDisplayedPresent(shownCount, shownUs);
+                if (statsOk) lastFrameStatsOkUs = nowUs;
+
+                // Give up on scan-out times when the driver does not deliver them:
+                // failing for 2 s, or 120 presents without a single match
+                const char* why = nullptr;
+                if (!statsOk && nowUs - lastFrameStatsOkUs > 2'000'000) why = "not provided";
+                else if (!frameStatsSeen && presentsTracked > 120) why = "never matched a present";
+                if (why && frameStatsUsable) {
+                    printf("[Perf] DXGI frame statistics %s — Display stage unavailable, "
+                           "Total measured to Present()\n", why);
+                    frameStatsUsable = false;
+                }
+
+                while (!pendingDisplay.empty()) {
+                    PendingDisplay& p = pendingDisplay.front();
+                    int32_t ahead = (int32_t)(shownCount - p.presentCount);
+                    if (statsOk && frameStatsUsable) {
+                        if (ahead < 0 && ahead > -1000) break;   // not on screen yet
+                        int64_t delayUs = shownUs - p.timeline.presentUs;
+                        if (ahead == 0 && delayUs >= -1000 && delayUs < 100'000) {
+                            p.timeline.displayUs = (std::max)(shownUs, p.timeline.presentUs);
+                            frameStatsSeen = true;
+                        }
+                    } else if (frameStatsUsable && nowUs - p.timeline.presentUs < 250'000) {
+                        break;   // statistics briefly unavailable: wait a little
+                    }
+                    finishFrame(p.timeline);
+                    pendingDisplay.pop_front();
+                }
+            }
+
+            // ── Once per second: rates, benchmark row, latency for the Mac ──
+            if (nowUs - lastTickUs >= 1'000'000) {
+                lastTickUs = nowUs;
+                NetworkCounters net;
+                if (receiver) {
+                    auto ns = receiver->getStats();
+                    net.bytesReceived = ns.bytesReceived;
+                    net.packetsReceived = ns.packetsReceived;
+                    net.packetsLost = ns.packetsLost;
+                    net.framesExpected = ns.framesExpected;
+                    net.framesReceived = ns.framesReceived;
+                    net.jitterMs = ns.jitterMs;
+                }
+                uint64_t skippedNow;
+                {
+                    std::lock_guard<std::mutex> iq(gInputMutex);
+                    skippedNow = gInputDropped;
+                }
+                {
+                    std::lock_guard<std::mutex> nv(gNV12Mutex);
+                    skippedNow += gNV12Overwritten;
+                }
+                if (skippedNow > skippedReported) {
+                    metrics.onFramesSkipped(skippedNow - skippedReported);
+                    skippedReported = skippedNow;
+                }
+                metrics.tick(nowUs, net);
+
+                MetricsSnapshot snap = metrics.snapshot();
+                const StageSummary& total = snap.stages[static_cast<size_t>(Stage::Total)];
+                if (receiver) {
+                    receiver->setReportedLatencyUs(total.samples ? (uint32_t)(total.avgMs * 1000) : 0);
+                }
+                ClockSync::Estimate sync = receiver ? receiver->clockEstimate() : ClockSync::Estimate{};
+                SenderSample mac = receiver ? receiver->senderStats() : SenderSample{};
+                bench.recordSecond(nowUs, snap, systemMonitor.latest(), mac, sync);
+
+                // Console summary every 5 s (the overlay has the full breakdown)
+                if (nowUs - lastConsoleUs >= 5'000'000) {
+                    lastConsoleUs = nowUs;
+                    auto stageAvg = [&snap](Stage s) {
+                        const StageSummary& x = snap.stages[static_cast<size_t>(s)];
+                        return x.samples ? x.avgMs : -1.0;
+                    };
+                    printf("[Perf] shown %.1f FPS (recv %.1f, loop %.1f) | %.1f Mbps | RTT %.1f ms | "
+                           "jitter %.1f ms | drop %.2f%% | loss %.2f%%\n",
+                           snap.presentedFps, snap.receivedFps, snap.loopFps, snap.bitrateMbps,
+                           sync.valid ? sync.smoothedRttMs : -1.0, snap.jitterMs,
+                           snap.frameDropPercent, snap.packetLossPercent);
+                    printf("[Perf] latency ms: capture %.1f  encode %.1f  send %.1f  network %.1f  "
+                           "queue %.1f  decode %.1f  render %.1f  display %.1f  | total %.1f (p95 %.1f)\n",
+                           stageAvg(Stage::Capture), stageAvg(Stage::Encode), stageAvg(Stage::Send),
+                           stageAvg(Stage::Network), stageAvg(Stage::Queue), stageAvg(Stage::Decode),
+                           stageAvg(Stage::Render), stageAvg(Stage::Display),
+                           stageAvg(Stage::Total), total.samples ? total.p95Ms : -1.0);
+                    if (receiver) {
+                        auto ns = receiver->getStats();
                         size_t q;
                         { std::lock_guard<std::mutex> lk(gInputMutex); q = gInputQueue.size(); }
-                        printf("  Decoder: %llu frames | Latency: %.1f ms | Queue: %zu",
-                            ds.framesDecoded, ds.avgDecodeLatencyMs, q);
+                        printf("[Perf] frames recv %llu / expected %llu, packets lost %llu, "
+                               "keyframe req %llu, decode queue %zu\n",
+                               ns.framesReceived, ns.framesExpected, ns.packetsLost,
+                               ns.keyframeRequests, q);
                     }
                 }
-                printf("\n\n");
-                lastStatsPrint = now;
             }
+
+            // ── Overlay text, rebuilt 4× per second (DirectWrite layout is not free) ──
+            if (window.ShowStats() && nowUs - lastOverlayUs >= 250'000) {
+                lastOverlayUs = nowUs;
+                OverlayInputs in;
+                in.metrics = metrics.snapshot();
+                in.pc = systemMonitor.latest();
+                in.gpuName = renderer->GetAdapterName();
+                in.loopFrameMsAvg = stats.GetAvgFrameTimeMs();
+                in.loopFrameMsMax = stats.GetMaxFrameTimeMs();
+                in.benchmarking = bench.active();
+                if (receiver) {
+                    in.sync = receiver->clockEstimate();
+                    in.mac = receiver->senderStats();
+                    const wchar_t* state = L"?";
+                    switch (receiver->getState()) {
+                        case StreamReceiver::State::Disconnected: state = L"Disconnected"; break;
+                        case StreamReceiver::State::Connecting:   state = L"Connecting"; break;
+                        case StreamReceiver::State::Connected:    state = L"Connected"; break;
+                        case StreamReceiver::State::Streaming:    state = L"Streaming"; break;
+                        case StreamReceiver::State::Reconnecting: state = L"Reconnecting"; break;
+                        case StreamReceiver::State::Error:        state = L"Error"; break;
+                    }
+                    wchar_t line[128];
+                    swprintf(line, 128, L"%ls %ux%u -> window %dx%d", state, streamWidth, streamHeight,
+                             window.GetWidth(), window.GetHeight());
+                    in.connection = line;
+                } else {
+                    in.connection = L"Test pattern (no Mac connection)";
+                }
+                overlayText = FormatDiagnostics(in);
+            }
+
+            if (bench.due(nowUs)) {
+                printf("\n%s\n[Bench] Files: %s-frames.csv, %s-seconds.csv, %s-summary.txt\n",
+                       bench.finish(nowUs).c_str(), bench.basePath().c_str(),
+                       bench.basePath().c_str(), bench.basePath().c_str());
+                if (!frameStatsSeen) {
+                    printf("[Bench] Note: no DXGI scan-out times — Total is measured to Present()\n");
+                }
+                break;   // benchmark complete: exit
+            }
+        }
+
+        if (bench.active()) {   // ESC before the benchmark finished: keep what we have
+            int64_t endUs = PipelineClock::NowUs();
+            printf("\n[Bench] Stopped early\n%s\n", bench.finish(endUs).c_str());
         }
 
         if (clipboardSync) clipboardSync->stop();
         if (receiver) receiver->disconnect();
         if (decoder) decoder->shutdown();
-        wprintf(L"\nFinal: %s\n", stats.FormatStats().c_str());
+        wprintf(L"\nRender loop: %ls\n", stats.FormatStats().c_str());
         if (networkMode) CoUninitialize();
 
     } catch (const std::exception& e) {

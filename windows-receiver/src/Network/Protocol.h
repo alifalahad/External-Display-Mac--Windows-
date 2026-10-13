@@ -40,6 +40,7 @@ enum class MessageType : uint8_t {
     Pong          = 0x21,
     KeyframeReq   = 0x30,
     QualityReport = 0x50,
+    SenderStats   = 0x51,   // Mac → Win: sender performance, once per second
     InputEvent    = 0x60,
     ClipboardData = 0x70,
     PairChallenge = 0x80,
@@ -58,6 +59,7 @@ enum class MessageType : uint8_t {
 enum MessageFlags : uint16_t {
     FLAG_NONE     = 0,
     FLAG_KEYFRAME = 1 << 0,
+    FLAG_TIMING   = 1 << 1,   // video: reassembled frame starts with FrameTimingPrefix
 };
 
 // ── Protocol Header (28 bytes) ─────────────────────────────────────────────
@@ -107,11 +109,41 @@ struct StartStreamPayload {
 
 struct QualityReportPayload {
     uint32_t packetLossPercent = 0;  // Loss × 100 (e.g. 350 = 3.50%)
-    uint32_t rttMs = 0;              // Round-trip time in milliseconds
+    uint32_t rttMs = 0;              // Round-trip time in milliseconds (PING/PONG)
     uint32_t framesDropped = 0;      // Frames dropped since last report
     uint32_t queueDepth = 0;         // Current decode queue depth
+    uint32_t latencyUs = 0;          // Avg capture→display latency (0 = unknown)
+};
+static_assert(sizeof(QualityReportPayload) == 20, "QualityReportPayload must be 20 bytes");
+
+// ── Performance payloads (Phase 16) ─────────────────────────────────────────
+
+/// Mac-side timestamps of one frame (Mac HostClock µs). Prefixes the frame
+/// data of every packet flagged FLAG_TIMING; stripped before decoding.
+struct FrameTimingPrefix {
+    uint32_t frameSequence = 0;
+    uint32_t flags = 0;              // TIMING_CAPTURE_VALID
+    uint64_t captureUs = 0;          // frame was on screen (SCK displayTime)
+    uint64_t encodeStartUs = 0;
+    uint64_t encodeEndUs = 0;
+    uint64_t sendUs = 0;             // packetization started
+};
+static_assert(sizeof(FrameTimingPrefix) == 40, "FrameTimingPrefix must be 40 bytes");
+constexpr uint32_t TIMING_CAPTURE_VALID = 1 << 0;
+
+/// SENDER_STATS payload (Mac → Windows, 32 bytes)
+struct SenderStatsPayload {
+    uint32_t captureFps100 = 0;      // × 100
+    uint32_t encodeFps100 = 0;       // × 100
+    uint32_t cpuPercent100 = 0;      // Mac process, % of all cores × 100
+    uint32_t memoryMB = 0;
+    uint32_t encoderKbps = 0;        // measured encoder output, last second
+    uint32_t targetKbps = 0;
+    uint32_t flags = 0;              // SENDER_HW_ENCODER
     uint32_t reserved = 0;
 };
+static_assert(sizeof(SenderStatsPayload) == 32, "SenderStatsPayload must be 32 bytes");
+constexpr uint32_t SENDER_HW_ENCODER = 1 << 0;
 
 // ── INPUT_EVENT payload (24 bytes, Windows → Mac) ─────────────────────────────
 

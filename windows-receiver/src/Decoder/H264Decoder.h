@@ -30,15 +30,18 @@ public:
     /// yData  = pointer to Y plane (luma, full resolution)
     /// uvData = pointer to UV plane (chroma, half width/height, interleaved U0V0U1V1...)
     /// stride = bytes per row for both Y and UV planes
+    /// sampleTime = the value passed to decode() for this picture (-1 if unknown)
     using RawNV12Callback = std::function<void(
         const uint8_t* yData, const uint8_t* uvData,
-        int stride, uint32_t width, uint32_t height)>;
+        int stride, uint32_t width, uint32_t height, int64_t sampleTime)>;
 
     H264Decoder();
     ~H264Decoder();
 
     bool initialize(uint32_t width, uint32_t height);
-    bool decode(const uint8_t* h264Data, size_t dataLen);
+    /// sampleTime (100 ns units) travels with the picture to the callback, so
+    /// the caller can match output pictures to their input frames
+    bool decode(const uint8_t* h264Data, size_t dataLen, int64_t sampleTime);
     void setRawNV12Callback(RawNV12Callback cb) { m_rawCallback = std::move(cb); }
     void flush();
     void shutdown();

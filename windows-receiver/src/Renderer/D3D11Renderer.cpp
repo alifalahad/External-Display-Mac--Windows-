@@ -4,7 +4,7 @@
 
 #include "Renderer/D3D11Renderer.h"
 #include "Renderer/TestPatternShader.h"
-#include "Performance/FrameStats.h"
+#include "Performance/PipelineClock.h"
 
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -365,7 +365,7 @@ void D3D11Renderer::Resize(int width, int height) {
 // Render
 // =============================================================================
 
-void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats) {
+void D3D11Renderer::Render(float time, float frameCount, const std::wstring* overlayText) {
     if (deviceLost_ || !rtv_) return;  // owner recreates the renderer
 
     // ── 1. Update constant buffer ───────────────────────────────────────────
@@ -434,8 +434,8 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
         context_->Draw(3, 0);
     }
 
-    // ── 4. D2D stats overlay ────────────────────────────────────────────────
-    if (stats && d2dContext_) {
+    // ── 4. D2D diagnostics overlay ──────────────────────────────────────────
+    if (overlayText && !overlayText->empty() && d2dContext_) {
         // Get current back buffer as DXGI surface for D2D target
         ComPtr<IDXGISurface> surface;
         hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&surface));
@@ -454,7 +454,22 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
                 surface.Get(), &bitmapProps, &d2dTarget
             );
 
+            // Lay the text out first so the panel fits it exactly
+            const float margin = 12.0f, padding = 10.0f, titleHeight = 24.0f;
+            ComPtr<IDWriteTextLayout> layout;
             if (SUCCEEDED(hr)) {
+                hr = dwriteFactory_->CreateTextLayout(
+                    overlayText->c_str(), static_cast<UINT32>(overlayText->size()),
+                    statsTextFormat_.Get(), static_cast<float>(width_), static_cast<float>(height_),
+                    &layout);
+            }
+
+            if (SUCCEEDED(hr)) {
+                DWRITE_TEXT_METRICS metrics{};
+                layout->GetMetrics(&metrics);
+                float panelWidth  = (std::max)(metrics.widthIncludingTrailingWhitespace, 400.0f) + 2 * padding;
+                float panelHeight = metrics.height + titleHeight + 2 * padding;
+
                 d2dContext_->SetTarget(d2dTarget.Get());
                 d2dContext_->BeginDraw();
 
@@ -464,86 +479,33 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
                     D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), &textBrush
                 );
                 d2dContext_->CreateSolidColorBrush(
-                    D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.65f), &bgBrush
+                    D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.70f), &bgBrush
                 );
                 d2dContext_->CreateSolidColorBrush(
                     D2D1::ColorF(0.2f, 0.7f, 1.0f, 0.95f), &accentBrush
                 );
 
-                // Stats panel dimensions
-                float panelWidth  = 340.0f;
-                float panelHeight = 150.0f;
-                float margin      = 12.0f;
-                float panelX      = margin;
-                float panelY      = margin;
-
-                // Draw background rectangle
                 D2D1_ROUNDED_RECT panelRect = D2D1::RoundedRect(
-                    D2D1::RectF(panelX, panelY,
-                                panelX + panelWidth, panelY + panelHeight),
+                    D2D1::RectF(margin, margin, margin + panelWidth, margin + panelHeight),
                     6.0f, 6.0f
                 );
                 d2dContext_->FillRoundedRectangle(panelRect, bgBrush.Get());
 
-                // Draw title
-                D2D1_RECT_F titleRect = D2D1::RectF(
-                    panelX + 10, panelY + 6,
-                    panelX + panelWidth - 10, panelY + 28
-                );
+                const wchar_t* title = L"Diagnostics   F2 hide · F11 fullscreen · Esc quit";
                 d2dContext_->DrawText(
-                    L"External Display Receiver", 25,
-                    titleTextFormat_.Get(), titleRect, accentBrush.Get()
+                    title, static_cast<UINT32>(wcslen(title)), titleTextFormat_.Get(),
+                    D2D1::RectF(margin + padding, margin + 6, margin + panelWidth - padding,
+                                margin + titleHeight + 4),
+                    accentBrush.Get()
                 );
-
-                // Draw separator line
                 d2dContext_->DrawLine(
-                    D2D1::Point2F(panelX + 10, panelY + 30),
-                    D2D1::Point2F(panelX + panelWidth - 10, panelY + 30),
+                    D2D1::Point2F(margin + padding, margin + titleHeight + 6),
+                    D2D1::Point2F(margin + panelWidth - padding, margin + titleHeight + 6),
                     accentBrush.Get(), 0.5f
                 );
-
-                // Format stats text
-                wchar_t statsText[512];
-                float dropPct = (stats->GetTotalFrames() > 0)
-                    ? (static_cast<float>(stats->GetDroppedFrames())
-                       / static_cast<float>(stats->GetTotalFrames()) * 100.0f)
-                    : 0.0f;
-
-                swprintf_s(statsText, sizeof(statsText) / sizeof(statsText[0]),
-                    L"FPS:         %.1f\n"
-                    L"Frame Time:  %.2f ms (avg)\n"
-                    L"             %.2f ms (min)  %.2f ms (max)\n"
-                    L"Dropped:     %llu / %llu (%.2f%%)\n"
-                    L"Resolution:  %d x %d\n"
-                    L"GPU:         %s",
-                    stats->GetFPS(),
-                    stats->GetAvgFrameTimeMs(),
-                    stats->GetMinFrameTimeMs(), stats->GetMaxFrameTimeMs(),
-                    stats->GetDroppedFrames(), stats->GetTotalFrames(), dropPct,
-                    width_, height_,
-                    adapterName_.c_str()
-                );
-
-                D2D1_RECT_F statsRect = D2D1::RectF(
-                    panelX + 10, panelY + 34,
-                    panelX + panelWidth - 10, panelY + panelHeight - 6
-                );
-                d2dContext_->DrawText(
-                    statsText, static_cast<UINT32>(wcslen(statsText)),
-                    statsTextFormat_.Get(), statsRect, textBrush.Get()
-                );
-
-                // Draw key hints at bottom-right
-                const wchar_t* hints = L"F11: Toggle Fullscreen  |  ESC: Exit";
-                D2D1_RECT_F hintsRect = D2D1::RectF(
-                    static_cast<float>(width_) - 320.0f,
-                    static_cast<float>(height_) - 28.0f,
-                    static_cast<float>(width_) - 10.0f,
-                    static_cast<float>(height_) - 6.0f
-                );
-                d2dContext_->DrawText(
-                    hints, static_cast<UINT32>(wcslen(hints)),
-                    statsTextFormat_.Get(), hintsRect, textBrush.Get()
+                d2dContext_->DrawTextLayout(
+                    D2D1::Point2F(margin + padding, margin + titleHeight + padding),
+                    layout.Get(), textBrush.Get()
                 );
 
                 d2dContext_->EndDraw();
@@ -555,6 +517,31 @@ void D3D11Renderer::Render(float time, float frameCount, const FrameStats* stats
     // ── 5. Present (VSync) ──────────────────────────────────────────────────
     hr = swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
     CheckDeviceLost(hr, "Present");
+}
+
+// =============================================================================
+// Frame statistics (Phase 16)
+// =============================================================================
+
+bool D3D11Renderer::GetLastPresentCount(uint32_t& presentCount) const {
+    if (!swapChain_ || deviceLost_) return false;
+    UINT count = 0;
+    if (FAILED(swapChain_->GetLastPresentCount(&count))) return false;
+    presentCount = count;
+    return true;
+}
+
+bool D3D11Renderer::GetLastDisplayedPresent(uint32_t& presentCount, int64_t& displayUs) const {
+    if (!swapChain_ || deviceLost_) return false;
+    // Flip-model swap chains report statistics in windowed mode too. Fails with
+    // DXGI_ERROR_FRAME_STATISTICS_DISJOINT around mode changes — just skip.
+    DXGI_FRAME_STATISTICS stats{};
+    if (FAILED(swapChain_->GetFrameStatistics(&stats)) || stats.SyncQPCTime.QuadPart == 0) {
+        return false;
+    }
+    presentCount = stats.PresentCount;
+    displayUs = PipelineClock::QpcToUs(stats.SyncQPCTime.QuadPart);
+    return true;
 }
 
 // =============================================================================

@@ -134,7 +134,7 @@ void H264Decoder::updateFrameSizeFrom(IMFMediaType* outputType) {
     }
 }
 
-bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
+bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen, int64_t sampleTime) {
     if (!m_initialized || !m_decoder) return false;
     auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -151,6 +151,8 @@ bool H264Decoder::decode(const uint8_t* h264Data, size_t dataLen) {
 
     MFCreateSample(&sample);
     sample->AddBuffer(buffer);
+    sample->SetSampleTime(sampleTime);
+    sample->SetSampleDuration(166667);   // 1/60 s; informational only
 
     hr = m_decoder->ProcessInput(0, sample, 0);
     sample->Release();
@@ -290,7 +292,9 @@ bool H264Decoder::processOutput() {
                     logged = true;
                 }
 
-                m_rawCallback(yData, uvData, stride, m_width, m_height);
+                LONGLONG sampleTime = -1;
+                if (FAILED(resultSample->GetSampleTime(&sampleTime))) sampleTime = -1;
+                m_rawCallback(yData, uvData, stride, m_width, m_height, sampleTime);
             } else {
                 printf("[Decoder] ERROR: UV plane out of bounds! "
                        "bufLen=%u, stride=%d, alignedH=%u, uvEnd=%zu\n",

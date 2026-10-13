@@ -16,6 +16,9 @@ add_executable(${PROJECT_NAME} WIN32
     src/App/CrashHandler.cpp
     src/Renderer/D3D11Renderer.cpp
     src/Performance/FrameStats.cpp
+    src/Performance/ClockSync.cpp
+    src/Performance/PipelineMetrics.cpp
+    src/Performance/SystemMonitor.cpp
     src/Network/StreamReceiver.cpp
     src/Decoder/H264Decoder.cpp
     src/Input/InputCapture.cpp
@@ -42,6 +45,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ole32
     bcrypt
     dbghelp
+    pdh
+    psapi
     user32
     gdi32
 )
@@ -60,4 +65,20 @@ if(MSVC)
     # Release builds also get a .pdb so crash reports show function names + lines
     target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:/Zi>)
     target_link_options(${PROJECT_NAME} PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
+endif()
+
+# Unit tests for the portable performance code (Phase 16):
+#   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build --config Release
+#   .\build\Release\PipelineMetricsTests.exe   (or .\build\PipelineMetricsTests.exe)
+option(EXDP_BUILD_TESTS "Build unit tests" OFF)
+if(EXDP_BUILD_TESTS)
+    add_executable(PipelineMetricsTests
+        tests/PipelineMetricsTests.cpp
+        src/Performance/ClockSync.cpp
+        src/Performance/PipelineMetrics.cpp
+    )
+    target_include_directories(PipelineMetricsTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(PipelineMetricsTests PRIVATE /W4 /permissive-)
+    endif()
 endif()

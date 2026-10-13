@@ -4,7 +4,8 @@
 // =============================================================================
 // Manages the D3D11 device, swap chain, shaders, and rendering.
 // Renders an animated test pattern via GPU shader.
-// Includes D2D1/DirectWrite overlay for on-screen statistics.
+// Includes D2D1/DirectWrite overlay for on-screen diagnostics, and exposes DXGI
+// frame statistics (when the frame actually reached the screen).
 // =============================================================================
 
 #include <d3d11.h>
@@ -12,9 +13,8 @@
 #include <dwrite.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
+#include <cstdint>
 #include <string>
-
-class FrameStats;
 
 /// Which GPU renders on hybrid (Intel + NVIDIA/AMD) laptops.
 /// Default = the adapter Windows picks (normally the one wired to the panel).
@@ -26,8 +26,16 @@ public:
                   GpuPreference gpuPreference = GpuPreference::Default);
     ~D3D11Renderer() = default; // ComPtr handles cleanup
 
-    // Render one frame: test pattern + optional stats overlay
-    void Render(float time, float frameCount, const FrameStats* stats = nullptr);
+    // Render one frame: video (or test pattern) + optional diagnostics text.
+    // Presents with VSync.
+    void Render(float time, float frameCount, const std::wstring* overlayText = nullptr);
+
+    // Present count of the most recent Present() (DXGI numbering)
+    bool GetLastPresentCount(uint32_t& presentCount) const;
+
+    // Most recent present the display has shown, and when (vblank, QPC µs).
+    // False when the driver/compositor does not provide frame statistics.
+    bool GetLastDisplayedPresent(uint32_t& presentCount, int64_t& displayUs) const;
 
     // Handle window resize
     void Resize(int width, int height);

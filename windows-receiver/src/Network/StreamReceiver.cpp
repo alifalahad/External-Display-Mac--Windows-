@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "StreamReceiver.h"
+#include "../Performance/PipelineClock.h"
 #include <iostream>
 #include <chrono>
 #include <algorithm>
@@ -123,6 +124,7 @@ void StreamReceiver::runConnectionLoop(std::string host) {
         m_failedConnects = 0;
         std::cout << "[Net] TCP connected" << std::endl;
         m_connectionId.fetch_add(1);
+        m_clockSync.reset();   // the Mac's clock may differ after a reconnect (sleep, restart)
         m_pinWantedFor.store(0);
         m_lastRxTime = Clock::now();
 
@@ -178,6 +180,12 @@ void StreamReceiver::runConnectionLoop(std::string host) {
                 case exdp::MessageType::Ping:
                     // Heartbeat — the Mac drops us after 15 s without a PONG
                     tcpSendMessage(exdp::MessageType::Pong, nullptr, 0);
+                    break;
+                case exdp::MessageType::Pong:
+                    handlePong(header, payload);
+                    break;
+                case exdp::MessageType::SenderStats:
+                    handleSenderStats(payload);
                     break;
                 case exdp::MessageType::Disconnect:
                     std::cout << "[Net] Disconnect received" << std::endl;
@@ -306,11 +314,12 @@ void StreamReceiver::closeUdpSocket() {
     }
 }
 
-void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen) {
+void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen,
+                                    uint64_t timestamp) {
     // Serialize whole messages so concurrent senders can't interleave bytes
     std::lock_guard<std::mutex> lock(m_sendMutex);
     if (m_tcpSocket == INVALID_SOCKET) return;
-    auto msg = exdp::buildMessage(type, 0, m_sequence++, 0, payload, payloadLen);
+    auto msg = exdp::buildMessage(type, 0, m_sequence++, timestamp, payload, payloadLen);
     send(m_tcpSocket, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
@@ -407,7 +416,10 @@ void StreamReceiver::udpReceiveLoop() {
         SOCKET s = m_udpSocket;
 
         m_haveUdpSequence = false;
+        m_haveFrameSeq = false;
+        m_jitter.reset();
         m_lastQualityReport = Clock::now();
+        m_nextPing = Clock::now();
         {
             std::lock_guard<std::mutex> lock(m_statsMutex);
             m_prevFramesReceived = m_stats.framesReceived;
@@ -421,6 +433,7 @@ void StreamReceiver::udpReceiveLoop() {
             int fromLen = sizeof(from);
             int n = recvfrom(s, (char*)buffer.data(), (int)buffer.size(), 0,
                              (sockaddr*)&from, &fromLen);
+            const int64_t rxUs = PipelineClock::NowUs();
 
             if (n == SOCKET_ERROR) {
                 int err = WSAGetLastError();
@@ -440,20 +453,30 @@ void StreamReceiver::udpReceiveLoop() {
                     size_t payloadLen = (size_t)n - exdp::HEADER_SIZE;
 
                     if (type == exdp::MessageType::VideoFrame) {
-                        handleVideoFrame(header, payload, payloadLen);
+                        handleVideoFrame(header, payload, payloadLen, rxUs);
                     } else if (type == exdp::MessageType::VideoFragment) {
-                        handleVideoFragment(header, payload, payloadLen);
+                        handleVideoFragment(header, payload, payloadLen, rxUs);
                     }
                 }
             }
 
-            // Periodic quality report (also while the screen is static)
+            // Periodic quality report and clock sync (also while the screen is static)
             if (m_state.load() == State::Streaming) {
                 auto now = Clock::now();
                 float elapsed = std::chrono::duration<float>(now - m_lastQualityReport).count();
                 if (elapsed >= QUALITY_REPORT_INTERVAL) {
                     sendQualityReport();
                     m_lastQualityReport = now;
+                }
+                if (m_pingBurst.exchange(false)) {
+                    m_fastPingsLeft = CLOCK_PING_BURST;
+                    m_nextPing = now;
+                }
+                if (now >= m_nextPing) {
+                    sendClockPing();
+                    int intervalMs = m_fastPingsLeft > 0 ? CLOCK_PING_BURST_MS : CLOCK_PING_INTERVAL_MS;
+                    if (m_fastPingsLeft > 0) m_fastPingsLeft--;
+                    m_nextPing = now + std::chrono::milliseconds(intervalMs);
                 }
             }
         }
@@ -522,6 +545,8 @@ void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
               << std::endl;
 
     m_udpSequenceReset.store(true);
+    m_frameSeqReset.store(true);     // the Mac restarts its frame numbering
+    m_pingBurst.store(true);         // a few quick pings so latency is known within ~1 s
     m_reconnectAttempts = 0;  // fully recovered — reset backoff
     m_state.store(State::Streaming);
 
@@ -538,15 +563,16 @@ void StreamReceiver::handleStopStream() {
 // ── Video Frame Handlers ────────────────────────────────────────────────────
 
 void StreamReceiver::handleVideoFrame(const exdp::ProtocolHeader& header,
-                                       const uint8_t* data, size_t dataLen) {
+                                       const uint8_t* data, size_t dataLen, int64_t rxUs) {
     // Complete frame in a single packet
     bool isKeyframe = (header.flags & exdp::FLAG_KEYFRAME) != 0;
+    bool hasTiming = (header.flags & exdp::FLAG_TIMING) != 0;
     std::vector<uint8_t> frameData(data, data + dataLen);
-    deliverFrame(frameData, isKeyframe);
+    deliverFrame(frameData, isKeyframe, hasTiming, rxUs, rxUs);
 }
 
 void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
-                                          const uint8_t* data, size_t dataLen) {
+                                          const uint8_t* data, size_t dataLen, int64_t rxUs) {
     if (dataLen < sizeof(exdp::FragmentHeader)) return;
 
     exdp::FragmentHeader fragHeader;
@@ -565,6 +591,8 @@ void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
     std::vector<uint8_t> fullFrame;
     bool complete = false;
     bool keyframe = false;
+    bool hasTiming = false;
+    int64_t firstPacketUs = rxUs;
     {
         std::lock_guard<std::mutex> lock(m_fragmentMutex);
 
@@ -572,6 +600,8 @@ void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
         if (frame.totalFragments == 0) {
             frame.totalFragments = fragHeader.fragmentTotal;
             frame.isKeyframe = isKeyframe;
+            frame.hasTiming = (header.flags & exdp::FLAG_TIMING) != 0;
+            frame.firstPacketUs = rxUs;
         } else if (frame.totalFragments != fragHeader.fragmentTotal) {
             return;  // inconsistent with earlier fragments
         }
@@ -596,6 +626,8 @@ void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
                 fullFrame.insert(fullFrame.end(), bytes.begin(), bytes.end());
             }
             keyframe = frame.isKeyframe;
+            hasTiming = frame.hasTiming;
+            firstPacketUs = frame.firstPacketUs;
             complete = true;
             m_pendingFrames.erase(fragHeader.frameSequence);
         }
@@ -604,17 +636,66 @@ void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
     }
 
     // Deliver outside the fragment lock
-    if (complete) deliverFrame(fullFrame, keyframe);
+    if (complete) deliverFrame(fullFrame, keyframe, hasTiming, firstPacketUs, rxUs);
 }
 
-void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe) {
+void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe,
+                                  bool hasTiming, int64_t firstPacketUs, int64_t completeUs) {
+    FrameTimeline timeline;
+    timeline.keyframe = isKeyframe;
+    timeline.firstPacketUs = firstPacketUs;
+    timeline.completeUs = completeUs;
+
+    const uint8_t* bitstream = frameData.data();
+    size_t bitstreamLen = frameData.size();
+    uint64_t newlyExpected = 1;   // without frame numbers every frame counts once
+
+    if (hasTiming) {
+        // Phase 16: Mac timestamps precede the H.264 data
+        if (bitstreamLen <= sizeof(exdp::FrameTimingPrefix)) return;  // malformed
+        exdp::FrameTimingPrefix prefix;
+        memcpy(&prefix, bitstream, sizeof(prefix));
+        bitstream += sizeof(prefix);
+        bitstreamLen -= sizeof(prefix);
+
+        timeline.hasSenderTiming = true;
+        timeline.captureTimeValid = (prefix.flags & exdp::TIMING_CAPTURE_VALID) != 0;
+        timeline.frameSequence = prefix.frameSequence;
+        timeline.captureUs = prefix.captureUs;
+        timeline.encodeStartUs = prefix.encodeStartUs;
+        timeline.encodeEndUs = prefix.encodeEndUs;
+        timeline.sendUs = prefix.sendUs;
+
+        // Frames lost completely (every fragment) show up as gaps in the numbering
+        if (m_frameSeqReset.exchange(false)) m_haveFrameSeq = false;
+        if (m_haveFrameSeq) {
+            int32_t gap = (int32_t)(prefix.frameSequence - m_lastFrameSeq);
+            if (gap > 0 && gap < 10000) {
+                newlyExpected = (uint64_t)gap;
+                m_lastFrameSeq = prefix.frameSequence;
+            } else if (gap <= 0 && gap > -10000) {
+                newlyExpected = 0;   // late or duplicate frame: already counted
+            } else {
+                m_lastFrameSeq = prefix.frameSequence;   // numbering restarted
+            }
+        } else {
+            m_haveFrameSeq = true;
+            m_lastFrameSeq = prefix.frameSequence;
+        }
+
+        if (timeline.captureTimeValid) m_jitter.addFrame(prefix.captureUs, completeUs);
+    }
+    timeline.bytes = (uint32_t)bitstreamLen;
+
     {
         std::lock_guard<std::mutex> lock(m_statsMutex);
         m_stats.framesReceived++;
+        m_stats.framesExpected += newlyExpected;
+        m_stats.jitterMs = m_jitter.jitterMs();
     }
 
     if (m_frameCallback) {
-        m_frameCallback(frameData.data(), frameData.size(), isKeyframe);
+        m_frameCallback(bitstream, bitstreamLen, timeline);
     }
 }
 
@@ -659,11 +740,14 @@ void StreamReceiver::sendQualityReport() {
         queueDepth = (uint32_t)m_pendingFrames.size();
     }
 
+    ClockSync::Estimate sync = m_clockSync.estimate();
+
     exdp::QualityReportPayload report;
     report.packetLossPercent = lossPercent100;
-    report.rttMs = 0;  // TODO: measure from Ping/Pong
+    report.rttMs = sync.valid ? (uint32_t)(sync.smoothedRttMs + 0.5) : 0;
     report.framesDropped = (uint32_t)newDropped;
     report.queueDepth = queueDepth;
+    report.latencyUs = m_reportedLatencyUs.load();
 
     tcpSendMessage(exdp::MessageType::QualityReport, &report, sizeof(report));
 
@@ -671,6 +755,50 @@ void StreamReceiver::sendQualityReport() {
     m_prevFramesDropped = currentStats.framesDropped;
     m_prevPacketsReceived = currentStats.packetsReceived;
     m_prevPacketsLost = currentStats.packetsLost;
+}
+
+// ── Clock Sync & Sender Stats (Phase 16) ────────────────────────────────────
+
+void StreamReceiver::sendClockPing() {
+    // Our clock goes in the header; the Mac's PONG echoes it back with its own
+    tcpSendMessage(exdp::MessageType::Ping, nullptr, 0, (uint64_t)PipelineClock::NowUs());
+}
+
+void StreamReceiver::handlePong(const exdp::ProtocolHeader& header, const std::vector<uint8_t>& payload) {
+    const int64_t recvUs = PipelineClock::NowUs();
+    if (payload.size() < sizeof(uint64_t)) return;   // old Mac build: no echo, no sync
+    uint64_t sentUs = 0;
+    memcpy(&sentUs, payload.data(), sizeof(sentUs));
+    if (sentUs == 0) return;
+    m_clockSync.addSample((int64_t)sentUs, header.timestamp, recvUs);
+}
+
+void StreamReceiver::handleSenderStats(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::SenderStatsPayload)) return;
+    exdp::SenderStatsPayload p;
+    memcpy(&p, payload.data(), sizeof(p));
+
+    SenderSample s;
+    s.valid = true;
+    s.captureFps = p.captureFps100 / 100.0;
+    s.encodeFps = p.encodeFps100 / 100.0;
+    s.cpuPercent = p.cpuPercent100 / 100.0;
+    s.memoryMB = p.memoryMB;
+    s.encoderMbps = p.encoderKbps / 1000.0;
+    s.targetMbps = p.targetKbps / 1000.0;
+    s.hardwareEncoder = (p.flags & exdp::SENDER_HW_ENCODER) != 0;
+
+    std::lock_guard<std::mutex> lock(m_senderMutex);
+    m_senderSample = s;
+    m_senderSampleTime = Clock::now();
+}
+
+SenderSample StreamReceiver::senderStats() const {
+    std::lock_guard<std::mutex> lock(m_senderMutex);
+    if (!m_senderSample.valid || Clock::now() - m_senderSampleTime > std::chrono::seconds(3)) {
+        return SenderSample{};
+    }
+    return m_senderSample;
 }
 
 // ── Pairing Handlers ───────────────────────────────────────────────────────────
