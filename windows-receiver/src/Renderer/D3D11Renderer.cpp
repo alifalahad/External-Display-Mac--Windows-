@@ -7,7 +7,9 @@
 #include "Performance/PipelineClock.h"
 
 #include <d3dcompiler.h>
+#include <d3d10.h>     // ID3D10Multithread (required by Media Foundation on a shared device)
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <dxgi1_6.h>
 #include <stdexcept>
 #include <string>
@@ -41,6 +43,10 @@ D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height, GpuPreference gpu
     CreateConstantBuffer();
     CreateD2DResources();
     CreateNV12Resources();
+}
+
+D3D11Renderer::~D3D11Renderer() {
+    if (frameLatencyWaitable_) CloseHandle(frameLatencyWaitable_);
 }
 
 // =============================================================================
@@ -94,8 +100,9 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         }
     }
 
-    // 1. Create D3D11 device with BGRA support (needed for D2D interop)
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    // 1. Create D3D11 device with BGRA support (needed for D2D interop) and
+    //    video support (the hardware H.264 decoder shares this device)
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
@@ -106,20 +113,42 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         D3D_FEATURE_LEVEL_10_1,
     };
 
-    D3D_FEATURE_LEVEL featureLevel;
-    HRESULT hr = D3D11CreateDevice(
-        chosenAdapter.Get(),        // nullptr = default adapter
-        chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,                    // no software rasterizer
-        flags,
-        featureLevels,
-        _countof(featureLevels),
-        D3D11_SDK_VERSION,
-        &device_,
-        &featureLevel,
-        &context_
-    );
+    auto createDevice = [&](UINT createFlags) {
+        D3D_FEATURE_LEVEL featureLevel;
+        return D3D11CreateDevice(
+            chosenAdapter.Get(),        // nullptr = default adapter
+            chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,                    // no software rasterizer
+            createFlags,
+            featureLevels,
+            _countof(featureLevels),
+            D3D11_SDK_VERSION,
+            &device_,
+            &featureLevel,
+            &context_
+        );
+    };
+    HRESULT hr = createDevice(flags);
+    bool videoDevice = SUCCEEDED(hr);
+    if (!videoDevice) {
+        printf("[Renderer] No video support on this adapter (0x%08lX) — software decoding\n",
+               (unsigned long)hr);
+        hr = createDevice(flags & ~D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
+    }
     ThrowIfFailed(hr, "D3D11CreateDevice");
+
+    // Hardware decode writes NV12 textures that we sample as R8 (Y) + R8G8 (UV)
+    UINT nv12Support = 0;
+    bool nv12Sampling = SUCCEEDED(device_->CheckFormatSupport(DXGI_FORMAT_NV12, &nv12Support)) &&
+                        (nv12Support & D3D11_FORMAT_SUPPORT_TEXTURE2D) &&
+                        (nv12Support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE);
+    ComPtr<ID3D10Multithread> multithread;
+    if (videoDevice && nv12Sampling && SUCCEEDED(device_.As(&multithread))) {
+        multithread->SetMultithreadProtected(TRUE);   // MF may touch the device internally
+        supportsHardwareVideo_ = true;
+    } else if (videoDevice) {
+        printf("[Renderer] GPU cannot sample NV12 textures — software decoding\n");
+    }
 
     // 2. Get DXGI factory from the device
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -149,11 +178,36 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
     scd.BufferCount = 2;
     scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
+    // Phase 17: a waitable swap chain lets us render only when a frame can go
+    // straight to the screen (Windows 8.1+; retried without on older systems)
+    scd.Flags       = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     hr = factory->CreateSwapChainForHwnd(
         device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_
     );
+    if (FAILED(hr)) {
+        scd.Flags = 0;
+        hr = factory->CreateSwapChainForHwnd(
+            device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_
+        );
+    }
     ThrowIfFailed(hr, "CreateSwapChainForHwnd");
+    swapChainFlags_ = scd.Flags;
+
+    // By default DXGI queues up to 3 frames: measured as ~3 refreshes (45-50 ms)
+    // between Present() and scan-out. One frame in flight is enough.
+    ComPtr<IDXGISwapChain2> swapChain2;
+    if ((swapChainFlags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) &&
+        SUCCEEDED(swapChain_.As(&swapChain2)) &&
+        SUCCEEDED(swapChain2->SetMaximumFrameLatency(1))) {
+        frameLatencyWaitable_ = swapChain2->GetFrameLatencyWaitableObject();
+    } else {
+        ComPtr<IDXGIDevice1> dxgiDevice1;
+        if (SUCCEEDED(device_.As(&dxgiDevice1))) dxgiDevice1->SetMaximumFrameLatency(1);
+    }
+    printf("[Renderer] Frame latency: 1 frame (%s), hardware video: %s\n",
+           frameLatencyWaitable_ ? "waitable swap chain" : "device limit",
+           supportsHardwareVideo_ ? "yes" : "no");
 
     // Disable Alt+Enter fullscreen toggle (we handle it ourselves)
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
@@ -343,7 +397,7 @@ void D3D11Renderer::Resize(int width, int height) {
     // device as lost and let the owner rebuild the renderer.
     HRESULT hr = swapChain_->ResizeBuffers(
         0, static_cast<UINT>(width), static_cast<UINT>(height),
-        DXGI_FORMAT_UNKNOWN, 0
+        DXGI_FORMAT_UNKNOWN, swapChainFlags_   // flags must match creation
     );
     if (FAILED(hr)) {
         printf("[Renderer] ResizeBuffers failed (0x%08lX) — recreating renderer\n",
@@ -393,7 +447,7 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->IASetInputLayout(nullptr);
-    if (hasVideoFrame_ && ySRV_ && uvSRV_) {
+    if (hasVideoFrame_ && frameYSRV_ && frameUVSRV_) {
         // Calculate letterboxed viewport to maintain video aspect ratio
         float videoAspect  = (float)nv12Width_ / (float)nv12Height_;
         float windowAspect = (float)width_ / (float)height_;
@@ -414,7 +468,8 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
         // Render NV12 video frame via GPU YUV→RGB shader
         context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
         context_->PSSetShader(nv12PixelShader_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { ySRV_.Get(), uvSRV_.Get() };
+        context_->PSSetConstantBuffers(1, 1, videoConstants_.GetAddressOf());
+        ID3D11ShaderResourceView* srvs[2] = { frameYSRV_.Get(), frameUVSRV_.Get() };
         context_->PSSetShaderResources(0, 2, srvs);
         context_->PSSetSamplers(0, 1, videoSampler_.GetAddressOf());
         context_->Draw(3, 0);
@@ -523,6 +578,11 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
 // Frame statistics (Phase 16)
 // =============================================================================
 
+bool D3D11Renderer::WaitForFrameSlot(DWORD timeoutMs) {
+    if (!frameLatencyWaitable_ || deviceLost_) return true;
+    return WaitForSingleObjectEx(frameLatencyWaitable_, timeoutMs, TRUE) == WAIT_OBJECT_0;
+}
+
 bool D3D11Renderer::GetLastPresentCount(uint32_t& presentCount) const {
     if (!swapChain_ || deviceLost_) return false;
     UINT count = 0;
@@ -557,11 +617,25 @@ void D3D11Renderer::CreateNV12Resources() {
     samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     device_->CreateSamplerState(&samplerDesc, &videoSampler_);
 
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 16;
+    cbd.Usage     = D3D11_USAGE_DEFAULT;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    device_->CreateBuffer(&cbd, nullptr, &videoConstants_);
+    SetVideoUVScale(1.0f, 1.0f);
+
     // BT.709 YUV→RGB pixel shader (FULL range — macOS VideoToolbox default)
     const char* nv12PS = R"(
         Texture2D    yTex  : register(t0);
         Texture2D    uvTex : register(t1);
         SamplerState samp  : register(s0);
+
+        // Part of the texture holding the picture (decoder surfaces are
+        // padded, e.g. 1088 rows for 1080p)
+        cbuffer VideoConstants : register(b1) {
+            float2 uvScale;
+            float2 unused;
+        };
 
         struct PSInput {
             float4 pos : SV_Position;
@@ -569,8 +643,9 @@ void D3D11Renderer::CreateNV12Resources() {
         };
 
         float4 main(PSInput input) : SV_Target {
-            float y  = yTex.Sample(samp, input.uv).r;
-            float2 uv_val = uvTex.Sample(samp, input.uv).rg;
+            float2 texCoord = input.uv * uvScale;
+            float y  = yTex.Sample(samp, texCoord).r;
+            float2 uv_val = uvTex.Sample(samp, texCoord).rg;
 
             // Full-range BT.709: Y [0,1], CbCr centered at 0.5
             float Cb = uv_val.r - 0.5;
@@ -601,8 +676,11 @@ void D3D11Renderer::CreateNV12Resources() {
 }
 
 void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
-    if (nv12Width_ == width && nv12Height_ == height && yTexture_) {
-        return;
+    uint32_t evenHeightWanted = (height + 1) & ~1;
+    if (yTexture_) {
+        D3D11_TEXTURE2D_DESC have;
+        yTexture_->GetDesc(&have);
+        if (have.Width == width && have.Height == evenHeightWanted) return;
     }
 
     yTexture_.Reset();
@@ -648,9 +726,6 @@ void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
     srvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
     hr = device_->CreateShaderResourceView(uvTexture_.Get(), &srvDesc, &uvSRV_);
     if (FAILED(hr)) return;
-
-    nv12Width_ = width;
-    nv12Height_ = height;
 
     printf("[Renderer] NV12 textures: Y=%ux%u, UV=%ux%u\n",
         width, evenHeight, width/2, evenHeight/2);
@@ -708,5 +783,76 @@ void D3D11Renderer::UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
         context_->Unmap(uvTexture_.Get(), 0);
     }
 
+    nv12Width_ = frameWidth;
+    nv12Height_ = frameHeight;
+    frameYSRV_ = ySRV_;
+    frameUVSRV_ = uvSRV_;
+    SetVideoUVScale(1.0f, static_cast<float>(frameHeight) / static_cast<float>(evenHeight));
     hasVideoFrame_ = true;
+}
+
+void D3D11Renderer::SetVideoUVScale(float x, float y) {
+    if (!videoConstants_ || (x == uvScaleX_ && y == uvScaleY_)) return;
+    const float data[4] = { x, y, 0.0f, 0.0f };
+    context_->UpdateSubresource(videoConstants_.Get(), 0, nullptr, data, 0, 0);
+    uvScaleX_ = x;
+    uvScaleY_ = y;
+}
+
+bool D3D11Renderer::UpdateFrameTexture(ID3D11Texture2D* source, UINT subresource,
+                                       uint32_t frameWidth, uint32_t frameHeight) {
+    if (deviceLost_ || !source) return false;
+
+    D3D11_TEXTURE2D_DESC srcDesc;
+    source->GetDesc(&srcDesc);
+    if (srcDesc.Format != DXGI_FORMAT_NV12) return false;
+
+    // Our copy target: same size as the decoder surface so a whole-subresource
+    // copy is valid; the shader crops the padding with uvScale
+    D3D11_TEXTURE2D_DESC have{};
+    if (hwTexture_) hwTexture_->GetDesc(&have);
+    if (!hwTexture_ || have.Width != srcDesc.Width || have.Height != srcDesc.Height) {
+        hwTexture_.Reset();
+        hwYSRV_.Reset();
+        hwUVSRV_.Reset();
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = srcDesc.Width;
+        desc.Height = srcDesc.Height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &hwTexture_);
+        if (FAILED(hr)) {
+            CheckDeviceLost(hr, "CreateTexture2D (NV12)");
+            return false;
+        }
+
+        // Plane views: R8 = luma (full size), R8G8 = interleaved chroma (half size)
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R8_UNORM;
+        if (FAILED(device_->CreateShaderResourceView(hwTexture_.Get(), &srv, &hwYSRV_))) return false;
+        srv.Format = DXGI_FORMAT_R8G8_UNORM;
+        if (FAILED(device_->CreateShaderResourceView(hwTexture_.Get(), &srv, &hwUVSRV_))) return false;
+
+        printf("[Renderer] Hardware frame texture: %ux%u NV12 (picture %ux%u)\n",
+               srcDesc.Width, srcDesc.Height, frameWidth, frameHeight);
+    }
+
+    // Copy before the decoder reuses its surface — stays on the GPU
+    context_->CopySubresourceRegion(hwTexture_.Get(), 0, 0, 0, 0, source, subresource, nullptr);
+
+    nv12Width_ = frameWidth;
+    nv12Height_ = frameHeight;
+    frameYSRV_ = hwYSRV_;
+    frameUVSRV_ = hwUVSRV_;
+    SetVideoUVScale(static_cast<float>(frameWidth) / static_cast<float>(srcDesc.Width),
+                    static_cast<float>(frameHeight) / static_cast<float>(srcDesc.Height));
+    hasVideoFrame_ = true;
+    return true;
 }

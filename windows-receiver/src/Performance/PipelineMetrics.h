@@ -136,7 +136,8 @@ struct MetricsSnapshot {
     double receivedFps = 0;
     double decodedFps = 0;
     double presentedFps = 0;         // new video frames on screen per second
-    double loopFps = 0;              // render loop iterations (≈ refresh rate)
+    double renderedFps = 0;          // presents per second (only when something changed)
+    StageSummary renderCall{};       // CPU time of one Render() call, last ~2 s
     double bitrateMbps = 0;
     double packetLossPercent = 0;
     double frameDropPercent = 0;     // expected but never shown, last interval
@@ -147,7 +148,8 @@ struct MetricsSnapshot {
 
 class PipelineMetrics {
 public:
-    void onLoopIteration() { loops_++; }
+    /// One Render()/Present() call took cpuMs on this thread
+    void onRender(double cpuMs) { renders_++; renderCall_.add(cpuMs); }
     void onFrameDecoded()  { decoded_++; }
     /// Received frames that will never reach the screen (queue trim, overwritten)
     void onFramesSkipped(uint64_t count) { skipped_ += count; }
@@ -161,14 +163,15 @@ public:
 
 private:
     std::array<RollingSamples, kStageCount> live_{};
+    RollingSamples renderCall_;
 
-    uint64_t loops_ = 0, decoded_ = 0, presented_ = 0, skipped_ = 0;
+    uint64_t renders_ = 0, decoded_ = 0, presented_ = 0, skipped_ = 0;
 
     // Previous tick
     bool            haveTick_ = false;
     int64_t         lastTickUs_ = 0;
     NetworkCounters lastNet_{};
-    uint64_t        lastLoops_ = 0, lastDecoded_ = 0, lastPresented_ = 0;
+    uint64_t        lastRenders_ = 0, lastDecoded_ = 0, lastPresented_ = 0;
     uint64_t        firstExpected_ = 0, firstReceived_ = 0;
     bool            haveFirst_ = false;
 
@@ -213,6 +216,9 @@ public:
     void recordSecond(int64_t nowUs, const MetricsSnapshot& m, const SystemSample& sys,
                       const SenderSample& mac, const ClockSync::Estimate& sync);
 
+    /// Extra line for the summary (e.g. "Decoder: hardware")
+    void addNote(const std::string& note) { notes_.push_back(note); }
+
     /// Close the files, write the summary; returns the summary text
     std::string finish(int64_t nowUs);
     const std::string& basePath() const { return base_; }
@@ -235,9 +241,10 @@ private:
         void add(double v);
         double avg() const { return n ? sum / n : 0; }
     };
-    Agg presentedFps_, receivedFps_, loopFps_, bitrate_, loss_, drop_, jitter_, rtt_;
+    Agg presentedFps_, receivedFps_, renderedFps_, bitrate_, loss_, drop_, jitter_, rtt_;
     Agg pcCpu_, pcRam_, gpu3d_, gpuDecode_, macCpu_, macRam_, macCaptureFps_, macEncodeFps_;
     double clockErrorMs_ = 0;
+    std::vector<std::string> notes_;
     uint64_t lostFrames_ = 0, droppedFrames_ = 0;
 };
 
@@ -250,8 +257,7 @@ struct OverlayInputs {
     SystemSample pc;
     std::wstring connection;         // e.g. "Streaming 1920x1080"
     std::wstring gpuName;
-    double loopFrameMsAvg = 0;
-    double loopFrameMsMax = 0;
+    bool   hardwareDecode = false;
     bool   benchmarking = false;
 };
 

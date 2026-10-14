@@ -191,7 +191,7 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
         rates_.receivedFps  = rate(net.framesReceived, lastNet_.framesReceived);
         rates_.decodedFps   = rate(decoded_, lastDecoded_);
         rates_.presentedFps = rate(presented_, lastPresented_);
-        rates_.loopFps      = rate(loops_, lastLoops_);
+        rates_.renderedFps  = rate(renders_, lastRenders_);
         rates_.bitrateMbps  = rate(net.bytesReceived, lastNet_.bytesReceived) * 8.0 / 1e6;
 
         uint64_t got  = net.packetsReceived - lastNet_.packetsReceived;
@@ -214,13 +214,14 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
     haveTick_ = true;
     lastTickUs_ = nowUs;
     lastNet_ = net;
-    lastLoops_ = loops_;
+    lastRenders_ = renders_;
     lastDecoded_ = decoded_;
     lastPresented_ = presented_;
 }
 
 MetricsSnapshot PipelineMetrics::snapshot() const {
     MetricsSnapshot out = rates_;
+    out.renderCall = renderCall_.summary();
     for (int i = 0; i < kStageCount; i++) out.stages[static_cast<size_t>(i)] = live_[static_cast<size_t>(i)].summary();
     return out;
 }
@@ -247,7 +248,7 @@ bool BenchmarkRecorder::start(const std::string& basePath, int durationSeconds, 
     frames_ << "frame_seq,keyframe,bytes";
     for (int i = 0; i < kStageCount; i++) frames_ << "," << StageName(static_cast<Stage>(i)) << "_ms";
     frames_ << "\n";
-    seconds_ << "t_s,received_fps,decoded_fps,presented_fps,loop_fps,bitrate_mbps,"
+    seconds_ << "t_s,received_fps,decoded_fps,presented_fps,rendered_fps,bitrate_mbps,"
                 "packet_loss_pct,frame_drop_pct,jitter_ms,rtt_ms,clock_error_ms,"
                 "pc_cpu_pct,pc_ram_mb,pc_private_mb,gpu_3d_pct,gpu_decode_pct,"
                 "mac_capture_fps,mac_encode_fps,mac_cpu_pct,mac_ram_mb,mac_encoder_mbps,mac_target_mbps,"
@@ -287,7 +288,7 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
     const StageSummary& total = m.stages[static_cast<size_t>(Stage::Total)];
     seconds_ << opt(true, (nowUs - startUs_) / 1e6) << ','
              << opt(true, m.receivedFps) << ',' << opt(true, m.decodedFps) << ','
-             << opt(true, m.presentedFps) << ',' << opt(true, m.loopFps) << ','
+             << opt(true, m.presentedFps) << ',' << opt(true, m.renderedFps) << ','
              << opt(true, m.bitrateMbps) << ',' << opt(true, m.packetLossPercent) << ','
              << opt(true, m.frameDropPercent) << ',' << opt(true, m.jitterMs) << ','
              << opt(sync.valid, sync.smoothedRttMs) << ',' << opt(sync.valid, sync.errorBoundMs) << ','
@@ -301,7 +302,7 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
 
     presentedFps_.add(m.presentedFps);
     receivedFps_.add(m.receivedFps);
-    loopFps_.add(m.loopFps);
+    renderedFps_.add(m.renderedFps);
     bitrate_.add(m.bitrateMbps);
     loss_.add(m.packetLossPercent);
     drop_.add(m.frameDropPercent);
@@ -334,6 +335,8 @@ std::string BenchmarkRecorder::finish(int64_t nowUs) {
     snprintf(line, sizeof(line), "Duration: %.1f s   Frames displayed: %llu\n\n",
              (nowUs - startUs_) / 1e6, static_cast<unsigned long long>(frameRows_));
     o << line;
+    for (const auto& note : notes_) o << note << "\n";
+    if (!notes_.empty()) o << "\n";
     o << "Stage (ms)      avg     p50     p95     p99     max   samples\n";
     for (int i = 0; i < kStageCount; i++) {
         StageSummary s = histograms_[static_cast<size_t>(i)].summary();
@@ -350,8 +353,8 @@ std::string BenchmarkRecorder::finish(int64_t nowUs) {
              clockErrorMs_);
     o << line;
 
-    snprintf(line, sizeof(line), "FPS        presented %.1f avg   received %.1f   display loop %.1f\n",
-             presentedFps_.avg(), receivedFps_.avg(), loopFps_.avg());
+    snprintf(line, sizeof(line), "FPS        presented %.1f avg   received %.1f   rendered %.1f\n",
+             presentedFps_.avg(), receivedFps_.avg(), renderedFps_.avg());
     o << line;
     snprintf(line, sizeof(line), "Network    %.1f Mbps avg (%.1f max)   RTT %.1f ms   jitter %.2f ms   packet loss %.3f%%\n",
              bitrate_.avg(), bitrate_.max, rtt_.avg(), jitter_.avg(), loss_.avg());
@@ -424,8 +427,10 @@ std::wstring FormatDiagnostics(const OverlayInputs& in) {
     } else {
         Appendf(out, L"FPS      recv %.1f\n", m.receivedFps);
     }
-    Appendf(out, L"         decode %.1f  shown %.1f  loop %.1f\n", m.decodedFps, m.presentedFps, m.loopFps);
-    Appendf(out, L"         loop frame %.1f ms avg, %.1f max\n", in.loopFrameMsAvg, in.loopFrameMsMax);
+    Appendf(out, L"         decode %.1f (%ls)  shown %.1f\n", m.decodedFps,
+            in.hardwareDecode ? L"GPU" : L"CPU", m.presentedFps);
+    Appendf(out, L"Render   %.1f/s, %.2f ms CPU avg, %.2f max\n", m.renderedFps,
+            m.renderCall.avgMs, m.renderCall.maxMs);
 
     if (in.sync.valid) {
         Appendf(out, L"Network  %.1f Mbps  RTT %.1f ms  jitter %.1f ms\n",

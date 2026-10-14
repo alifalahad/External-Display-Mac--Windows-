@@ -24,11 +24,19 @@ class D3D11Renderer {
 public:
     D3D11Renderer(HWND hwnd, int width, int height,
                   GpuPreference gpuPreference = GpuPreference::Default);
-    ~D3D11Renderer() = default; // ComPtr handles cleanup
+    ~D3D11Renderer();
+    D3D11Renderer(const D3D11Renderer&) = delete;
+    D3D11Renderer& operator=(const D3D11Renderer&) = delete;
 
     // Render one frame: video (or test pattern) + optional diagnostics text.
-    // Presents with VSync.
+    // Presents with VSync. Call WaitForFrameSlot() first.
     void Render(float time, float frameCount, const std::wstring* overlayText = nullptr);
+
+    // Phase 17: block until the swap chain can take a frame without queueing
+    // behind older ones (max frame latency 1). Rendering right after this —
+    // with the newest picture — keeps Present→scan-out to about one refresh.
+    // Returns false on timeout (render anyway).
+    bool WaitForFrameSlot(DWORD timeoutMs);
 
     // Present count of the most recent Present() (DXGI numbering)
     bool GetLastPresentCount(uint32_t& presentCount) const;
@@ -43,9 +51,18 @@ public:
     // Get GPU adapter name
     std::wstring GetAdapterName() const { return adapterName_; }
 
-    // Upload raw NV12 Y and UV planes for GPU-side YUV→RGB conversion
+    // Software-decoded frame: upload NV12 Y and UV planes from system memory
     void UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
                          int nv12Stride, uint32_t frameWidth, uint32_t frameHeight);
+
+    // Hardware-decoded frame: GPU→GPU copy of one NV12 texture slice
+    // (the decoder's texture must come from GetDevice())
+    bool UpdateFrameTexture(ID3D11Texture2D* source, UINT subresource,
+                            uint32_t frameWidth, uint32_t frameHeight);
+
+    // Device for the hardware decoder, or nullptr when it cannot decode into
+    // textures this renderer can sample (no video support / no NV12 views)
+    ID3D11Device* GetVideoDevice() const { return supportsHardwareVideo_ ? device_.Get() : nullptr; }
 
     // Whether we have a video frame to display
     bool HasVideoFrame() const { return hasVideoFrame_; }
@@ -107,6 +124,24 @@ private:
     bool deviceLost_ = false;
     void CreateNV12Resources();
     void EnsureNV12Textures(uint32_t width, uint32_t height);
+    void SetVideoUVScale(float x, float y);
+
+    // Frame currently drawn: the software textures' views or the hardware
+    // texture's views, whichever was updated last
+    ComPtr<ID3D11ShaderResourceView> frameYSRV_;
+    ComPtr<ID3D11ShaderResourceView> frameUVSRV_;
+    ComPtr<ID3D11Buffer>             videoConstants_;   // uvScale: crop decoder padding
+    float uvScaleX_ = 0, uvScaleY_ = 0;
+
+    // Hardware decode target (NV12, same size as the decoder's surfaces)
+    ComPtr<ID3D11Texture2D>          hwTexture_;
+    ComPtr<ID3D11ShaderResourceView> hwYSRV_;
+    ComPtr<ID3D11ShaderResourceView> hwUVSRV_;
+    bool supportsHardwareVideo_ = false;
+
+    // Frame latency (Phase 17)
+    HANDLE frameLatencyWaitable_ = nullptr;
+    UINT   swapChainFlags_ = 0;
 
     // Shader constant buffer layout (must be 16-byte aligned)
     struct alignas(16) ShaderConstants {

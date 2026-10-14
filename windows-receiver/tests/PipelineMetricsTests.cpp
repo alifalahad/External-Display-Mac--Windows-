@@ -234,7 +234,7 @@ static void TestRates() {
     for (int i = 0; i < 57; i++) { m.onFrameDecoded(); m.onFrameDisplayed(t, sync); }
     m.onFrameDecoded();
     m.onFramesSkipped(1);
-    for (int i = 0; i < 60; i++) m.onLoopIteration();
+    for (int i = 0; i < 60; i++) m.onRender(0.5 + i % 2);
     net.framesExpected = 60;
     net.framesReceived = 58;
     net.bytesReceived = 5'000'000;     // 40 Mbit
@@ -247,7 +247,9 @@ static void TestRates() {
     CHECK_NEAR(s.receivedFps, 58, 1e-9);
     CHECK_NEAR(s.decodedFps, 58, 1e-9);
     CHECK_NEAR(s.presentedFps, 57, 1e-9);
-    CHECK_NEAR(s.loopFps, 60, 1e-9);
+    CHECK_NEAR(s.renderedFps, 60, 1e-9);
+    CHECK_NEAR(s.renderCall.avgMs, 1.0, 1e-9);
+    CHECK_NEAR(s.renderCall.maxMs, 1.5, 1e-9);
     CHECK_NEAR(s.bitrateMbps, 40.0, 1e-9);
     CHECK_NEAR(s.packetLossPercent, 1.0, 1e-9);
     CHECK_NEAR(s.frameDropPercent, 5.0, 1e-9);     // 3 of 60 never shown

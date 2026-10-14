@@ -20,7 +20,6 @@
 
 #include "App/Window.h"
 #include "Renderer/D3D11Renderer.h"
-#include "Performance/FrameStats.h"
 #include "Performance/PipelineMetrics.h"
 #include "Performance/PipelineClock.h"
 #include "Performance/SystemMonitor.h"
@@ -93,42 +92,26 @@ static void CleanupConsole() {
     FreeConsole();
 }
 
-// ── NV12 Frame (thread-safe, latest-frame-wins) ─────────────────────────────
+// ── Newest decoded picture (main thread only) ───────────────────────────────
+// Decoder callbacks run on the main thread and hand each picture straight to
+// the renderer (a GPU copy for hardware decoding, an upload for software).
+// This remembers which frame that was until it has been presented.
 
-struct NV12Frame {
-    std::vector<uint8_t> yPlane;
-    std::vector<uint8_t> uvPlane;
-    int stride;
-    uint32_t width;
-    uint32_t height;
+struct PictureState {
+    bool fresh = false;            // in the renderer, not presented yet
     FrameTimeline timeline;
+    uint64_t overwritten = 0;      // replaced by a newer picture before presenting
 };
+static PictureState gPicture;
 
-static std::mutex gNV12Mutex;
-static NV12Frame gLatestNV12;
-static bool gHasNewNV12 = false;
-static uint64_t gNV12Overwritten = 0;   // decoded but replaced before upload (guarded by gNV12Mutex)
-
-static void QueueNV12Frame(const uint8_t* yData, const uint8_t* uvData,
-                            int stride, uint32_t width, uint32_t height,
-                            const FrameTimeline& timeline) {
-    uint32_t evenH = (height + 1) & ~1;
-    size_t ySize  = (size_t)stride * evenH;
-    size_t uvSize = (size_t)stride * (evenH / 2);
-
-    std::lock_guard<std::mutex> lock(gNV12Mutex);
-    if (gHasNewNV12) gNV12Overwritten++;   // latest frame wins
-    if (gLatestNV12.yPlane.size() != ySize)   gLatestNV12.yPlane.resize(ySize);
-    if (gLatestNV12.uvPlane.size() != uvSize) gLatestNV12.uvPlane.resize(uvSize);
-
-    memcpy(gLatestNV12.yPlane.data(), yData, ySize);
-    memcpy(gLatestNV12.uvPlane.data(), uvData, uvSize);
-    gLatestNV12.stride = stride;
-    gLatestNV12.width = width;
-    gLatestNV12.height = height;
-    gLatestNV12.timeline = timeline;
-    gHasNewNV12 = true;
+static void OnPictureDecoded(const FrameTimeline& timeline) {
+    if (gPicture.fresh) gPicture.overwritten++;   // latest picture wins
+    gPicture.timeline = timeline;
+    gPicture.fresh = true;
 }
+
+// Wakes the main loop: a frame arrived or the stream changed (auto-reset)
+static HANDLE gWakeEvent = nullptr;
 
 // ── H.264 Input Queue (main-thread decode with frame dropping) ──────────────
 
@@ -158,6 +141,7 @@ static void QueueH264Frame(const uint8_t* data, size_t len, const FrameTimeline&
         }
     }
     gInputQueue.push_back({std::vector<uint8_t>(data, data + len), timeline});
+    if (gWakeEvent) SetEvent(gWakeEvent);
 }
 
 // ── Decode bookkeeping (main thread only) ───────────────────────────────────
@@ -360,8 +344,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         D3D11Renderer::LogAdapters();
         auto renderer = std::make_unique<D3D11Renderer>(
             window.GetHandle(), window.GetWidth(), window.GetHeight(), gpuPreference);
-        wprintf(L"GPU:    %s (rendering)\n", renderer->GetAdapterName().c_str());
-        printf("VSync:  Enabled (60 Hz target)\n\n");
+        wprintf(L"GPU:    %ls (rendering)\n", renderer->GetAdapterName().c_str());
+        printf("VSync:  on, renders only when something changed\n\n");
+        gWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
         // Declared before the receiver so it outlives the receiver's network thread
         std::unique_ptr<PairingManager> pairingMgr;
@@ -384,6 +369,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     gPendingFPS = fps;
                     gPendingStreamRestart = true;
                     printf("[Net] Stream info queued: %ux%u @ %u FPS\n", w, h, fps);
+                    if (gWakeEvent) SetEvent(gWakeEvent);
                 });
 
             // Network thread: queue H.264 frames (don't decode here)
@@ -392,13 +378,25 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     QueueH264Frame(data, len, timeline);
                 });
 
-            // Decoder (main thread): output raw NV12 Y+UV planes for GPU upload
-            decoder->setRawNV12Callback(
-                [](const uint8_t* yData, const uint8_t* uvData,
-                   int stride, uint32_t w, uint32_t h, int64_t sampleTime) {
+            // Decoder output (main thread) goes straight to the renderer.
+            // Hardware: GPU→GPU copy of the decoded surface.
+            decoder->setTextureCallback(
+                [&renderer](ID3D11Texture2D* texture, UINT subresource,
+                            uint32_t w, uint32_t h, int64_t sampleTime) {
                     FrameTimeline timeline = TakeDecodingTimeline(sampleTime);
                     timeline.decodeEndUs = PipelineClock::NowUs();
-                    QueueNV12Frame(yData, uvData, stride, w, h, timeline);
+                    if (renderer->UpdateFrameTexture(texture, subresource, w, h)) {
+                        OnPictureDecoded(timeline);
+                    }
+                });
+            // Software fallback: upload the NV12 planes from system memory
+            decoder->setRawNV12Callback(
+                [&renderer](const uint8_t* yData, const uint8_t* uvData,
+                            int stride, uint32_t w, uint32_t h, int64_t sampleTime) {
+                    FrameTimeline timeline = TakeDecodingTimeline(sampleTime);
+                    timeline.decodeEndUs = PipelineClock::NowUs();
+                    renderer->UpdateFrameNV12(yData, uvData, stride, w, h);
+                    OnPictureDecoded(timeline);
                 });
 
             // Set up pairing manager for secure authentication.
@@ -463,6 +461,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 std::string base = BenchmarkBasePath();
                 if (bench.start(base, benchSeconds, PipelineClock::NowUs())) {
                     printf("[Bench] Recording %d s to %s-*.csv\n", benchSeconds, base.c_str());
+                    bench.addNote(decoder && decoder->isHardwareAccelerated()
+                        ? "Decoder: hardware (D3D11 video engine)" : "Decoder: software (CPU)");
                 } else {
                     printf("[Bench] Cannot create %s-*.csv — benchmark disabled\n", base.c_str());
                     benchSeconds = 0;
@@ -471,15 +471,72 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
             bench.recordFrame(t, stages);
         };
 
+        // Decoder (re)start on the renderer's current device: hardware decoding
+        // when the GPU allows it. The decoder can only start from a keyframe.
+        auto restartDecoder = [&](uint32_t w, uint32_t h) {
+            decoder->shutdown();
+            gDecoding.clear();
+            gPicture.fresh = false;
+            decoder->setD3D11Device(renderer->GetVideoDevice());
+            decoder->initialize(w, h);
+            if (receiver) receiver->requestKeyframe();
+        };
+
+        // Decode everything that has arrived. Pictures go to the renderer as
+        // they come out; only the newest is presented.
+        int consecutiveDecodeFailures = 0;
+        auto decodePending = [&]() {
+            if (!decoder) return;
+            std::deque<H264InputFrame> frames;
+            {
+                std::lock_guard<std::mutex> lock(gInputMutex);
+                frames.swap(gInputQueue);   // don't hold the lock while decoding
+            }
+            for (auto& frame : frames) {
+                const int64_t sampleTime = gNextSampleTime;
+                gNextSampleTime += kSampleTimeStep;
+                frame.timeline.decodeStartUs = PipelineClock::NowUs();
+                gDecoding.emplace_back(sampleTime, frame.timeline);
+
+                if (decoder->decode(frame.data.data(), frame.data.size(), sampleTime)) {
+                    metrics.onFrameDecoded();
+                    consecutiveDecodeFailures = 0;
+                } else if (++consecutiveDecodeFailures >= 30) {
+                    // Phase 15: a decoder that keeps failing is rebuilt
+                    printf("[Decoder] %d consecutive failures — reinitializing decoder\n",
+                           consecutiveDecodeFailures);
+                    consecutiveDecodeFailures = 0;
+                    restartDecoder(streamWidth ? streamWidth : 1920, streamHeight ? streamHeight : 1080);
+                    break;
+                }
+            }
+            // Pictures the decoder finished after the last input
+            if (!gDecoding.empty()) decoder->drainOutput();
+
+            // Inputs that never produced a picture (e.g. before the first
+            // keyframe) must not keep the loop polling
+            const int64_t staleUs = PipelineClock::NowUs() - 500'000;
+            while (!gDecoding.empty() && gDecoding.front().second.decodeStartUs < staleUs) {
+                gDecoding.pop_front();
+            }
+        };
+
         // ── Main loop ───────────────────────────────────────────────────────
-        FrameStats stats(60.0f);
+        // Phase 17: event-driven. The loop sleeps until a frame arrives, a
+        // window message comes in, or a timer (overlay, statistics) is due, and
+        // renders only when the picture changed — a static screen costs almost
+        // nothing. Before rendering it waits for the swap chain's frame slot, so
+        // the newest picture goes out with at most one frame queued.
         auto startTime = std::chrono::high_resolution_clock::now();
         uint64_t frameCounter = 0;
+        bool forceRender = true;
+        bool lastShowStats = window.ShowStats();
 
         while (window.ProcessMessages()) {
             if (window.WasResized()) {
                 renderer->Resize(window.GetWidth(), window.GetHeight());
                 window.ClearResizedFlag();
+                forceRender = true;
             }
 
             // Phase 15: GPU removed/reset (driver update, TDR, hybrid GPU switch)
@@ -501,12 +558,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 // The new swap chain numbers its presents from scratch
                 for (const auto& p : pendingDisplay) finishFrame(p.timeline);
                 pendingDisplay.clear();
-                {
-                    // Re-upload the last frame so a static screen isn't left black
-                    std::lock_guard<std::mutex> lock(gNV12Mutex);
-                    gHasNewNV12 = !gLatestNV12.yPlane.empty();
-                }
-                if (receiver) receiver->requestKeyframe();
+                // A hardware decoder is bound to the old device
+                if (decoder && streamWidth) restartDecoder(streamWidth, streamHeight);
+                forceRender = true;
             }
 
             // Phase 15: laptop woke up — the old TCP connection is dead, don't
@@ -528,87 +582,17 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         std::lock_guard<std::mutex> iq(gInputMutex);
                         gInputQueue.clear();
                     }
-                    {
-                        std::lock_guard<std::mutex> nv(gNV12Mutex);
-                        gHasNewNV12 = false;
-                    }
-                    gDecoding.clear();
                     pendingDisplay.clear();
                     streamWidth = gPendingWidth;
                     streamHeight = gPendingHeight;
-
-                    decoder->shutdown();
-                    decoder->initialize(gPendingWidth, gPendingHeight);
-
-                    // The decoder can only start from an IDR frame — ask for one
-                    // now that it is ready (earlier ones were flushed above)
-                    if (receiver) receiver->requestKeyframe();
+                    restartDecoder(gPendingWidth, gPendingHeight);
 
                     float aspect = (float)gPendingWidth / (float)gPendingHeight;
                     window.SetVideoAspectRatio(aspect);
                     printf("[Main] Aspect ratio locked: %.4f\n", aspect);
 
                     gPendingStreamRestart = false;
-                }
-            }
-
-            // Decode H.264 on main thread (up to 2 per vsync)
-            if (networkMode && decoder) {
-                std::lock_guard<std::mutex> lock(gInputMutex);
-                int decoded = 0;
-                static int consecutiveDecodeFailures = 0;
-                while (!gInputQueue.empty() && decoded < 2) {
-                    auto& frame = gInputQueue.front();
-                    const int64_t sampleTime = gNextSampleTime;
-                    gNextSampleTime += kSampleTimeStep;
-                    frame.timeline.decodeStartUs = PipelineClock::NowUs();
-                    gDecoding.emplace_back(sampleTime, frame.timeline);
-                    if (gDecoding.size() > 32) gDecoding.pop_front();   // decoder never answered
-
-                    bool ok = decoder->decode(frame.data.data(), frame.data.size(), sampleTime);
-                    gInputQueue.pop_front();
-                    decoded++;
-                    if (ok) metrics.onFrameDecoded();
-
-                    // Phase 15: Track decoder failures for auto-recovery
-                    if (!ok) {
-                        consecutiveDecodeFailures++;
-                        if (consecutiveDecodeFailures >= 30) {
-                            printf("[Decoder] %d consecutive failures — reinitializing decoder\n",
-                                   consecutiveDecodeFailures);
-                            decoder->shutdown();
-                            decoder->initialize(gPendingWidth > 0 ? gPendingWidth : 1920,
-                                               gPendingHeight > 0 ? gPendingHeight : 1080);
-                            consecutiveDecodeFailures = 0;
-                            gInputQueue.clear();
-                            gDecoding.clear();
-                            // Request keyframe from server
-                            if (receiver) {
-                                receiver->requestKeyframe();
-                            }
-                            break;
-                        }
-                    } else {
-                        consecutiveDecodeFailures = 0;
-                    }
-                }
-            }
-
-            // Upload latest NV12 frame to GPU
-            bool uploadedFrame = false;
-            FrameTimeline uploadedTimeline;
-            if (networkMode) {
-                std::lock_guard<std::mutex> lock(gNV12Mutex);
-                if (gHasNewNV12) {
-                    renderer->UpdateFrameNV12(
-                        gLatestNV12.yPlane.data(),
-                        gLatestNV12.uvPlane.data(),
-                        gLatestNV12.stride,
-                        gLatestNV12.width,
-                        gLatestNV12.height);
-                    gHasNewNV12 = false;
-                    uploadedFrame = true;
-                    uploadedTimeline = gLatestNV12.timeline;
+                    forceRender = true;
                 }
             }
 
@@ -632,32 +616,83 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 clipboardSync->poll();
             }
 
-            // Render
-            auto now = std::chrono::high_resolution_clock::now();
-            float elapsed = std::chrono::duration<float>(now - startTime).count();
-            stats.BeginFrame();
-            renderer->Render(elapsed, (float)frameCounter, window.ShowStats() ? &overlayText : nullptr);
-            stats.EndFrame();
-            frameCounter++;
-            metrics.onLoopIteration();
-            const int64_t nowUs = PipelineClock::NowUs();
+            decodePending();
 
-            // ── Phase 16: follow each new video frame until it is on screen ──
-            if (uploadedFrame) {
-                uploadedTimeline.presentUs = nowUs;
-                uint32_t presentCount = 0;
-                if (frameStatsUsable && renderer->GetLastPresentCount(presentCount)) {
-                    if (lastFrameStatsOkUs == 0) lastFrameStatsOkUs = nowUs;
-                    presentsTracked++;
-                    pendingDisplay.push_back({ presentCount, uploadedTimeline });
-                    if (pendingDisplay.size() > 8) {   // statistics stalled: give up on the oldest
-                        finishFrame(pendingDisplay.front().timeline);
-                        pendingDisplay.pop_front();
+            // ── Overlay text, rebuilt 4× per second (DirectWrite layout is not free) ──
+            int64_t nowUs = PipelineClock::NowUs();
+            if (window.ShowStats() != lastShowStats) {
+                lastShowStats = window.ShowStats();
+                lastOverlayUs = 0;
+                forceRender = true;
+            }
+            if (window.ShowStats() && nowUs - lastOverlayUs >= 250'000) {
+                lastOverlayUs = nowUs;
+                OverlayInputs in;
+                in.metrics = metrics.snapshot();
+                in.pc = systemMonitor.latest();
+                in.gpuName = renderer->GetAdapterName();
+                in.hardwareDecode = decoder && decoder->isHardwareAccelerated();
+                in.benchmarking = bench.active();
+                if (receiver) {
+                    in.sync = receiver->clockEstimate();
+                    in.mac = receiver->senderStats();
+                    const wchar_t* state = L"?";
+                    switch (receiver->getState()) {
+                        case StreamReceiver::State::Disconnected: state = L"Disconnected"; break;
+                        case StreamReceiver::State::Connecting:   state = L"Connecting"; break;
+                        case StreamReceiver::State::Connected:    state = L"Connected"; break;
+                        case StreamReceiver::State::Streaming:    state = L"Streaming"; break;
+                        case StreamReceiver::State::Reconnecting: state = L"Reconnecting"; break;
+                        case StreamReceiver::State::Error:        state = L"Error"; break;
                     }
+                    wchar_t line[128];
+                    swprintf(line, 128, L"%ls %ux%u -> window %dx%d", state, streamWidth, streamHeight,
+                             window.GetWidth(), window.GetHeight());
+                    in.connection = line;
                 } else {
-                    finishFrame(uploadedTimeline);   // no scan-out time available
+                    in.connection = L"Test pattern (no Mac connection)";
+                }
+                overlayText = FormatDiagnostics(in);
+                forceRender = true;
+            }
+
+            // ── Render only when something changed ──────────────────────────
+            const bool animating = !networkMode;   // test pattern moves every frame
+            if (gPicture.fresh || forceRender || animating) {
+                // Wait for a free frame slot, then take whatever arrived meanwhile:
+                // the frame we present is the newest one, not the one that woke us
+                renderer->WaitForFrameSlot(100);
+                decodePending();
+
+                auto now = std::chrono::high_resolution_clock::now();
+                float elapsed = std::chrono::duration<float>(now - startTime).count();
+                const int64_t renderStartUs = PipelineClock::NowUs();
+                renderer->Render(elapsed, (float)frameCounter, window.ShowStats() ? &overlayText : nullptr);
+                nowUs = PipelineClock::NowUs();
+                metrics.onRender((nowUs - renderStartUs) / 1000.0);
+                frameCounter++;
+                forceRender = false;
+
+                // ── Phase 16: follow each new video frame until it is on screen ──
+                if (gPicture.fresh) {
+                    gPicture.fresh = false;
+                    FrameTimeline presented = gPicture.timeline;
+                    presented.presentUs = nowUs;
+                    uint32_t presentCount = 0;
+                    if (frameStatsUsable && renderer->GetLastPresentCount(presentCount)) {
+                        if (lastFrameStatsOkUs == 0) lastFrameStatsOkUs = nowUs;
+                        presentsTracked++;
+                        pendingDisplay.push_back({ presentCount, presented });
+                        if (pendingDisplay.size() > 8) {   // statistics stalled: give up on the oldest
+                            finishFrame(pendingDisplay.front().timeline);
+                            pendingDisplay.pop_front();
+                        }
+                    } else {
+                        finishFrame(presented);   // no scan-out time available
+                    }
                 }
             }
+
             if (!pendingDisplay.empty()) {
                 uint32_t shownCount = 0;
                 int64_t shownUs = 0;
@@ -711,10 +746,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     std::lock_guard<std::mutex> iq(gInputMutex);
                     skippedNow = gInputDropped;
                 }
-                {
-                    std::lock_guard<std::mutex> nv(gNV12Mutex);
-                    skippedNow += gNV12Overwritten;
-                }
+                skippedNow += gPicture.overwritten;
                 if (skippedNow > skippedReported) {
                     metrics.onFramesSkipped(skippedNow - skippedReported);
                     skippedReported = skippedNow;
@@ -737,9 +769,9 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                         const StageSummary& x = snap.stages[static_cast<size_t>(s)];
                         return x.samples ? x.avgMs : -1.0;
                     };
-                    printf("[Perf] shown %.1f FPS (recv %.1f, loop %.1f) | %.1f Mbps | RTT %.1f ms | "
+                    printf("[Perf] shown %.1f FPS (recv %.1f, rendered %.1f) | %.1f Mbps | RTT %.1f ms | "
                            "jitter %.1f ms | drop %.2f%% | loss %.2f%%\n",
-                           snap.presentedFps, snap.receivedFps, snap.loopFps, snap.bitrateMbps,
+                           snap.presentedFps, snap.receivedFps, snap.renderedFps, snap.bitrateMbps,
                            sync.valid ? sync.smoothedRttMs : -1.0, snap.jitterMs,
                            snap.frameDropPercent, snap.packetLossPercent);
                     printf("[Perf] latency ms: capture %.1f  encode %.1f  send %.1f  network %.1f  "
@@ -760,38 +792,6 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                 }
             }
 
-            // ── Overlay text, rebuilt 4× per second (DirectWrite layout is not free) ──
-            if (window.ShowStats() && nowUs - lastOverlayUs >= 250'000) {
-                lastOverlayUs = nowUs;
-                OverlayInputs in;
-                in.metrics = metrics.snapshot();
-                in.pc = systemMonitor.latest();
-                in.gpuName = renderer->GetAdapterName();
-                in.loopFrameMsAvg = stats.GetAvgFrameTimeMs();
-                in.loopFrameMsMax = stats.GetMaxFrameTimeMs();
-                in.benchmarking = bench.active();
-                if (receiver) {
-                    in.sync = receiver->clockEstimate();
-                    in.mac = receiver->senderStats();
-                    const wchar_t* state = L"?";
-                    switch (receiver->getState()) {
-                        case StreamReceiver::State::Disconnected: state = L"Disconnected"; break;
-                        case StreamReceiver::State::Connecting:   state = L"Connecting"; break;
-                        case StreamReceiver::State::Connected:    state = L"Connected"; break;
-                        case StreamReceiver::State::Streaming:    state = L"Streaming"; break;
-                        case StreamReceiver::State::Reconnecting: state = L"Reconnecting"; break;
-                        case StreamReceiver::State::Error:        state = L"Error"; break;
-                    }
-                    wchar_t line[128];
-                    swprintf(line, 128, L"%ls %ux%u -> window %dx%d", state, streamWidth, streamHeight,
-                             window.GetWidth(), window.GetHeight());
-                    in.connection = line;
-                } else {
-                    in.connection = L"Test pattern (no Mac connection)";
-                }
-                overlayText = FormatDiagnostics(in);
-            }
-
             if (bench.due(nowUs)) {
                 printf("\n%s\n[Bench] Files: %s-frames.csv, %s-seconds.csv, %s-summary.txt\n",
                        bench.finish(nowUs).c_str(), bench.basePath().c_str(),
@@ -800,6 +800,21 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
                     printf("[Bench] Note: no DXGI scan-out times — Total is measured to Present()\n");
                 }
                 break;   // benchmark complete: exit
+            }
+
+            // ── Sleep until there is something to do ────────────────────────
+            if (!animating) {
+                int64_t waitUs = 100'000;   // PIN requests, resume, state changes
+                waitUs = (std::min)(waitUs, lastTickUs + 1'000'000 - nowUs);
+                if (window.ShowStats()) waitUs = (std::min)(waitUs, lastOverlayUs + 250'000 - nowUs);
+                // Decoder still holds frames: check soon. A scan-out time is due
+                // within a refresh or two: half a refresh period is precise enough.
+                if (!gDecoding.empty()) waitUs = (std::min)(waitUs, (int64_t)4'000);
+                if (!pendingDisplay.empty()) waitUs = (std::min)(waitUs, (int64_t)8'000);
+                if (waitUs > 0) {
+                    MsgWaitForMultipleObjectsEx(1, &gWakeEvent, (DWORD)((waitUs + 999) / 1000),
+                                                QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
             }
         }
 
@@ -811,7 +826,7 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE,
         if (clipboardSync) clipboardSync->stop();
         if (receiver) receiver->disconnect();
         if (decoder) decoder->shutdown();
-        wprintf(L"\nRender loop: %ls\n", stats.FormatStats().c_str());
+        if (gWakeEvent) CloseHandle(gWakeEvent);
         if (networkMode) CoUninitialize();
 
     } catch (const std::exception& e) {

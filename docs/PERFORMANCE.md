@@ -52,9 +52,10 @@ Clock offset cancels out, so it needs no sync.
 
 ## Where to see it
 
-- **Windows overlay (F2).** FPS at every stage (capture, encode, receive, decode, shown, render
-  loop), bitrate, RTT, jitter, drops, packet loss, per-stage latency (avg / p95 / max over the
-  last ~2 s), Mac and PC CPU/RAM, and GPU usage.
+- **Windows overlay (F2).** FPS at every stage (capture, encode, receive, decode, shown), whether
+  decoding runs on the GPU or CPU, presents per second and render CPU time, bitrate, RTT, jitter,
+  drops, packet loss, per-stage latency (avg / p95 / max over the last ~2 s), Mac and PC
+  CPU/RAM, and GPU usage.
 - **Windows console.** A two-line summary every 5 s.
 - **Mac window.** Capture FPS and latency, encoder FPS, latency and bitrate (actual / target),
   send rate, RTT, end-to-end latency, packet loss, and this process's CPU and memory. Updated once
@@ -139,8 +140,49 @@ Other changes (not separately benchmarked):
 
 ### Real LAN results
 
-Not measured yet. Add the `bench-*-summary.txt` numbers here for each setup (network, Mac model,
-Windows GPU, resolution).
+#### Phase 16 baseline — 2026-10-14, Wi-Fi, 60 s (`bench-20261014-103135`)
+
+| Stage | avg | p50 | p95 | p99 | max (ms) |
+|-------|----:|----:|----:|----:|----:|
+| Capture | 1.0 | 0.05 | 2.2 | 21.2 | 171 |
+| Encode | 8.3 | 7.4 | 13.1 | 15.8 | 71 |
+| Send | 0.4 | 0.2 | 0.7 | 3.8 | 107 |
+| Network | 10.3 | 4.5 | 58.3 | 80.5 | 169 |
+| Queue | 15.6 | 11.5 | 45.3 | 58.3 | 79 |
+| **Decode** | **102.0** | 74.5 | 178.1 | 554.5 | 2635 |
+| Render | 6.8 | 7.2 | 11.1 | 11.8 | 24 |
+| **Display** | **45.2** | 49.5 | 49.7 | 49.8 | 50 |
+| **Total** | **188.5** | 157.6 | 259.6 | 648.1 | 2698 |
+
+Other numbers from the same run:
+- 30.6 FPS shown of 39.9 received; 20.6 % of frames dropped, 564 of them on the PC.
+- 8.6 Mbps, RTT 9.7 ms, jitter 9.1 ms, packet loss 0.011 %.
+- PC CPU 9.5 %, GPU 3D 8.5 %, **GPU video decode 0.0 %**. Mac CPU 3.8 %.
+
+What it showed:
+1. **Decoding ran in software on the CPU.** The GPU's video engine sat at 0 %. Decoded pictures
+   were also only collected when the *next* frame was submitted, so each picture waited for the
+   frame behind it. When the decoder was full, the input frame was thrown away, corrupting the
+   picture until the next keyframe.
+2. **Display ≈ 3 refreshes** (49.5 ms, nearly constant): DXGI's default queue of up to 3
+   presented frames.
+3. **Queue**: frames waited for the vsync-paced render loop before decoding started.
+
+#### Phase 17 — awaiting measurement
+
+Same benchmark after the changes below. Compare against the table above.
+
+### Phase 17 changes (power and latency)
+
+| Change | Why (from the baseline) |
+|--------|-------------------------|
+| Hardware H.264 decoding: the decoder gets the renderer's D3D11 device (`IMFDXGIDeviceManager`); pictures stay on the GPU and are copied GPU→GPU into an NV12 texture sampled as R8 + R8G8. Software decoding is the automatic fallback. | Decode 102 ms avg on the CPU, video engine 0 %. Also removes the per-frame CPU copy and texture upload. |
+| Decoder: full output drained after every input and when frames are pending; on `MF_E_NOTACCEPTING` the input is resubmitted, not dropped. | Pictures waited for the next frame; dropped inputs corrupted the picture. |
+| Swap chain: frame-latency waitable object, maximum frame latency 1. The loop waits for the slot, *then* decodes whatever arrived and presents the newest picture. | Display ≈ 49.5 ms (3-frame queue). |
+| Event-driven render loop: sleeps in `MsgWaitForMultipleObjectsEx` until a frame arrives (event set by the network thread), a window message, or a timer. It renders only when the picture or overlay changed. | Rendered 60× per second even on a static screen; frames waited for the next vsync before decoding. |
+| Mac: VideoToolbox low-latency rate control with the Constrained High profile, hardware required (falls back to the normal encoder if refused). | Measured on M2 at 1080p: 9.2 → 6.7 ms avg, p95 12.3 → 7.0 ms, same bitrate, same CPU. Forced keyframes verified. |
+| Mac: preview paused while streaming (toggle to keep it). | Each preview is a GPU→CPU readback; the picture is on the PC anyway. |
+| Mac: `ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep)` while capturing. | App Nap would throttle the sender while its window is hidden, which is exactly when the PC display is in use. Idle sleep stays allowed. |
 
 ## Known limitations
 
@@ -153,7 +195,8 @@ Windows GPU, resolution).
 - **Network and Total** are accurate to ± the clock sync bound shown on the overlay. A sample
   slightly below zero (within the bound) is shown as 0; one further below is discarded.
 - **Mac GPU %** is not available (no public API).
-- **PC decode path**: the PC decodes to system memory (`ConvertToContiguousBuffer`), then
-  copies to a texture. That GPU→CPU→GPU path is inside Decode and Render. With real LAN numbers,
-  it is the first candidate for the next optimization: D3D11 decoder output with zero-copy
-  texture sampling.
+- **Software decoding fallback**: used when the GPU has no D3D11 video support, cannot sample
+  NV12, or rejects the stream. The console says `Decoder ... (SOFTWARE — CPU decoding)` and the
+  overlay shows `decode ... (CPU)`. Benchmark summaries record which decoder ran.
+- **Rendered FPS** (overlay, `rendered_fps` column) counts presents. A static screen with the
+  overlay hidden presents nothing, which is the intended power saving, not a stall.

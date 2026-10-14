@@ -15,7 +15,6 @@ add_executable(${PROJECT_NAME} WIN32
     src/App/Window.cpp
     src/App/CrashHandler.cpp
     src/Renderer/D3D11Renderer.cpp
-    src/Performance/FrameStats.cpp
     src/Performance/ClockSync.cpp
     src/Performance/PipelineMetrics.cpp
     src/Performance/SystemMonitor.cpp
