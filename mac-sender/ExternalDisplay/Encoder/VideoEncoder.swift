@@ -34,6 +34,9 @@ final class VideoEncoder {
     /// Whether hardware encoder was actually selected
     private(set) var isHardwareAccelerated = false
 
+    /// Whether VideoToolbox accepted low-latency rate control
+    private(set) var isLowLatencyRateControl = false
+
     // ── Private ─────────────────────────────────────────────────────────────
 
     private var session: VTCompressionSession?
@@ -77,20 +80,38 @@ final class VideoEncoder {
             encoderSpec[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = false
         }
 
-        // Create session with block-based output handler
+        // Phase 17: low-latency rate control; without it if this Mac refuses
+        var status: OSStatus = noErr
         var sessionOut: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: kCFAllocatorDefault,
-            width: config.width,
-            height: config.height,
-            codecType: kCMVideoCodecType_H264,
-            encoderSpecification: encoderSpec as CFDictionary,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: nil,       // Using encodeFrame's outputHandler instead
-            refcon: nil,
-            compressionSessionOut: &sessionOut
-        )
+        let attempts: [Bool] = config.lowLatencyRateControl ? [true, false] : [false]
+        for lowLatency in attempts {
+            var spec = encoderSpec
+            if lowLatency {
+                // The low-latency encoder can't report UsingHardwareAccelerated…
+                // (kVTPropertyNotSupportedErr), so require hardware instead: a
+                // session that gets created is then known to be hardware.
+                spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = true
+                spec[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true
+            }
+            // Create session with block-based output handler
+            status = VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                width: config.width,
+                height: config.height,
+                codecType: kCMVideoCodecType_H264,
+                encoderSpecification: spec as CFDictionary,
+                imageBufferAttributes: nil,
+                compressedDataAllocator: nil,
+                outputCallback: nil,       // Using encodeFrame's outputHandler instead
+                refcon: nil,
+                compressionSessionOut: &sessionOut
+            )
+            if status == noErr {
+                isLowLatencyRateControl = lowLatency
+                break
+            }
+            print("[Encoder] Session creation failed (low-latency: \(lowLatency), status \(status))")
+        }
 
         guard status == noErr, let session = sessionOut else {
             throw EncoderError.sessionCreationFailed(status)
@@ -145,6 +166,8 @@ final class VideoEncoder {
         }
         if hwStatus == noErr, let usingHardware {
             isHardwareAccelerated = CFBooleanGetValue(usingHardware)
+        } else if isLowLatencyRateControl {
+            isHardwareAccelerated = true   // created with RequireHardwareAcceleratedVideoEncoder
         }
 
         // Prepare to encode
@@ -155,7 +178,7 @@ final class VideoEncoder {
 
         print("[Encoder] Session created: \(config.width)×\(config.height) "
             + "\(config.profile.rawValue) @ \(config.bitrateMbps) Mbps, "
-            + "HW: \(isHardwareAccelerated)")
+            + "HW: \(isHardwareAccelerated), low-latency RC: \(isLowLatencyRateControl)")
     }
 
     // ── Runtime Bitrate Update ──────────────────────────────────────────────

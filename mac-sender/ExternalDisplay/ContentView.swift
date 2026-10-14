@@ -254,6 +254,16 @@ struct ContentView: View {
                                 Text("Looking for displays…")
                                     .foregroundStyle(.secondary)
 
+                            } else if engine.previewPaused {
+                                Image(systemName: "leaf")
+                                    .font(.system(size: 48))
+                                    .foregroundStyle(.green.opacity(0.6))
+                                Text("Preview paused while streaming — saves battery")
+                                    .foregroundStyle(.secondary)
+                                Text("The picture is on the Windows display. Turn on “Preview while streaming” to see it here.")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+
                             } else if engine.isCapturing {
                                 ProgressView()
                                 Text("Waiting for frames…")
@@ -305,11 +315,11 @@ struct ContentView: View {
                         .font(.system(.caption, design: .monospaced))
                 }
                 Spacer()
-                Toggle("Preview", isOn: $engine.previewEnabled)
+                Toggle("Preview while streaming", isOn: $engine.previewWhileStreaming)
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .font(.caption)
-                    .help("The preview copies frames from the GPU; turn it off to save CPU and battery")
+                    .help("The preview copies frames from the GPU; leave it off to save CPU and battery")
             }
 
             // Row 2: Encoder stats (when encoding)

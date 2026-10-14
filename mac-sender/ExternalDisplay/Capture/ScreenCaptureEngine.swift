@@ -4,7 +4,7 @@
 // Captures a selected display at up to 60 FPS via ScreenCaptureKit, then
 // feeds CVPixelBuffer frames to:
 //   1. VideoToolbox H.264 hardware encoder (GPU→GPU, all frames)
-//   2. CIContext → CGImage preview (≤ 10 FPS, downscaled, optional)
+//   2. CIContext → CGImage preview (≤ 10 FPS, downscaled; paused while streaming)
 //
 // Key design decisions:
 // - CVPixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally
@@ -30,14 +30,14 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     @Published var networkStats = NetworkStats()
     @Published var processUsage = ProcessUsage()
 
-    /// Live preview in the window. Off saves a full-frame GPU→CPU readback.
-    @Published var previewEnabled = true {
-        didSet {
-            let enabled = previewEnabled
-            captureQueue.async { [weak self] in self?.previewEnabledOnCaptureQueue = enabled }
-            if !enabled { capturedFrame = nil }
-        }
+    /// Live preview while streaming. Off by default (Phase 17): the picture is
+    /// on the Windows display anyway, and every preview is a GPU→CPU readback.
+    @Published var previewWhileStreaming = false {
+        didSet { updatePreviewGate() }
     }
+
+    /// True while streaming with the preview off (the UI explains why it is blank)
+    @Published private(set) var previewPaused = false
     @Published var isCapturing = false
     @Published var isEncoding = false
     @Published var availableDisplays: [SCDisplay] = []
@@ -83,6 +83,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     // ── Diagnostics (main thread) ───────────────────────────────────────────
     private var diagnosticsTimer: DispatchSourceTimer?
     private let processMetrics = ProcessMetrics()
+
+    /// Keeps App Nap from throttling us while the window is hidden (main thread)
+    private var streamingActivity: NSObjectProtocol?
 
     // ── Keyframe recovery (capture queue only) ──────────────────────────────
     /// Last complete frame — re-encoded on keyframe requests, because
@@ -375,7 +378,10 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Watch for connection state changes — auto-start streaming
             setupSenderObserver()
 
-            await MainActor.run { self.startDiagnosticsTimer() }
+            await MainActor.run {
+                self.startDiagnosticsTimer()
+                self.beginStreamingActivity()
+            }
 
             // After an auto-restart the receiver may still be streaming —
             // resend stream parameters (resolution may have changed)
@@ -414,6 +420,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         senderCancellable = nil
         diagnosticsTimer?.cancel()
         diagnosticsTimer = nil
+        endStreamingActivity()
 
         Task {
             do {
@@ -448,6 +455,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                     // Peer connected — begin streaming
                     self?.sender.startStreaming()
                 }
+                self?.updatePreviewGate(streaming: newState.isStreaming)
             }
     }
 
@@ -480,6 +488,33 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts,
                         duration: CMTime(value: 1, timescale: 60),
                         captureUs: captureUs, captureIsReal: captureIsReal)
+    }
+
+    // ── Power (Phase 17) ────────────────────────────────────────────────────
+
+    /// Main thread only. Pause the preview while streaming unless asked for.
+    private func updatePreviewGate(streaming: Bool? = nil) {
+        let paused = (streaming ?? sender.state.isStreaming) && !previewWhileStreaming
+        if previewPaused != paused { previewPaused = paused }
+        if paused { capturedFrame = nil }
+        captureQueue.async { [weak self] in self?.previewEnabledOnCaptureQueue = !paused }
+    }
+
+    /// Main thread only. App Nap would lower our priority and coalesce timers
+    /// when the window is hidden — exactly while the user works on the other
+    /// display. Idle system sleep stays allowed (forwarded input counts as activity).
+    private func beginStreamingActivity() {
+        guard streamingActivity == nil else { return }
+        streamingActivity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "Streaming to an external display")
+    }
+
+    private func endStreamingActivity() {
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
     }
 
     // ── Diagnostics (Phase 16) ──────────────────────────────────────────────
@@ -700,7 +735,7 @@ extension ScreenCaptureEngine: SCStreamOutput {
             return
         }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.previewEnabled else { return }
+            guard let self = self, !self.previewPaused else { return }
             self.capturedFrame = cgImage
         }
     }
