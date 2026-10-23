@@ -5,36 +5,55 @@
 // encoder bitrate to match network conditions.
 //
 // Design principles:
-// - Hysteresis: only change after 3 consecutive reports in same direction
+// - Hysteresis: up after 3 consecutive reports, down after 2 (react faster
+//   to trouble than to recovery)
 // - Smooth transitions: max 5 Mbps change per step
-// - Range: 8 Mbps (poor WiFi) to 40 Mbps (excellent WiFi)
-// - Default: 25 Mbps (balanced)
+// - Range: set by the user's QualityPreset (e.g. Balanced: 8 – 25 Mbps)
 // =============================================================================
 
 import Foundation
 
 /// Network quality tier
 enum QualityTier: String {
-    case excellent  // loss < 1%, RTT < 20ms  → target 40 Mbps
-    case good       // loss < 3%, RTT < 50ms  → target 25 Mbps
-    case fair       // loss < 5%, RTT < 100ms → target 15 Mbps
-    case poor       // loss > 5% or RTT > 100ms → target 8 Mbps
+    case excellent  // loss < 1%, RTT < 20ms  → preset maximum
+    case good       // loss < 3%, RTT < 50ms  → 70% of the maximum
+    case fair       // loss < 5%, RTT < 100ms → 45% of the maximum
+    case poor       // loss > 5% or RTT > 100ms → preset minimum
 }
 
 final class AdaptiveQualityController {
 
     // ── Configuration ───────────────────────────────────────────────────────
 
-    static let minBitrateBps  = 8_000_000    //  8 Mbps
-    static let maxBitrateBps  = 40_000_000   // 40 Mbps
-    static let defaultBitrate = 25_000_000   // 25 Mbps
     static let maxStepBps     = 5_000_000    //  5 Mbps per adjustment
     static let hysteresis     = 3            // consecutive reports needed
 
+    private(set) var minBitrateBps: Int
+    private(set) var maxBitrateBps: Int
+
     // ── State ───────────────────────────────────────────────────────────────
 
-    private(set) var currentBitrateBps: Int = defaultBitrate
+    private(set) var currentBitrateBps: Int
     private(set) var currentTier: QualityTier = .good
+
+    init(preset: QualityPreset = .balanced) {
+        minBitrateBps = preset.minBitrateBps
+        maxBitrateBps = preset.maxBitrateBps
+        currentBitrateBps = preset.startBitrateBps
+    }
+
+    /// The user changed the preset: new bounds now, clamped bitrate reported
+    func apply(_ preset: QualityPreset) {
+        minBitrateBps = preset.minBitrateBps
+        maxBitrateBps = preset.maxBitrateBps
+        let clamped = min(max(currentBitrateBps, minBitrateBps), maxBitrateBps)
+        consecutiveUp = 0
+        consecutiveDown = 0
+        if clamped != currentBitrateBps {
+            currentBitrateBps = clamped
+            onBitrateChange?(clamped)
+        }
+    }
 
     /// Called when bitrate should change. Parameter: new bitrate in bps.
     var onBitrateChange: ((Int) -> Void)?
@@ -96,7 +115,7 @@ final class AdaptiveQualityController {
 
         currentTier = tier
 
-        print("[Quality] Loss: \(String(format: "%.1f", lossPercent))%, "
+        Log.debug(.quality, "Loss: \(String(format: "%.1f", lossPercent))%, "
             + "Drops: \(framesDropped), Queue: \(queueDepth), "
             + "Tier: \(tier.rawValue), Bitrate: \(currentBitrateBps / 1_000_000) Mbps")
     }
@@ -125,12 +144,12 @@ final class AdaptiveQualityController {
         return .good
     }
 
-    private func bitrateForTier(_ tier: QualityTier) -> Int {
+    func bitrateForTier(_ tier: QualityTier) -> Int {
         switch tier {
-        case .excellent: return Self.maxBitrateBps
-        case .good:      return Self.defaultBitrate
-        case .fair:      return 15_000_000
-        case .poor:      return Self.minBitrateBps
+        case .excellent: return maxBitrateBps
+        case .good:      return max(minBitrateBps, maxBitrateBps * 7 / 10)
+        case .fair:      return max(minBitrateBps, maxBitrateBps * 45 / 100)
+        case .poor:      return minBitrateBps
         }
     }
 
@@ -140,9 +159,9 @@ final class AdaptiveQualityController {
         let newBitrate: Int
 
         if diff > 0 {
-            newBitrate = min(currentBitrateBps + step, Self.maxBitrateBps)
+            newBitrate = min(currentBitrateBps + step, maxBitrateBps)
         } else {
-            newBitrate = max(currentBitrateBps - step, Self.minBitrateBps)
+            newBitrate = max(currentBitrateBps - step, minBitrateBps)
         }
 
         if newBitrate != currentBitrateBps {

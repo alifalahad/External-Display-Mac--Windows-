@@ -14,6 +14,11 @@ add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
     src/App/Window.cpp
     src/App/CrashHandler.cpp
+    src/App/Log.cpp
+    src/App/Options.cpp
+    src/App/StatusText.cpp
+    src/App/MacFinder.cpp
+    src/App/ReceiverApp.cpp
     src/Renderer/D3D11Renderer.cpp
     src/Performance/ClockSync.cpp
     src/Performance/PipelineMetrics.cpp
@@ -24,6 +29,8 @@ add_executable(${PROJECT_NAME} WIN32
     src/Clipboard/ClipboardSync.cpp
     src/Discovery/ServiceDiscovery.cpp
     src/Security/PairingManager.cpp
+    src/Security/Crypto.cpp
+    src/Security/SecureChannel.cpp
     src/UI/PinPrompt.cpp
 )
 
@@ -43,6 +50,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     mfuuid
     ole32
     bcrypt
+    crypt32
     dbghelp
     pdh
     psapi
@@ -66,18 +74,38 @@ if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE "$<$<CONFIG:Release>:/DEBUG;/OPT:REF;/OPT:ICF>")
 endif()
 
-# Unit tests for the portable performance code (Phase 16):
-#   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build --config Release
-#   .\build\Release\PipelineMetricsTests.exe   (or .\build\PipelineMetricsTests.exe)
+# Tests (Phase 20):
+#   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build
+#   .\build\PipelineMetricsTests.exe   metrics, clock sync, benchmark files, payload layout
+#   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window
+#   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
+#   ctest --test-dir build               all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
+    enable_testing()
     add_executable(PipelineMetricsTests
         tests/PipelineMetricsTests.cpp
         src/Performance/ClockSync.cpp
         src/Performance/PipelineMetrics.cpp
     )
-    target_include_directories(PipelineMetricsTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    if(MSVC)
-        target_compile_options(PipelineMetricsTests PRIVATE /W4 /permissive-)
-    endif()
+    add_executable(AppLogicTests
+        tests/AppLogicTests.cpp
+        src/App/Options.cpp
+        src/App/StatusText.cpp
+        src/App/Log.cpp
+    )
+    add_executable(SecureChannelTests
+        tests/SecureChannelTests.cpp
+        src/Security/Crypto.cpp
+        src/Security/SecureChannel.cpp
+    )
+    target_link_libraries(SecureChannelTests PRIVATE bcrypt crypt32)
+    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests)
+        target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(${test} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+        if(MSVC)
+            target_compile_options(${test} PRIVATE /W4 /permissive-)
+        endif()
+        add_test(NAME ${test} COMMAND ${test})
+    endforeach()
 endif()

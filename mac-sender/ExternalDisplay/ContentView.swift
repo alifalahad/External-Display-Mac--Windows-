@@ -10,6 +10,7 @@ import ScreenCaptureKit
 
 struct ContentView: View {
     @StateObject private var engine = ScreenCaptureEngine()
+    @AppStorage("diagnosticsLogging") private var diagnosticsLogging = false
 
     // Virtual display resolution presets
     private let resolutionPresets: [(String, Int, Int)] = [
@@ -46,6 +47,14 @@ struct ContentView: View {
 
             Divider()
 
+            // ── Quality, privacy and diagnostics controls ───────────────────
+            controlsBar
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
             // ── Stats Bar ───────────────────────────────────────────────────
             statsBar
                 .padding(.horizontal, 16)
@@ -55,6 +64,75 @@ struct ContentView: View {
         .frame(minWidth: 800, minHeight: 600)
         .task {
             await engine.refreshDisplays()
+        }
+    }
+
+    // ── Controls (Phase 18) ─────────────────────────────────────────────────
+
+    private var controlsBar: some View {
+        HStack(spacing: 14) {
+            Text("Quality")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Quality", selection: $engine.qualityPreset) {
+                ForEach(QualityPreset.allCases) { preset in
+                    Text(preset.rawValue).tag(preset)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 320)
+            .help("Adaptive quality follows the network, up to this preset's limit")
+            Text(engine.qualityPreset.summary)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Toggle("Share clipboard", isOn: $engine.shareClipboard)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.caption)
+                .help("Copy and paste between the Mac and the PC (text). Off: nothing is shared either way")
+
+            Toggle("Preview while streaming", isOn: $engine.previewWhileStreaming)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.caption)
+                .help("The preview copies frames from the GPU; leave it off to save CPU and battery")
+
+            Menu {
+                if engine.pairingManager.pairedDevices.isEmpty {
+                    Text("No paired PCs yet")
+                } else {
+                    ForEach(engine.pairingManager.pairedDevices) { device in
+                        Button("Forget “\(device.name)”") {
+                            engine.pairingManager.unpair(deviceId: device.id)
+                        }
+                    }
+                }
+            } label: {
+                Label("Paired PCs (\(engine.pairingManager.pairedDevices.count))", systemImage: "lock.laptopcomputer")
+                    .font(.caption)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Receivers that may connect without a new pairing")
+
+            Menu {
+                Toggle("Diagnostics logging (more detail)", isOn: $diagnosticsLogging)
+                Button("Show Log in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: Log.filePath)])
+                }
+            } label: {
+                Image(systemName: "doc.text.magnifyingglass")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Logs: \(Log.filePath)")
+            .onChange(of: diagnosticsLogging) { enabled in
+                Log.diagnosticsEnabled = enabled
+            }
         }
     }
 
@@ -315,11 +393,6 @@ struct ContentView: View {
                         .font(.system(.caption, design: .monospaced))
                 }
                 Spacer()
-                Toggle("Preview while streaming", isOn: $engine.previewWhileStreaming)
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .font(.caption)
-                    .help("The preview copies frames from the GPU; leave it off to save CPU and battery")
             }
 
             // Row 2: Encoder stats (when encoding)
@@ -377,31 +450,11 @@ struct ContentView: View {
                 }
             }
 
-            // Row 4: Pairing PIN display
-            if let pin = engine.pairingManager.currentPIN {
-                HStack(spacing: 12) {
-                    Image(systemName: "key.fill")
-                        .foregroundStyle(.yellow)
-                        .font(.title3)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Pairing PIN — enter it on the Windows receiver")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-
-                        Text(pin)
-                            .font(.system(.title, design: .monospaced, weight: .bold))
-                            .foregroundStyle(.yellow)
-                    }
-
-                    if let deviceName = engine.pairingManager.pairingDeviceName {
-                        Text("for \(deviceName)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-                }
+            // Row 4: Pairing request (protocol v2)
+            if let request = engine.pairingManager.request {
+                PairingRequestView(request: request,
+                                   onPair: { engine.pairingManager.approve() },
+                                   onReject: { engine.pairingManager.reject() })
                 .padding(.vertical, 6)
                 .padding(.horizontal, 12)
                 .background(

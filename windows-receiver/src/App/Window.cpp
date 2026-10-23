@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "App/Window.h"
+#include "App/Log.h"
 #include "Input/InputCapture.h"
 #include <stdexcept>
 
@@ -252,6 +253,8 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
 
     case WM_KEYDOWN:
+        if (self && wp >= '1' && wp <= '9') self->digitKey_ = static_cast<int>(wp - '0');
+        if (self && wp >= VK_NUMPAD1 && wp <= VK_NUMPAD9) self->digitKey_ = static_cast<int>(wp - VK_NUMPAD0);
         if (wp == VK_ESCAPE) {
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return 0;
@@ -267,7 +270,7 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == VK_F3 && self && self->inputCapture_) {
             bool newState = !self->inputCapture_->isEnabled();
             self->inputCapture_->setEnabled(newState);
-            printf("[Input] %s\n", newState ? "ENABLED (F3)" : "DISABLED (F3)");
+            LOGF_INFO("Input", "Input forwarding %s (F3)", newState ? "enabled" : "disabled");
             if (newState) {
                 // Hide cursor when input capture is active
                 ShowCursor(FALSE);

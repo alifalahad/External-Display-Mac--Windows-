@@ -110,7 +110,7 @@ final class VideoEncoder {
                 isLowLatencyRateControl = lowLatency
                 break
             }
-            print("[Encoder] Session creation failed (low-latency: \(lowLatency), status \(status))")
+            Log.warning(.encoder, "Session creation failed (low-latency: \(lowLatency), status \(status))")
         }
 
         guard status == noErr, let session = sessionOut else {
@@ -176,7 +176,7 @@ final class VideoEncoder {
             throw EncoderError.prepareFailed(prepStatus)
         }
 
-        print("[Encoder] Session created: \(config.width)×\(config.height) "
+        Log.info(.encoder, "Session created: \(config.width)×\(config.height) "
             + "\(config.profile.rawValue) @ \(config.bitrateMbps) Mbps, "
             + "HW: \(isHardwareAccelerated), low-latency RC: \(isLowLatencyRateControl)")
     }
@@ -189,7 +189,12 @@ final class VideoEncoder {
         currentBitrateBps = newBps
         statsLock.unlock()
         applyBitrate(newBps)
-        print("[Encoder] Bitrate updated: \(newBps / 1_000_000) Mbps")
+        Log.info(.encoder, "Bitrate updated: \(newBps / 1_000_000) Mbps")
+    }
+
+    /// Quality preset changed the frame rate (helps VT allocate bits)
+    func updateFrameRate(_ fps: Int) {
+        setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
     }
 
     private func applyBitrate(_ bps: Int) {
@@ -251,7 +256,7 @@ final class VideoEncoder {
     /// Phase 15: the hardware encoder session can be invalidated (sleep/wake,
     /// GPU reset, media server restart). Rebuild it on the next frame.
     private func handleEncodeFailure(_ status: OSStatus) {
-        print("[Encoder] Encode error: \(status)")
+        Log.every(1, key: "encode-error", .error, .encoder, "Encode error: \(status)")
         if status == kVTInvalidSessionErr {
             controlLock.lock()
             sessionNeedsReset = true
@@ -261,7 +266,7 @@ final class VideoEncoder {
 
     /// Tear down and recreate the compression session (capture queue only)
     private func recreateSession() {
-        print("[Encoder] ♻️ Recreating compression session")
+        Log.info(.encoder, "Recreating compression session")
         if let old = session {
             VTCompressionSessionInvalidate(old)
             session = nil
@@ -269,7 +274,7 @@ final class VideoEncoder {
         do {
             try createSession()
         } catch {
-            print("[Encoder] Session recreation failed: \(error) — retrying on next frame")
+            Log.error(.encoder, "Session recreation failed: \(error) — retrying on next frame")
             controlLock.lock()
             sessionNeedsReset = true
             controlLock.unlock()
@@ -372,7 +377,7 @@ final class VideoEncoder {
             VTCompressionSessionInvalidate(session)
             self.session = nil
         }
-        print("[Encoder] Stopped. Encoded \(encodedFrameCount) frames, "
+        Log.info(.encoder, "Stopped. Encoded \(encodedFrameCount) frames, "
             + "\(encodedByteCount / 1024) KB total")
     }
 
@@ -382,7 +387,7 @@ final class VideoEncoder {
         guard let session = session else { return }
         let status = VTSessionSetProperty(session, key: key, value: value as CFTypeRef)
         if status != noErr {
-            print("[Encoder] Warning: Failed to set \(key): \(status)")
+            Log.warning(.encoder, "Failed to set \(key): \(status)")
         }
     }
 }

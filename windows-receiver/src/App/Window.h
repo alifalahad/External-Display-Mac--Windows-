@@ -52,6 +52,9 @@ public:
     // True once after the system resumes from sleep (Phase 15: reconnect immediately)
     bool TakeResumeEvent()       { bool r = resumed_; resumed_ = false; return r; }
 
+    // Last number key 1-9 pressed (0 = none), cleared on read — picks a Mac
+    int TakeDigitKey()           { int d = digitKey_; digitKey_ = 0; return d; }
+
 private:
     void RegisterWindowClass();
     void CreateFullscreenWindow(const wchar_t* title);
@@ -66,6 +69,7 @@ private:
     bool resized_    = false;
     bool showStats_  = true;
     bool resumed_    = false;
+    int  digitKey_   = 0;
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;

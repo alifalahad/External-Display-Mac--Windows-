@@ -38,6 +38,25 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     /// True while streaming with the preview off (the UI explains why it is blank)
     @Published private(set) var previewPaused = false
+
+    /// Clipboard sharing with the PC (both directions). Off = nothing copied
+    /// on either machine reaches the other.
+    @Published var shareClipboard = UserDefaults.standard.object(forKey: "shareClipboard") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(shareClipboard, forKey: "shareClipboard")
+            if shareClipboard { clipboardSync?.start() } else { clipboardSync?.stop() }
+            Log.info(.clipboard, "Clipboard sharing \(shareClipboard ? "on" : "off")")
+        }
+    }
+
+    /// Quality preset (Phase 18): frame rate and bitrate ceiling. Applies live.
+    @Published var qualityPreset = QualityPreset.saved {
+        didSet {
+            guard qualityPreset != oldValue else { return }
+            QualityPreset.saved = qualityPreset
+            applyQualityPreset()
+        }
+    }
     @Published var isCapturing = false
     @Published var isEncoding = false
     @Published var availableDisplays: [SCDisplay] = []
@@ -56,11 +75,14 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     override init() {
         super.init()
         // Wire pairing manager to sender immediately so it's ready
-        // before any connections arrive (fixes: PIN not asked)
+        // before any connections arrive
         sender.pairingManager = pairingManager
+        pairingManager.onDecision = { [weak self] deviceId, approved in
+            self?.sender.resolvePairing(deviceId: deviceId, approved: approved)
+        }
 
-        // ContentView only observes the engine; re-publish nested PIN changes
-        // so the PIN appears the moment it is generated.
+        // ContentView only observes the engine; re-publish nested pairing
+        // changes so a request appears the moment a receiver connects.
         pairingCancellable = pairingManager.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -128,9 +150,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     func startEncoder(width: Int, height: Int) {
         stopEncoder()
         do {
+            let preset = qualityPreset
             var config = EncoderConfig()
             config.width = Int32(width)
             config.height = Int32(height)
+            config.fps = Double(preset.fps)
+            config.bitrateBps = preset.startBitrateBps
             let enc = try VideoEncoder(config: config)
 
             enc.onEncodedFrame = { [weak self] sampleBuffer, isKeyframe, timing in
@@ -145,9 +170,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Configure sender with stream parameters
             sender.streamWidth = UInt32(width)
             sender.streamHeight = UInt32(height)
+            sender.streamFPS = UInt32(preset.fps)
+            sender.streamBitrate = UInt32(preset.startBitrateBps)
 
-            // Set up adaptive quality controller
-            let controller = AdaptiveQualityController()
+            // Set up adaptive quality controller (within the preset's bounds)
+            let controller = AdaptiveQualityController(preset: preset)
             controller.onBitrateChange = { [weak enc] newBps in
                 enc?.updateBitrate(newBps)
             }
@@ -174,7 +201,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 let bounds = virtualDisplayManager.getDisplayBounds()
                 injector.displayOriginX = bounds.origin.x
                 injector.displayOriginY = bounds.origin.y
-                print("[Engine] Input mapped to virtual display at (\(bounds.origin.x), \(bounds.origin.y))")
+                Log.info(.app, "Input mapped to virtual display at (\(bounds.origin.x), \(bounds.origin.y))")
             }
             inputInjector = injector
 
@@ -190,12 +217,13 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             clipboard.onClipboardChanged = { [weak self] data in
                 self?.sender.sendClipboardData(data)
             }
-            sender.onClipboardData = { [weak clipboard] data in
+            sender.onClipboardData = { [weak self, weak clipboard] data in
                 DispatchQueue.main.async {
+                    guard self?.shareClipboard == true else { return }   // sharing off: ignore
                     clipboard?.receiveRemoteClipboard(data)
                 }
             }
-            clipboard.start()
+            if shareClipboard { clipboard.start() }
             clipboardSync = clipboard
 
             DispatchQueue.main.async { [weak self] in
@@ -210,12 +238,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Phase 15: Set up sleep/wake observer
             setupSleepWakeObserver()
 
-            print("[Engine] Encoder started with adaptive quality + input forwarding + clipboard sync")
+            Log.info(.app, "Encoder started with adaptive quality + input forwarding + clipboard sync")
         } catch {
             DispatchQueue.main.async { [weak self] in
                 self?.errorMessage = "Encoder error: \(error.localizedDescription)"
             }
-            print("[Engine] Encoder error: \(error)")
+            Log.error(.app, "Encoder error: \(error)")
         }
     }
 
@@ -267,7 +295,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 // Store the error but simplify the message — full detail in logs
                 self.errorMessage = "Permission denied"
             }
-            print("[Capture] Permission error: \(error.localizedDescription)")
+            Log.error(.capture, "Permission error: \(error.localizedDescription)")
 
             // Auto-retry after 2s so user doesn't need to click Refresh
             // manually after granting permission in System Settings
@@ -290,13 +318,13 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             let vdID = virtualDisplayManager.virtualDisplayID
             if let vd = availableDisplays.first(where: { $0.displayID == vdID }) {
                 display = vd
-                print("[Capture] Using virtual display ID=\(vdID)")
+                Log.info(.capture, "Using virtual display ID=\(vdID)")
             } else {
                 // Virtual display not in the list yet — refresh and retry
                 await refreshDisplays()
                 if let vd = availableDisplays.first(where: { $0.displayID == vdID }) {
                     display = vd
-                    print("[Capture] Using virtual display ID=\(vdID) (after refresh)")
+                    Log.info(.capture, "Using virtual display ID=\(vdID) (after refresh)")
                 } else {
                     await MainActor.run {
                         self.errorMessage = "Virtual display not found in ScreenCaptureKit. Refresh displays."
@@ -337,8 +365,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             config.width = display.width
             config.height = display.height
 
-            // 60 FPS target
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            // Frame rate from the quality preset (60, or 30 for Battery Saver)
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(qualityPreset.fps))
 
             // BGRA pixel format — standard for display capture
             config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -389,7 +417,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             await MainActor.run { self.captureRestartAttempts = 0 }
 
             let modeStr = virtualDisplayManager.isActive ? "Virtual" : "Physical"
-            print("[Capture] Started (\(modeStr)): \(display.width)×\(display.height) @ 60 FPS")
+            Log.info(.capture, "Started (\(modeStr)): \(display.width)×\(display.height) @ \(qualityPreset.fps) FPS, "
+                     + "quality \(qualityPreset.rawValue)")
             return true
 
         } catch {
@@ -397,7 +426,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 self.errorMessage = "Capture failed: \(error.localizedDescription)"
                 self.isCapturing = false
             }
-            print("[Capture] Error: \(error)")
+            Log.error(.capture, "Error: \(error)")
             return false
         }
     }
@@ -426,13 +455,13 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             do {
                 try await stream?.stopCapture()
             } catch {
-                print("[Capture] Stop error: \(error)")
+                Log.error(.capture, "Stop error: \(error)")
             }
             await MainActor.run {
                 self.isCapturing = false
                 self.capturedFrame = nil
             }
-            print("[Capture] Stopped. Total frames: \(statsTracker.totalFrames)")
+            Log.info(.capture, "Stopped. Total frames: \(statsTracker.totalFrames)")
         }
     }
 
@@ -476,7 +505,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 // Old content: its real capture time would count the idle period as latency
                 self.encodeFrame(pixelBuffer, pts: pts, captureUs: HostClock.nowUs(), captureIsReal: false)
             }
-            print("[Engine] Keyframe forced")
+            Log.debug(.app, "Keyframe forced")
         }
     }
 
@@ -488,6 +517,33 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts,
                         duration: CMTime(value: 1, timescale: 60),
                         captureUs: captureUs, captureIsReal: captureIsReal)
+    }
+
+    // ── Quality (Phase 18) ──────────────────────────────────────────────────
+
+    /// Main thread. New ceiling for adaptive bitrate; new capture frame rate
+    /// without restarting the stream.
+    private func applyQualityPreset() {
+        let preset = qualityPreset
+        Log.info(.quality, "Quality preset: \(preset.rawValue) (\(preset.summary))")
+        qualityController?.apply(preset)
+        encoder?.updateFrameRate(preset.fps)
+        sender.streamFPS = UInt32(preset.fps)
+
+        guard let stream else { return }
+        let config = SCStreamConfiguration()
+        config.width = Int(stats.resolution.width)
+        config.height = Int(stats.resolution.height)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.showsCursor = true
+        config.queueDepth = 3
+        guard config.width > 0, config.height > 0 else { return }
+        stream.updateConfiguration(config) { error in
+            if let error {
+                Log.warning(.capture, "Could not change the frame rate: \(error.localizedDescription)")
+            }
+        }
     }
 
     // ── Power (Phase 17) ────────────────────────────────────────────────────
@@ -564,7 +620,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         guard failedStream === stream else { return }  // stale or user-stopped
 
         if let scError = error as? SCStreamError, scError.code == .userStopped {
-            print("[Capture] Stopped by user from system UI")
+            Log.info(.capture, "Stopped by user from system UI")
             stopCapture()
             errorMessage = "Capture stopped from the system menu"
             return
@@ -574,7 +630,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         captureRestartAttempts += 1
         let delay = min(pow(2.0, Double(captureRestartAttempts - 1)), 10.0)
         errorMessage = "Capture interrupted — restarting in \(Int(delay))s…"
-        print("[Capture] Restart attempt \(captureRestartAttempts) in \(delay)s")
+        Log.warning(.capture, "Restart attempt \(captureRestartAttempts) in \(delay)s")
 
         captureRestartTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -592,7 +648,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             vdm.isActive && !self.availableDisplays.contains { $0.displayID == vdm.virtualDisplayID }
         }
         if vdMissing {
-            print("[Capture] Virtual display missing — recreating")
+            Log.warning(.capture, "Virtual display missing — recreating")
             let (w, h) = await MainActor.run { (vdm.width, vdm.height) }
             await MainActor.run {
                 vdm.destroyDisplay()
@@ -608,7 +664,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 guard self.captureRestartTask?.isCancelled == false else { return }
                 self.captureRestartAttempts += 1
                 let delay = min(pow(2.0, Double(self.captureRestartAttempts - 1)), 10.0)
-                print("[Capture] Restart failed — retrying in \(delay)s")
+                Log.warning(.capture, "Restart failed — retrying in \(delay)s")
                 self.captureRestartTask = Task { [weak self] in
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     guard let self = self, !Task.isCancelled else { return }
@@ -629,7 +685,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self, self.isCapturing else { return }
-            print("[Engine] ⏰ System wake detected — forcing keyframe for stream recovery")
+            Log.info(.app, "System wake detected — forcing keyframe for stream recovery")
 
             // Force keyframe so receiver can resume decoding immediately
             self.requestKeyframe()
@@ -639,7 +695,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             forName: NSWorkspace.willSleepNotification,
             object: nil, queue: .main
         ) { _ in
-            print("[Engine] 💤 System going to sleep")
+            Log.info(.app, "System going to sleep")
         }
 
         sleepWakeObservers = [wakeObs, sleepObs]
@@ -686,7 +742,7 @@ extension ScreenCaptureEngine: SCStreamOutput {
         case .blank, .suspended, .stopped:
             return
         case .started:
-            print("[Capture] Stream started")
+            Log.debug(.capture, "Stream started")
             return
         @unknown default:
             return
@@ -746,7 +802,7 @@ extension ScreenCaptureEngine: SCStreamOutput {
 extension ScreenCaptureEngine: SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("[Capture] Stream stopped with error: \(error)")
+        Log.error(.capture, "Stream stopped with error: \(error)")
         Task { @MainActor [weak self] in
             self?.handleCaptureStopped(stream, error: error)
         }
