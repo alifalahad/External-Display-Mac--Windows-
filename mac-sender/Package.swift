@@ -2,7 +2,7 @@
 // =============================================================================
 // Package.swift — Mac Sender (External Display)
 // =============================================================================
-// Build: swift build
+// Build: swift build      Test: swift test (or xcodebuild test, see BUILD.md)
 // Run:   swift run ExternalDisplay
 // Xcode: open Package.swift  (opens in Xcode, press ⌘R to run)
 // =============================================================================
@@ -18,6 +18,12 @@ let package = Package(
         .executableTarget(
             name: "ExternalDisplay",
             path: "ExternalDisplay"
+        ),
+        // Phase 20: xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
+        .testTarget(
+            name: "ExternalDisplayTests",
+            dependencies: ["ExternalDisplay"],
+            path: "Tests/ExternalDisplayTests"
         )
     ]
 )
