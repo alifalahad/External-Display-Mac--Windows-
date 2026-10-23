@@ -95,13 +95,8 @@ For comparable numbers:
 ## Unit tests
 
 The latency arithmetic, clock sync, percentiles, jitter, rates, benchmark files and payload
-layout are plain C++ (no Windows headers):
-
-```powershell
-cmake -B build -DEXDP_BUILD_TESTS=ON
-cmake --build build --config Release
-.\build\Release\PipelineMetricsTests.exe
-```
+layout are tested by `PipelineMetricsTests` (plain C++, any OS). The full test list is in
+[TESTING.md](TESTING.md).
 
 ## Results so far
 
@@ -168,9 +163,44 @@ What it showed:
    presented frames.
 3. **Queue**: frames waited for the vsync-paced render loop before decoding started.
 
-#### Phase 17 — awaiting measurement
+#### Phase 17 / version 2 — awaiting measurement
 
-Same benchmark after the changes below. Compare against the table above.
+Same benchmark after the changes below. Compare against the table above. The benchmark summary
+now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
+different laptops can be compared.
+
+### Encryption cost (protocol v2)
+
+AES-256-GCM over every video packet, measured on an M2 with CryptoKit (Release build). Packets
+are 1,348-byte payloads:
+
+| Stream | Packets/s | CPU for encryption |
+|---|---:|---:|
+| 25 Mbps | 2,250 | 4.2 ms/s (0.4 % of one core) |
+| 40 Mbps | 3,600 | 8.0 ms/s (0.8 % of one core) |
+
+Adds 24 bytes per datagram (8-byte counter + 16-byte tag): 1.7 % of a full packet. Windows
+decryption uses CNG (AES-NI); it is not measured here, because Wine's numbers would not represent
+real Windows. The benchmark's PC CPU column shows it on real hardware.
+
+### Soak: 10 minutes, encrypted, localhost
+
+2026-10-23, Apple M2: the Mac sender harness (real StreamSender, VideoToolbox, AES-GCM; 720p60
+synthetic frames) streamed to the Windows receiver networking code (MinGW build under Wine)
+for 10 minutes. The Mac sender's memory was sampled every 30 s:
+
+| Time | 0 s | 1 min | 2 min | 3 min | 4 min | 5 min | 6 min | 7 min | 8 min | 9 min | 10 min |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Mac RSS (MB) | 47.2 (start-up) | 22.5 | 22.1 | 18.7 | 22.1 | 17.7 | 21.2 | 16.3 | 16.2 | 16.3 | 19.8 |
+| Mac CPU (% of one core) | 26 | 23 | 25 | 18 | 13 | 16 | 23 | 25 | 24 | 28 | 29 |
+
+Result: **35,986 of 35,986 frames received, 0 lost, 0 bad start codes, 600 keyframes**, every
+frame with timing. Encode 5.8 ms avg, network 1.1 ms avg, RTT 0.7 ms, clock sync ± 0.23 ms.
+Memory stays between 16 and 23 MB after start-up with no upward trend: no leak in the sender,
+encryption or statistics paths. Most of the CPU is the harness drawing its synthetic frames.
+
+This covers the code, not the hardware: the GPU, decoder and Wi-Fi need the real-hardware
+stress runs in [TESTING.md](TESTING.md#stress-30-min--1-h--4-h).
 
 ### Phase 17 changes (power and latency)
 
