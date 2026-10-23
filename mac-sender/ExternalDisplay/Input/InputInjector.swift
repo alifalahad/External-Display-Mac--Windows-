@@ -52,11 +52,10 @@ final class InputInjector {
         // CGWarpMouseCursorPosition works without it (mouse movement only)
         hasAccessibility = AXIsProcessTrusted()
         if hasAccessibility {
-            print("[Input] ✅ Accessibility permission granted")
+            Log.info(.input, "Accessibility permission granted")
         } else {
-            print("[Input] ⚠️ Accessibility NOT granted — clicks & keyboard will NOT work!")
-            print("[Input] → Go to: System Settings → Privacy & Security → Accessibility")
-            print("[Input] → Add this app, then RESTART the app")
+            Log.warning(.input, "Accessibility permission missing — clicks and keyboard from Windows will not work. "
+                        + "System Settings → Privacy & Security → Accessibility: add this app, then restart it")
             // Show the system prompt to guide the user
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             AXIsProcessTrustedWithOptions(options)
@@ -88,8 +87,6 @@ final class InputInjector {
 
     // ── Mouse Handling ──────────────────────────────────────────────────────
 
-    private var debugLogCounter: Int = 0
-
     private func handleMouseMove(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
         lastMousePos = point
@@ -110,11 +107,8 @@ final class InputInjector {
                                    mouseButton: .left) else { return }
         event.post(tap: .cghidEventTap)
 
-        // Debug: log first few events and then every 100th
-        debugLogCounter += 1
-        if debugLogCounter <= 3 || debugLogCounter % 100 == 0 {
-            print("[Input] Mouse → (\(String(format: "%.0f", point.x)), \(String(format: "%.0f", point.y))) [norm: \(String(format: "%.3f", p.x)), \(String(format: "%.3f", p.y))]")
-        }
+        Log.every(2, key: "mouse-move", .trace, .input,
+                  "Mouse → (\(String(format: "%.0f", point.x)), \(String(format: "%.0f", point.y))) [norm: \(String(format: "%.3f", p.x)), \(String(format: "%.3f", p.y))]")
     }
 
     private func handleMouseDown(_ p: InputEventPayload) {
@@ -200,7 +194,7 @@ final class InputInjector {
 
     private func handleKeyDown(_ p: InputEventPayload) {
         guard let macKeyCode = windowsVKToMacKeyCode(p.keyCode) else {
-            print("[Input] Key down: VK=0x\(String(p.keyCode, radix: 16)) — unmapped")
+            Log.debug(.input, "Key down: Windows key code 0x\(String(p.keyCode, radix: 16)) has no Mac equivalent")
             return
         }
 
@@ -209,7 +203,7 @@ final class InputInjector {
                                    keyDown: true) else { return }
         applyModifiers(event, modifiers: p.modifiers)
         event.post(tap: .cghidEventTap)
-        print("[Input] Key down: VK=0x\(String(p.keyCode, radix: 16)) → mac=\(macKeyCode)")
+        // No per-key logging: the log would become a keylogger
     }
 
     private func handleKeyUp(_ p: InputEventPayload) {
@@ -247,17 +241,22 @@ final class InputInjector {
 
     // ── Coordinate Mapping ──────────────────────────────────────────────────
 
-    private func normalizedToDisplay(x: Float, y: Float) -> CGPoint {
+    /// Receiver coordinates (0…1 across the streamed display) → global Mac
+    /// points. Clamped: the pointer can never leave the streamed display,
+    /// whatever the receiver sends (NaN counts as 0).
+    func normalizedToDisplay(x: Float, y: Float) -> CGPoint {
+        func unit(_ v: Float) -> CGFloat { v.isNaN ? 0 : CGFloat(min(max(v, 0), 1)) }
+        // The last pixel row/column is width-1 / height-1
         return CGPoint(
-            x: displayOriginX + CGFloat(x) * displayWidth,
-            y: displayOriginY + CGFloat(y) * displayHeight
+            x: displayOriginX + unit(x) * max(displayWidth - 1, 0),
+            y: displayOriginY + unit(y) * max(displayHeight - 1, 0)
         )
     }
 
     // ── Windows VK → macOS Key Code Mapping ─────────────────────────────────
 
     // swiftlint:disable cyclomatic_complexity function_body_length
-    private func windowsVKToMacKeyCode(_ vk: UInt16) -> UInt16? {
+    func windowsVKToMacKeyCode(_ vk: UInt16) -> UInt16? {
         switch vk {
         // Letters A-Z (Windows VK_A=0x41 → VK_Z=0x5A)
         case 0x41: return UInt16(kVK_ANSI_A)

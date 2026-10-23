@@ -23,6 +23,10 @@ public:
 
     /// Enable/disable input capture
     void setEnabled(bool enabled) { m_enabled = enabled; }
+
+    /// Stream width / height: mouse positions are mapped through the
+    /// letterboxed video rectangle, not the whole window (0 = whole window)
+    void setVideoAspect(float aspect) { m_videoAspect = aspect; }
     bool isEnabled() const { return m_enabled; }
 
     // ── Input event handlers (called from WndProc) ──────────────────────────
@@ -44,6 +48,7 @@ private:
     SendCallback m_sendCallback;
     uint32_t m_videoW = 0, m_videoH = 0;
     bool m_enabled = false;
+    float m_videoAspect = 0.0f;
 
     // Mouse move throttle (max 120 events/sec)
     std::chrono::steady_clock::time_point m_lastMouseMove;

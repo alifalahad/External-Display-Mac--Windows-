@@ -8,15 +8,12 @@
 #include <Windows.h>
 
 #include "Input/InputCapture.h"
+#include "Input/VideoViewport.h"
 
 void InputCapture::normalizeCoords(int wx, int wy, int ww, int wh,
                                     float& outX, float& outY) {
-    // Clamp to window bounds
-    if (ww <= 0 || wh <= 0) { outX = outY = 0; return; }
-    float nx = (float)wx / (float)ww;
-    float ny = (float)wy / (float)wh;
-    outX = (nx < 0) ? 0 : (nx > 1.0f) ? 1.0f : nx;
-    outY = (ny < 0) ? 0 : (ny > 1.0f) ? 1.0f : ny;
+    // Through the same letterbox/pillarbox rectangle the renderer draws into
+    WindowToVideo(wx, wy, ww, wh, m_videoAspect, outX, outY);
 }
 
 uint32_t InputCapture::getModifiers() const {
