@@ -27,6 +27,7 @@
 
 #include "Protocol.h"
 #include "../Security/PairingManager.h"
+#include "../Security/SecureChannel.h"
 #include "../Performance/ClockSync.h"
 #include "../Performance/PipelineMetrics.h"
 #include <winsock2.h>
@@ -101,21 +102,34 @@ public:
     void setHostResolver(HostResolver resolver) { m_hostResolver = std::move(resolver); }
 
     /// Request a keyframe from the sender (decoder reset / recovery)
-    void requestKeyframe() { tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
+    void requestKeyframe() { if (isSecure()) tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
 
-    // ── Pairing (PIN is entered on the UI thread, never on the network thread) ──
+    // ── Pairing (the code is typed on the UI thread, never on the network thread) ──
 
-    /// Returns true once per PIN challenge. outRequestId identifies the
-    /// connection the PIN belongs to.
-    bool takePinRequest(uint32_t& outRequestId);
+    /// Returns true once per new pairing. outRequestId identifies the
+    /// connection the verification code belongs to.
+    bool takeCodeRequest(uint32_t& outRequestId);
 
-    /// True while the Mac is still waiting for the PIN of that request
-    bool isPinRequestCurrent(uint32_t requestId) const {
+    /// True while that pairing is still waiting for the code
+    bool isCodeRequestCurrent(uint32_t requestId) const {
         return requestId != 0 && m_pinWantedFor.load() == requestId;
     }
 
-    /// Send the PIN typed by the user. Ignored if the request went stale.
-    void submitPIN(uint32_t requestId, const std::string& pin);
+    /// A new pairing is waiting for the user to type the code
+    bool isAwaitingCode() const { return m_pinWantedFor.load() != 0; }
+
+    enum class CodeResult { Sent, Mismatch, Expired };
+
+    /// Check the code the user typed against the one this side derived from
+    /// the handshake. A match is confirmed to the Mac; a mismatch means a
+    /// typo or someone in the middle — the connection restarts with a new code.
+    CodeResult submitVerificationCode(uint32_t requestId, const std::string& code);
+
+    /// A pairing problem the user should see (empty if none); cleared on read
+    std::string takeUserMessage();
+
+    /// The session is authenticated and encrypted
+    bool isSecure() const { return std::atomic_load(&m_session) != nullptr; }
 
     // ── Stats ───────────────────────────────────────────────────────────────
 
@@ -185,7 +199,8 @@ private:
     bool tcpConnect(const std::string& hostIP);
     void tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen,
                         uint64_t timestamp = 0);
-    bool tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload);
+    bool tcpReceiveMessage(exdp::ProtocolHeader& header, uint8_t rawHeader[exdp::HEADER_SIZE],
+                           std::vector<uint8_t>& payload);
     bool recvExact(uint8_t* dst, size_t len);
     void closeTcpSocket();
     void closeUdpSocket();
@@ -216,10 +231,12 @@ private:
     /// Ask the Mac for a keyframe after loss (at most once per interval)
     void requestKeyframeAfterLoss();
 
-    /// Handle pairing messages. Return false when the connection must be dropped.
-    bool handlePairChallenge(const std::vector<uint8_t>& payload);
-    void handlePairAccept(const std::vector<uint8_t>& payload);
-    bool handlePairReject();
+    /// Handshake (protocol v2). Return false when the connection must be dropped.
+    void sendHello();
+    bool handleKeyExchange(const std::vector<uint8_t>& payload);
+    bool handlePairAccept(const std::vector<uint8_t>& payload);
+    bool handlePairReject(const std::vector<uint8_t>& payload);
+    void setUserMessage(const std::string& text);
 
     // ── State ───────────────────────────────────────────────────────────────
 
@@ -235,6 +252,22 @@ private:
 
     // PIN handshake state, shared between network and UI threads
     std::atomic<uint32_t> m_connectionId{0};    // incremented per TCP connection
+    std::string m_currentHost;                  // network thread
+
+    // Handshake of the current connection (network thread; keys also read by
+    // the UI thread when the user submits the code → m_handshakeMutex)
+    std::mutex m_handshakeMutex;
+    std::unique_ptr<crypto::EcdhKeyPair> m_ephemeral;
+    crypto::Bytes m_helloBytes;
+    std::unique_ptr<SessionKeys> m_handshakeKeys;
+
+    // Set (under m_sendMutex) when PAIR_ACCEPT verified; read lock-free by the
+    // UDP thread via std::atomic_load
+    std::shared_ptr<SecureSession> m_session;
+
+    std::mutex m_messageMutex;
+    std::string m_userMessage;
+    bool m_versionMismatch = false;             // network thread
     std::atomic<uint32_t> m_pinWantedFor{0};    // connection awaiting a PIN (0 = none)
     std::atomic<bool> m_pinRequestNew{false};   // not yet picked up by the UI
 

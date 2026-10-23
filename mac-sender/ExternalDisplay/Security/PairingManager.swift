@@ -1,212 +1,183 @@
 // =============================================================================
-// PairingManager.swift — Secure device pairing for External Display
+// PairingManager.swift — Paired receivers and pairing approval (protocol v2)
 // =============================================================================
-// Manages PIN-based pairing and HMAC challenge-response authentication.
+// Pairing (see SecureChannel.swift):
+//   1. An unknown receiver connects → a request appears in the app with the
+//      6-digit verification code both sides derived from the handshake.
+//   2. The user types the code on Windows. Windows refuses a wrong code; a
+//      right one is confirmed to the Mac (HMAC over the handshake).
+//   3. The user clicks "Pair" here. Only now is the receiver trusted.
+// The pairing key is derived on both sides — it never crosses the network.
 //
-// First connection:
-//   1. Mac generates 6-digit PIN, shows in UI
-//   2. Windows user enters PIN
-//   3. If correct, Mac generates 256-bit pairing key
-//   4. Key saved on both sides for future auto-authentication
-//
-// Reconnection:
-//   1. Mac sends random nonce
-//   2. Windows computes HMAC-SHA256(nonce, pairingKey) and sends back
-//   3. Mac verifies → auto-authenticated
-//
-// Uses CryptoKit for HMAC-SHA256 and SecRandomCopyBytes for secure RNG.
+// Storage: ~/Library/Application Support/ExternalDisplay/pairings-v2.json,
+// owner-only (0600). The Keychain would be the choice for a signed release
+// build; ad-hoc signed development builds get a Keychain prompt after every
+// rebuild (see docs/SECURITY.md). Version 1 pairings are deleted: their keys
+// were sent over the network in plaintext.
 // =============================================================================
 
 import Foundation
-import CryptoKit
+
+/// A pairing waiting for the user (UI state)
+struct PairingRequest: Equatable {
+    let deviceId: String
+    let deviceName: String
+    let verificationCode: String     // shown to the user only, never logged
+    var windowsConfirmed: Bool       // Windows entered the right code
+}
 
 final class PairingManager: ObservableObject {
 
-    // ── Published state (for UI) ────────────────────────────────────────────
+    // ── Published state (main thread) ───────────────────────────────────────
 
-    /// Currently displayed PIN (nil when not pairing)
-    @Published var currentPIN: String?
+    /// The pairing the user is asked to approve (nil when none)
+    @Published private(set) var request: PairingRequest?
 
-    /// Name of the device being paired
-    @Published var pairingDeviceName: String?
+    /// Paired receivers, for the UI (name, id, date)
+    @Published private(set) var pairedDevices: [PairedDeviceInfo] = []
 
-    // ── Internal state ──────────────────────────────────────────────────────
-
-    private var pairedDevices: [String: PairedDevice] = [:]  // keyed by deviceId
-    private var pendingPIN: String?
-    private var pendingPairingKey: Data?
-    private var pendingNonce: Data?
-
-    /// Codable struct for persistence
-    struct PairedDevice: Codable {
+    struct PairedDeviceInfo: Identifiable, Equatable {
+        let id: String
         let name: String
-        let pairingKey: Data     // 32 bytes
         let pairedAt: Date
     }
 
-    // ── Lifecycle ───────────────────────────────────────────────────────────
+    /// Called on the main thread when the user approves or rejects `request`
+    var onDecision: ((_ deviceId: String, _ approved: Bool) -> Void)?
 
-    init() {
-        loadPairedDevices()
-        print("[Pairing] Loaded \(pairedDevices.count) paired device(s)")
+    // ── Storage ─────────────────────────────────────────────────────────────
+
+    private struct StoredDevice: Codable {
+        let name: String
+        let pairingKey: Data     // 32 bytes, derived during pairing
+        let pairedAt: Date
     }
 
-    // ── Pairing Check ───────────────────────────────────────────────────────
+    private var devices: [String: StoredDevice] = [:]   // keyed by device ID
+    private let lock = NSLock()                          // devices: network queue + main
+    private let directory: URL
 
-    /// Check if a device with the given ID is already paired
-    func isPaired(deviceId: String) -> Bool {
-        return !deviceId.isEmpty && pairedDevices[deviceId] != nil
+    init(directory: URL? = nil) {
+        self.directory = directory ?? FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ExternalDisplay", isDirectory: true)
+        removeLegacyPairings()
+        load()
+        Log.info(.pairing, "Loaded \(devices.count) paired receiver(s)")
     }
 
-    // ── PIN Pairing (First Time) ────────────────────────────────────────────
+    // ── Queries (any thread) ────────────────────────────────────────────────
 
-    /// Generate a new 6-digit PIN for pairing a new device.
-    /// Returns the PIN string. Shows it in the UI.
-    func generatePIN(forDevice deviceName: String) -> String {
-        let pin = String(format: "%06d", Int.random(in: 0...999999))
+    func pairingKey(for deviceId: String) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return deviceId.isEmpty ? nil : devices[deviceId]?.pairingKey
+    }
 
-        pendingPIN = pin
-        pendingPairingKey = generateRandomBytes(32)
+    // ── Pairing requests (network queue → main) ─────────────────────────────
 
+    func beginRequest(deviceId: String, deviceName: String, verificationCode: String) {
+        let request = PairingRequest(deviceId: deviceId, deviceName: deviceName,
+                                     verificationCode: verificationCode, windowsConfirmed: false)
+        DispatchQueue.main.async { [weak self] in self?.request = request }
+        Log.info(.pairing, "Pairing request from '\(deviceName)' — waiting for the code on Windows")
+    }
+
+    func markWindowsConfirmed(deviceId: String) {
         DispatchQueue.main.async { [weak self] in
-            self?.currentPIN = pin
-            self?.pairingDeviceName = deviceName
+            guard let self, var current = self.request, current.deviceId == deviceId else { return }
+            current.windowsConfirmed = true
+            self.request = current
         }
-
-        print("[Pairing] PIN generated for '\(deviceName)': \(pin)")
-        return pin
+        Log.info(.pairing, "Windows entered the correct verification code — waiting for approval")
     }
 
-    /// Validate the PIN entered by the Windows user.
-    /// Returns the 256-bit pairing key on success, nil on failure.
-    func validatePIN(_ enteredPIN: String, deviceId: String, deviceName: String) -> Data? {
-        guard let expectedPIN = pendingPIN,
-              let key = pendingPairingKey,
-              enteredPIN == expectedPIN else {
-            print("[Pairing] ❌ PIN rejected (entered: '\(enteredPIN)')")
-            return nil
-        }
-
-        // Save the pairing
-        pairedDevices[deviceId] = PairedDevice(
-            name: deviceName,
-            pairingKey: key,
-            pairedAt: Date()
-        )
-        savePairedDevices()
-
-        // Clear pending state
-        pendingPIN = nil
-        pendingPairingKey = nil
-
-        DispatchQueue.main.async { [weak self] in
-            self?.currentPIN = nil
-            self?.pairingDeviceName = nil
-        }
-
-        print("[Pairing] ✅ Paired with '\(deviceName)' (id: \(deviceId.prefix(16))…)")
-        return key
+    func cancelRequest() {
+        DispatchQueue.main.async { [weak self] in self?.request = nil }
     }
 
-    /// Cancel an in-progress PIN pairing
-    func cancelPairing() {
-        pendingPIN = nil
-        pendingPairingKey = nil
-        DispatchQueue.main.async { [weak self] in
-            self?.currentPIN = nil
-            self?.pairingDeviceName = nil
+    // ── User decision (main thread) ─────────────────────────────────────────
+
+    func approve() {
+        guard let current = request, current.windowsConfirmed else { return }
+        request = nil
+        onDecision?(current.deviceId, true)
+    }
+
+    func reject() {
+        guard let current = request else { return }
+        request = nil
+        onDecision?(current.deviceId, false)
+    }
+
+    // ── Storing pairings ────────────────────────────────────────────────────
+
+    func savePairing(deviceId: String, deviceName: String, pairingKey: Data) {
+        lock.lock()
+        devices[deviceId] = StoredDevice(name: deviceName, pairingKey: pairingKey, pairedAt: Date())
+        lock.unlock()
+        save()
+        Log.info(.pairing, "Paired with '\(deviceName)'")
+    }
+
+    /// Forget a receiver: it must pair again
+    func unpair(deviceId: String) {
+        lock.lock()
+        let removed = devices.removeValue(forKey: deviceId)
+        lock.unlock()
+        if let removed {
+            save()
+            Log.info(.pairing, "Forgot '\(removed.name)'")
         }
-    }
-
-    // ── HMAC Challenge-Response (Reconnection) ──────────────────────────────
-
-    /// Generate a random 32-byte nonce for HMAC challenge.
-    /// Stores it internally for later validation.
-    func generateNonce() -> Data {
-        let nonce = generateRandomBytes(32)
-        pendingNonce = nonce
-        return nonce
-    }
-
-    /// Validate the HMAC response from a previously paired device.
-    func validateHMAC(deviceId: String, receivedHMAC: Data) -> Bool {
-        guard let device = pairedDevices[deviceId],
-              let nonce = pendingNonce else {
-            print("[Pairing] ❌ HMAC validation failed — device not paired or no nonce")
-            return false
-        }
-
-        // Verify HMAC-SHA256(nonce, pairingKey) — constant-time comparison
-        let key = SymmetricKey(data: device.pairingKey)
-
-        pendingNonce = nil  // Consume the nonce
-
-        if HMAC<SHA256>.isValidAuthenticationCode(receivedHMAC, authenticating: nonce, using: key) {
-            print("[Pairing] ✅ HMAC verified for '\(device.name)'")
-            return true
-        } else {
-            print("[Pairing] ❌ HMAC mismatch for '\(device.name)'")
-            return false
-        }
-    }
-
-    /// Get the pairing key for a device (for sending in PairAccept)
-    func getPairingKey(for deviceId: String) -> Data? {
-        return pairedDevices[deviceId]?.pairingKey
-    }
-
-    // ── Device Management ───────────────────────────────────────────────────
-
-    /// Remove a paired device (forget)
-    func unpairDevice(deviceId: String) {
-        if let device = pairedDevices.removeValue(forKey: deviceId) {
-            savePairedDevices()
-            print("[Pairing] Removed pairing for '\(device.name)'")
-        }
-    }
-
-    /// Get list of all paired devices
-    func listPairedDevices() -> [(id: String, name: String, date: Date)] {
-        return pairedDevices.map { ($0.key, $0.value.name, $0.value.pairedAt) }
-    }
-
-    // ── Crypto Helpers ──────────────────────────────────────────────────────
-
-    private func generateRandomBytes(_ count: Int) -> Data {
-        var bytes = [UInt8](repeating: 0, count: count)
-        let status = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
-        if status != errSecSuccess {
-            // Fallback — less secure but functional
-            bytes = (0..<count).map { _ in UInt8.random(in: 0...255) }
-        }
-        return Data(bytes)
     }
 
     // ── Persistence ─────────────────────────────────────────────────────────
 
-    private var storageURL: URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask
-        ).first!.appendingPathComponent("ExternalDisplay")
+    private var storeURL: URL { directory.appendingPathComponent("pairings-v2.json") }
 
-        // Create directory if it doesn't exist
-        try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
-
-        return appSupport.appendingPathComponent("paired_devices.json")
-    }
-
-    private func loadPairedDevices() {
-        guard let data = try? Data(contentsOf: storageURL),
-              let devices = try? JSONDecoder().decode([String: PairedDevice].self, from: data) else {
+    private func load() {
+        guard let data = try? Data(contentsOf: storeURL),
+              let decoded = try? JSONDecoder().decode([String: StoredDevice].self, from: data) else {
+            publishDeviceList()
             return
         }
-        pairedDevices = devices
+        lock.lock()
+        devices = decoded.filter { $0.value.pairingKey.count == 32 }
+        lock.unlock()
+        publishDeviceList()
     }
 
-    private func savePairedDevices() {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        guard let data = try? encoder.encode(pairedDevices) else { return }
-        try? data.write(to: storageURL)
+    private func save() {
+        lock.lock()
+        let snapshot = devices
+        lock.unlock()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(snapshot)
+            // Created owner-only before any key is written into it
+            FileManager.default.createFile(atPath: storeURL.path, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
+            try data.write(to: storeURL, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
+        } catch {
+            Log.error(.pairing, "Saving pairings failed: \(error.localizedDescription)")
+        }
+        publishDeviceList()
+    }
+
+    private func publishDeviceList() {
+        lock.lock()
+        let list = devices.map { PairedDeviceInfo(id: $0.key, name: $0.value.name, pairedAt: $0.value.pairedAt) }
+            .sorted { $0.pairedAt > $1.pairedAt }
+        lock.unlock()
+        DispatchQueue.main.async { [weak self] in self?.pairedDevices = list }
+    }
+
+    private func removeLegacyPairings() {
+        let legacy = directory.appendingPathComponent("paired_devices.json")
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            try? FileManager.default.removeItem(at: legacy)
+            Log.warning(.pairing, "Removed protocol v1 pairings (their keys were sent unencrypted) — pair again")
+        }
     }
 }

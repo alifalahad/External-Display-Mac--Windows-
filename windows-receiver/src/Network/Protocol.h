@@ -8,6 +8,12 @@
 //   Sequence(4) | Timestamp(8) | PayloadLen(4) | CRC32(4)
 //
 // All multi-byte integers are little-endian on the wire.
+//
+// Version 2: every message after the handshake is AES-256-GCM encrypted
+// (FLAG_ENCRYPTED, header = associated data, CRC field 0):
+//   TCP: header | ciphertext | tag(16)                 nonce counter implicit
+//   UDP: header | counter(8, big-endian) | ciphertext | tag
+// See Security/SecureChannel.h and docs/PROTOCOL.md.
 // =============================================================================
 
 #pragma once
@@ -22,11 +28,14 @@ namespace exdp {
 // ── Constants ───────────────────────────────────────────────────────────────
 
 constexpr uint32_t PROTOCOL_MAGIC   = 0x50445845;  // "EXDP" little-endian
-constexpr uint8_t  PROTOCOL_VERSION = 0x01;
+constexpr uint8_t  PROTOCOL_VERSION = 0x02;
 constexpr int      HEADER_SIZE      = 28;
 constexpr uint16_t TCP_PORT         = 9876;
 constexpr uint16_t UDP_PORT         = 9877;
-constexpr int      MAX_FRAGMENT_PAYLOAD = 1364;  // 1400 - 28 header - 8 frag
+constexpr int      MAX_FRAGMENT_PAYLOAD = 1340;  // 1400 - 28 header - 8 counter - 16 tag - 8 frag
+constexpr int      UDP_COUNTER_SIZE = 8;
+constexpr int      AEAD_TAG_SIZE    = 16;
+constexpr int      PUBLIC_KEY_SIZE  = 65;        // P-256, X9.63 uncompressed (04 | X | Y)
 
 // ── Message Types ───────────────────────────────────────────────────────────
 
@@ -43,10 +52,11 @@ enum class MessageType : uint8_t {
     SenderStats   = 0x51,   // Mac → Win: sender performance, once per second
     InputEvent    = 0x60,
     ClipboardData = 0x70,
-    PairChallenge = 0x80,
-    PairResponse  = 0x81,
-    PairAccept    = 0x82,
-    PairReject    = 0x83,
+    KeyExchange   = 0x80,   // Mac → Win: handshake mode + Mac's ephemeral key
+    PairConfirm   = 0x81,   // Win → Mac: HMAC over the handshake transcript
+    PairAccept    = 0x82,   // Mac → Win: Mac's HMAC; encryption starts after it
+    PairReject    = 0x83,   // Mac → Win: handshake refused (reason)
+    KeyReveal     = 0x84,   // Win → Mac: our ephemeral key (committed in HELLO)
     Disconnect    = 0xFF,
 
     // Data (UDP)
@@ -60,6 +70,7 @@ enum MessageFlags : uint16_t {
     FLAG_NONE     = 0,
     FLAG_KEYFRAME = 1 << 0,
     FLAG_TIMING   = 1 << 1,   // video: reassembled frame starts with FrameTimingPrefix
+    FLAG_ENCRYPTED = 1 << 2,  // payload is AES-GCM sealed (protocol v2)
 };
 
 // ── Protocol Header (28 bytes) ─────────────────────────────────────────────
@@ -86,14 +97,15 @@ struct FragmentHeader {
 };
 static_assert(sizeof(FragmentHeader) == 8, "Fragment header must be 8 bytes");
 
-// ── HELLO payload (130 bytes) ───────────────────────────────────────────────
+// ── HELLO payload (162 bytes) ───────────────────────────────────────────────
 
 struct HelloPayload {
     char     receiverName[64] = {};  // Null-terminated UTF-8
     uint16_t udpPort = UDP_PORT;
     char     deviceId[64] = {};      // Unique device identifier for pairing
+    uint8_t  commitment[32] = {};    // SHA-256 of our ephemeral public key
 };
-static_assert(sizeof(HelloPayload) == 130, "HelloPayload must be 130 bytes");
+static_assert(sizeof(HelloPayload) == 162, "HelloPayload must be 162 bytes");
 
 // ── START_STREAM payload (20 bytes) ─────────────────────────────────────────
 
@@ -176,36 +188,52 @@ struct InputEventPayload {
 };
 static_assert(sizeof(InputEventPayload) == 24, "InputEventPayload must be 24 bytes");
 
-// ── Pairing Payloads ────────────────────────────────────────────────────────────
+// ── Handshake Payloads (protocol v2) ────────────────────────────────────────
 
-enum PairChallengeType : uint8_t {
-    PAIR_PIN  = 0,   // First-time pairing: user must enter PIN
-    PAIR_HMAC = 1,   // Already paired: HMAC challenge-response
+enum HandshakeMode : uint8_t {
+    HANDSHAKE_NEW_PAIRING = 0,   // verification code + approval on the Mac
+    HANDSHAKE_PAIRED      = 1,   // stored pairing key mixed into the keys
 };
 
-/// PAIR_CHALLENGE payload (Mac → Windows, 40 bytes)
-struct PairChallengePayload {
-    uint8_t type = 0;           // PairChallengeType
-    uint8_t reserved[7] = {};   // Padding
-    uint8_t nonce[32] = {};     // 32-byte random nonce
+/// KEY_EXCHANGE payload (Mac → Windows, 73 bytes)
+struct KeyExchangePayload {
+    uint8_t mode = 0;                      // HandshakeMode
+    uint8_t reserved[7] = {};
+    uint8_t publicKey[PUBLIC_KEY_SIZE] = {};
 };
-static_assert(sizeof(PairChallengePayload) == 40, "PairChallengePayload must be 40 bytes");
+static_assert(sizeof(KeyExchangePayload) == 73, "KeyExchangePayload must be 73 bytes");
 
-/// PAIR_RESPONSE payload (Windows → Mac, 40 bytes)
-struct PairResponsePayload {
-    uint8_t type = 0;           // 0 = PIN, 1 = HMAC
-    uint8_t reserved[7] = {};   // Padding
-    uint8_t data[32] = {};      // PIN (null-padded) or HMAC-SHA256
+/// KEY_REVEAL payload (Windows → Mac, 65 bytes)
+struct KeyRevealPayload {
+    uint8_t publicKey[PUBLIC_KEY_SIZE] = {};
 };
-static_assert(sizeof(PairResponsePayload) == 40, "PairResponsePayload must be 40 bytes");
 
-/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes)
+/// PAIR_CONFIRM payload (Windows → Mac, 32 bytes): HMAC(confirm-win, transcript)
+struct PairConfirmPayload {
+    uint8_t mac[32] = {};
+};
+
+/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes): HMAC(confirm-mac, transcript)
 struct PairAcceptPayload {
-    uint8_t newlyPaired = 0;    // 1 = new pairing (key included), 0 = existing
-    uint8_t reserved[7] = {};   // Padding
-    uint8_t pairingKey[32] = {};// 256-bit pairing key (only when newlyPaired=1)
+    uint8_t newlyPaired = 0;
+    uint8_t reserved[7] = {};
+    uint8_t mac[32] = {};
 };
 static_assert(sizeof(PairAcceptPayload) == 40, "PairAcceptPayload must be 40 bytes");
+
+enum PairRejectReason : uint8_t {
+    REJECT_GENERIC          = 0,
+    REJECT_USER_REJECTED    = 1,   // the Mac user clicked Reject
+    REJECT_UNKNOWN_DEVICE   = 2,   // stored keys differ: pair again
+    REJECT_VERSION_MISMATCH = 3,   // update both apps
+    REJECT_BAD_HANDSHAKE    = 4,
+};
+
+/// PAIR_REJECT payload (Mac → Windows, 4 bytes)
+struct PairRejectPayload {
+    uint8_t reason = 0;
+    uint8_t reserved[3] = {};
+};
 
 #pragma pack(pop)
 

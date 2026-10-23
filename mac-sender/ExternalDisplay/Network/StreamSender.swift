@@ -3,11 +3,13 @@
 // =============================================================================
 // Manages TCP control channel, UDP data channel, and Bonjour service.
 //
-// Connection flow:
+// Connection flow (protocol v2):
 //   1. Start listening (TCP + Bonjour)
-//   2. Windows connects via TCP → HELLO exchange
-//   3. Mac sends START_STREAM
-//   4. Encoded H.264 frames sent over UDP (fragmented if needed)
+//   2. Windows connects via TCP → HELLO / KEY_EXCHANGE / KEY_REVEAL
+//   3. Authentication: PAIR_CONFIRM / PAIR_ACCEPT (new devices: the user
+//      approves after Windows entered the verification code)
+//   4. Everything after PAIR_ACCEPT is AES-GCM encrypted: START_STREAM,
+//      video over UDP (fragmented if needed), input, clipboard, statistics
 //
 // Uses Apple's Network.framework (NWConnection/NWListener).
 // =============================================================================
@@ -16,6 +18,7 @@ import Foundation
 import Network
 import Combine
 import QuartzCore
+import CryptoKit
 
 /// Connection state machine
 enum SenderState: Equatable {
@@ -124,12 +127,25 @@ final class StreamSender: ObservableObject {
     /// Pairing manager for secure authentication
     var pairingManager: PairingManager?
 
-    // Pairing state for the current connection (networkQueue only)
-    private var pendingDeviceId: String?
-    private var pendingDeviceName: String?
-    /// True once the current peer passed PIN or HMAC verification.
-    /// Nothing except the pairing handshake is accepted or sent before this.
-    private var isAuthenticated = false
+    // ── Security (protocol v2, networkQueue only) ───────────────────────────
+
+    /// Handshake of the current connection, until it is accepted
+    private struct Handshake {
+        var hello: HelloPayload
+        var helloBytes: Data              // exactly as received: part of the transcript
+        var mode: HandshakeMode
+        var ephemeral: P256.KeyAgreement.PrivateKey
+        var keyExchangeBytes: Data
+        var keys: SessionKeys? = nil      // after KEY_REVEAL
+        var windowsConfirmed = false      // new pairing: Windows entered the code
+    }
+    private var handshake: Handshake?
+
+    /// Encryption keys and counters; set when PAIR_ACCEPT is sent.
+    /// Nothing except the handshake is accepted or sent before this.
+    private var session: SecureSession?
+    private var isAuthenticated: Bool { session != nil }
+    private var peerName = "Receiver"
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -146,7 +162,7 @@ final class StreamSender: ObservableObject {
     private func scheduleListenerRestart() {
         tcpListener?.cancel()
         tcpListener = nil
-        print("[Net] Restarting listener in 2s…")
+        Log.warning(.net, "Restarting listener in 2s…")
         networkQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self = self, self.tcpListener == nil, self.listenerWanted else { return }
             self.createListener()
@@ -178,12 +194,12 @@ final class StreamSender: ObservableObject {
             listener.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
-                    print("[Net] TCP listener ready on port \(ProtocolConstants.tcpPort)")
+                    Log.info(.net, "TCP listener ready on port \(ProtocolConstants.tcpPort)")
                     DispatchQueue.main.async {
                         self?.state = .listening
                     }
                 case .failed(let error):
-                    print("[Net] Listener failed: \(error)")
+                    Log.error(.net, "Listener failed: \(error)")
                     DispatchQueue.main.async {
                         self?.state = .error("Listener: \(error.localizedDescription)")
                     }
@@ -199,7 +215,7 @@ final class StreamSender: ObservableObject {
                 // Phase 15: If a client is already connected, check if it's still alive.
                 // If the old connection is stale (e.g. Wi-Fi dropout), drop it and accept the new one.
                 if self.tcpConnection != nil {
-                    print("[Net] New connection while already connected — dropping old connection for reconnect")
+                    Log.warning(.net, "New connection while already connected — dropping old connection for reconnect")
                     self.stopHeartbeat()
                     self.stopStreaming()
                     self.tcpConnection?.cancel()
@@ -222,8 +238,13 @@ final class StreamSender: ObservableObject {
         }
     }
 
-    /// Stop streaming and disconnect client, but keep listener alive for reconnects
+    /// Stop streaming and disconnect client, but keep listener alive for reconnects.
+    /// Runs on the network queue: the session's nonce counters live there.
     func stop() {
+        networkQueue.sync { self.stopOnNetworkQueue() }
+    }
+
+    private func stopOnNetworkQueue() {
         stopStreaming()
         tcpConnection?.cancel()
         tcpConnection = nil
@@ -247,6 +268,10 @@ final class StreamSender: ObservableObject {
 
     /// Full shutdown — stop everything including the listener
     func shutdown() {
+        networkQueue.sync { self.shutdownOnNetworkQueue() }
+    }
+
+    private func shutdownOnNetworkQueue() {
         listenerWanted = false
         stopStreaming()
         tcpConnection?.cancel()
@@ -267,7 +292,7 @@ final class StreamSender: ObservableObject {
     // ── TCP Connection Handling ─────────────────────────────────────────────
 
     private func handleNewTCPConnection(_ connection: NWConnection) {
-        print("[Net] New TCP connection from \(connection.endpoint)")
+        Log.info(.net, "New TCP connection from \(connection.endpoint)")
         tcpConnection = connection
         resetAuthentication()
 
@@ -279,16 +304,16 @@ final class StreamSender: ObservableObject {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
-                print("[Net] TCP connection ready")
+                Log.info(.net, "TCP connection ready")
                 self?.lastPongReceived = CACurrentMediaTime()
                 self?.startHeartbeat()
                 self?.receiveTCPMessages()
             case .failed(let error):
-                print("[Net] TCP connection failed: \(error)")
+                Log.error(.net, "TCP connection failed: \(error)")
                 self?.stopHeartbeat()
                 self?.handleDisconnect(for: connection)
             case .cancelled:
-                print("[Net] TCP connection cancelled")
+                Log.debug(.net, "TCP connection cancelled")
                 self?.stopHeartbeat()
                 break
             default:
@@ -310,13 +335,13 @@ final class StreamSender: ObservableObject {
             guard let self = self else { return }
 
             if let error = error {
-                print("[Net] TCP receive error: \(error)")
+                Log.error(.net, "TCP receive error: \(error)")
                 self.handleDisconnect(for: connection)
                 return
             }
 
             if isComplete {
-                print("[Net] TCP connection closed by peer")
+                Log.info(.net, "TCP connection closed by peer")
                 self.handleDisconnect(for: connection)
                 return
             }
@@ -330,25 +355,26 @@ final class StreamSender: ObservableObject {
 
             let payloadLen = Int(header.payloadLength)
             guard payloadLen <= self.maxControlPayload else {
-                print("[Net] ❌ Control payload too large (\(payloadLen) bytes) — dropping connection")
+                Log.warning(.net, "Control payload too large (\(payloadLen) bytes) — dropping connection")
                 self.handleDisconnect(for: connection)
                 return
             }
 
             if payloadLen == 0 {
                 // No payload — dispatch immediately
-                self.dispatchMessage(header: header, payload: Data(), connection: connection)
+                self.processMessage(header: header, rawHeader: headerData, payload: Data(),
+                                    connection: connection)
                 self.receiveTCPMessages()
             } else {
                 // Step 2: Read exactly payloadLength bytes
-                self.readTCPPayload(connection: connection, header: header,
+                self.readTCPPayload(connection: connection, header: header, rawHeader: headerData,
                                      remaining: payloadLen, accumulated: Data())
             }
         }
     }
 
     /// Read exactly `remaining` bytes of payload from TCP, accumulating chunks
-    private func readTCPPayload(connection: NWConnection, header: ProtocolHeader,
+    private func readTCPPayload(connection: NWConnection, header: ProtocolHeader, rawHeader: Data,
                                  remaining: Int, accumulated: Data) {
         connection.receive(
             minimumIncompleteLength: remaining,
@@ -357,13 +383,13 @@ final class StreamSender: ObservableObject {
             guard let self = self else { return }
 
             if let error = error {
-                print("[Net] TCP payload read error: \(error)")
+                Log.error(.net, "TCP payload read error: \(error)")
                 self.handleDisconnect(for: connection)
                 return
             }
 
             if isComplete && (data == nil || data!.isEmpty) {
-                print("[Net] TCP connection closed during payload read")
+                Log.info(.net, "TCP connection closed during payload read")
                 self.handleDisconnect(for: connection)
                 return
             }
@@ -376,20 +402,59 @@ final class StreamSender: ObservableObject {
             let left = remaining - (data?.count ?? 0)
             if left > 0 {
                 // Need more data
-                self.readTCPPayload(connection: connection, header: header,
+                self.readTCPPayload(connection: connection, header: header, rawHeader: rawHeader,
                                      remaining: left, accumulated: acc)
             } else {
                 // Full payload received
-                self.dispatchMessage(header: header, payload: acc, connection: connection)
+                self.processMessage(header: header, rawHeader: rawHeader, payload: acc,
+                                    connection: connection)
                 self.receiveTCPMessages()
             }
         }
     }
 
+    /// Version check and decryption, then dispatch
+    private func processMessage(header: ProtocolHeader, rawHeader: Data, payload: Data,
+                                connection: NWConnection) {
+        guard header.version == ProtocolConstants.version else {
+            Log.error(.net, "Receiver speaks protocol v\(header.version), this Mac app v\(ProtocolConstants.version) — update both apps")
+            reject(.versionMismatch)
+            return
+        }
+
+        if MessageFlags(rawValue: header.flags).contains(.encrypted) {
+            guard let session else {
+                Log.warning(.net, "Encrypted message before the handshake finished — dropping connection")
+                handleDisconnect(for: connection)
+                return
+            }
+            do {
+                let plaintext = try session.openControl(payload, aad: Data(rawHeader.prefix(ProtocolConstants.headerSize)))
+                dispatchMessage(header: header, payload: plaintext, connection: connection)
+            } catch {
+                Log.error(.net, "Control message failed authentication — dropping connection")
+                handleDisconnect(for: connection)
+            }
+            return
+        }
+
+        if isAuthenticated {
+            // Only a PONG the receiver sent before it saw PAIR_ACCEPT may still be plaintext
+            if header.type == MessageType.pong.rawValue {
+                lastPongReceived = CACurrentMediaTime()
+                return
+            }
+            Log.warning(.net, "Unencrypted message type \(header.type) after authentication — dropping connection")
+            handleDisconnect(for: connection)
+            return
+        }
+        dispatchMessage(header: header, payload: payload, connection: connection)
+    }
+
     /// Dispatch a fully-received TCP message to the appropriate handler
     private func dispatchMessage(header: ProtocolHeader, payload: Data, connection: NWConnection) {
         guard let msgType = MessageType(rawValue: header.type) else {
-            print("[Net] Unknown message type: \(header.type)")
+            Log.warning(.net, "Unknown message type: \(header.type)")
             return
         }
 
@@ -397,10 +462,10 @@ final class StreamSender: ObservableObject {
         // never inject input or clipboard data from an unverified peer.
         if !isAuthenticated {
             switch msgType {
-            case .hello, .pairResponse, .ping, .pong, .disconnect:
+            case .hello, .keyReveal, .pairConfirm, .ping, .pong, .disconnect:
                 break
             default:
-                print("[Net] Dropping \(msgType) from unauthenticated peer")
+                Log.warning(.net, "Dropping \(msgType) from unauthenticated peer")
                 return
             }
         }
@@ -421,12 +486,14 @@ final class StreamSender: ObservableObject {
             handleInputEvent(payload)
         case .clipboardData:
             handleClipboardData(payload)
-        case .pairResponse:
-            handlePairResponse(payload)
+        case .keyReveal:
+            handleKeyReveal(payload)
+        case .pairConfirm:
+            handlePairConfirm(payload)
         case .disconnect:
             handleDisconnect(for: connection)
         default:
-            print("[Net] Unhandled message type: \(msgType)")
+            Log.warning(.net, "Unhandled message type: \(msgType)")
         }
     }
 
@@ -439,7 +506,7 @@ final class StreamSender: ObservableObject {
 
     private func handleQualityReport(_ payload: Data) {
         guard let report = QualityReportPayload.deserialize(from: payload) else {
-            print("[Net] Invalid QualityReport payload")
+            Log.error(.net, "Invalid QualityReport payload")
             return
         }
         countersLock.lock()
@@ -455,122 +522,150 @@ final class StreamSender: ObservableObject {
         onClipboardData?(payload)
     }
 
+    // ── Handshake (protocol v2, see SecureChannel.swift) ────────────────────
+
     private func handleHello(_ payload: Data) {
-        guard let hello = HelloPayload.deserialize(from: payload) else {
-            print("[Net] Invalid HELLO payload")
+        guard handshake == nil, !isAuthenticated else {
+            Log.warning(.net, "Ignoring repeated HELLO")
             return
         }
-        guard !isAuthenticated else {
-            print("[Net] Ignoring repeated HELLO on an authenticated connection")
+        // Every receiver authenticates; a missing device ID is a broken receiver
+        guard let hello = HelloPayload.deserialize(from: payload), !hello.deviceId.isEmpty else {
+            Log.warning(.pairing, "Malformed HELLO — rejecting")
+            reject(.badHandshake)
             return
         }
-
-        print("[Net] HELLO from: \(hello.receiverName), UDP port: \(hello.udpPort), device: \(hello.deviceId.prefix(16))")
         remoteUDPPort = hello.udpPort
+        peerName = hello.receiverName
 
-        // Store pending connection info for pairing
-        pendingDeviceId = hello.deviceId
-        pendingDeviceName = hello.receiverName
+        let mode: HandshakeMode = pairingManager?.pairingKey(for: hello.deviceId) != nil ? .paired : .newPairing
+        let ephemeral = P256.KeyAgreement.PrivateKey()
+        var keyExchange = KeyExchangePayload()
+        keyExchange.mode = mode
+        keyExchange.publicKey = ephemeral.publicKey.x963Representation
+        let keyExchangeBytes = keyExchange.serialize()
 
-        // Every receiver must authenticate. A missing device ID means an old or
-        // broken receiver build — reject instead of silently skipping pairing.
-        guard let pm = pairingManager, !hello.deviceId.isEmpty else {
-            print("[Pairing] ❌ HELLO without device ID from '\(hello.receiverName)' — rejecting")
-            sendControlMessage(type: .pairReject, payload: Data())
-            return
-        }
-
-        if pm.isPaired(deviceId: hello.deviceId) {
-            // Already paired — send HMAC challenge
-            let nonce = pm.generateNonce()
-            var challenge = PairChallengePayload()
-            challenge.type = PairChallengeType.hmac.rawValue
-            challenge.nonce = nonce
-            sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
-            print("[Pairing] Sent HMAC challenge to '\(hello.receiverName)'")
-        } else {
-            // Not paired — generate PIN and show in UI
-            let pin = pm.generatePIN(forDevice: hello.receiverName)
-            var challenge = PairChallengePayload()
-            challenge.type = PairChallengeType.pin.rawValue
-            challenge.nonce = Data(repeating: 0, count: 32)  // unused for PIN
-            sendControlMessage(type: .pairChallenge, payload: challenge.serialize())
-            print("[Pairing] Sent PIN challenge to '\(hello.receiverName)' — PIN: \(pin)")
-        }
+        handshake = Handshake(hello: hello, helloBytes: Data(payload.prefix(HelloPayload.size)),
+                              mode: mode, ephemeral: ephemeral, keyExchangeBytes: keyExchangeBytes)
+        sendControlMessage(type: .keyExchange, payload: keyExchangeBytes)
+        Log.info(.pairing, "HELLO from '\(hello.receiverName)' (UDP port \(hello.udpPort)) — "
+                 + (mode == .paired ? "paired receiver, authenticating" : "new receiver, pairing"))
 
         DispatchQueue.main.async { [weak self] in
             self?.state = .pairing(hello.receiverName)
         }
     }
 
-    /// Handle pairing response from Windows (PIN or HMAC)
-    private func handlePairResponse(_ payload: Data) {
-        guard let response = PairResponsePayload.deserialize(from: payload),
-              let pm = pairingManager,
-              let deviceId = pendingDeviceId else {
-            print("[Pairing] Invalid pair response")
-            sendControlMessage(type: .pairReject, payload: Data())
+    private func handleKeyReveal(_ payload: Data) {
+        guard var hs = handshake, hs.keys == nil,
+              let reveal = KeyRevealPayload.deserialize(from: payload) else {
+            reject(.badHandshake)
+            return
+        }
+        // The key must be the one committed to in HELLO (prevents code searching)
+        guard KeySchedule.commitment(publicKey: reveal.publicKey) == hs.hello.commitment else {
+            Log.warning(.pairing, "Receiver's key does not match its commitment — rejecting")
+            reject(.badHandshake)
+            return
+        }
+        do {
+            let shared = try KeySchedule.sharedSecret(privateKey: hs.ephemeral, peerPublicKey: reveal.publicKey)
+            let transcript = KeySchedule.transcriptHash(hello: hs.helloBytes, keyExchange: hs.keyExchangeBytes,
+                                                        keyReveal: reveal.publicKey)
+            let pairingKey = hs.mode == .paired ? pairingManager?.pairingKey(for: hs.hello.deviceId) : nil
+            let keys = KeySchedule.derive(sharedSecret: shared, pairingKey: pairingKey, transcriptHash: transcript)
+            hs.keys = keys
+            handshake = hs
+            if hs.mode == .newPairing {
+                pairingManager?.beginRequest(deviceId: hs.hello.deviceId, deviceName: hs.hello.receiverName,
+                                             verificationCode: keys.verificationCode)
+            }
+        } catch {
+            Log.warning(.pairing, "Invalid public key from receiver — rejecting")
+            reject(.badHandshake)
+        }
+    }
+
+    private func handlePairConfirm(_ payload: Data) {
+        guard var hs = handshake, let keys = hs.keys,
+              let confirm = PairConfirmPayload.deserialize(from: payload) else {
+            reject(.badHandshake)
+            return
+        }
+        guard KeySchedule.verify(confirm.mac, key: keys.confirmWin, transcriptHash: keys.transcriptHash) else {
+            if hs.mode == .paired {
+                // Its key differs from ours (it reset, or it is not who it claims): pair again
+                Log.warning(.pairing, "'\(hs.hello.receiverName)' failed authentication — it has to pair again")
+                reject(.unknownDevice)
+            } else {
+                Log.warning(.pairing, "Invalid pairing confirmation from '\(hs.hello.receiverName)'")
+                reject(.badHandshake)
+            }
             return
         }
 
-        let deviceName = pendingDeviceName ?? "Unknown"
+        if hs.mode == .paired {
+            accept(newlyPaired: false)
+        } else {
+            hs.windowsConfirmed = true
+            handshake = hs
+            pairingManager?.markWindowsConfirmed(deviceId: hs.hello.deviceId)
+        }
+    }
 
-        if response.type == PairChallengeType.pin.rawValue {
-            // Validate PIN
-            let enteredPIN = response.pinString
-            if let pairingKey = pm.validatePIN(enteredPIN, deviceId: deviceId, deviceName: deviceName) {
-                // Send PAIR_ACCEPT with the pairing key
-                var accept = PairAcceptPayload()
-                accept.newlyPaired = 1
-                accept.pairingKey = pairingKey
-                sendControlMessage(type: .pairAccept, payload: accept.serialize())
-
-                // Now send WELCOME to proceed
-                sendControlMessage(type: .welcome, payload: Data())
-                markAuthenticated(deviceName)
-                print("[Pairing] ✅ PIN accepted — paired with '\(deviceName)'")
+    /// The user approved or rejected a new pairing (called from the main thread)
+    func resolvePairing(deviceId: String, approved: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self, let hs = self.handshake, hs.hello.deviceId == deviceId,
+                  hs.mode == .newPairing else { return }
+            if approved, hs.windowsConfirmed, let keys = hs.keys {
+                self.pairingManager?.savePairing(deviceId: deviceId, deviceName: hs.hello.receiverName,
+                                                 pairingKey: keys.pairingKey)
+                self.accept(newlyPaired: true)
             } else {
-                // One attempt per PIN: the receiver reconnects and gets a fresh one
-                pm.cancelPairing()
-                sendControlMessage(type: .pairReject, payload: Data())
-                print("[Pairing] ❌ PIN rejected from '\(deviceName)'")
+                Log.info(.pairing, "Pairing with '\(hs.hello.receiverName)' rejected on the Mac")
+                self.reject(.userRejected)
             }
+        }
+    }
 
-        } else if response.type == PairChallengeType.hmac.rawValue {
-            // Validate HMAC
-            let hmacData = response.data_
-            if pm.validateHMAC(deviceId: deviceId, receivedHMAC: hmacData) {
-                // Send PAIR_ACCEPT (no key since already paired)
-                var accept = PairAcceptPayload()
-                accept.newlyPaired = 0
-                accept.pairingKey = Data(repeating: 0, count: 32)
-                sendControlMessage(type: .pairAccept, payload: accept.serialize())
+    /// Prove the transcript to the receiver and switch to encryption
+    private func accept(newlyPaired: Bool) {
+        guard let hs = handshake, let keys = hs.keys else { return }
+        var acceptPayload = PairAcceptPayload()
+        acceptPayload.newlyPaired = newlyPaired
+        acceptPayload.mac = KeySchedule.confirmation(keys.confirmMac, transcriptHash: keys.transcriptHash)
+        sendControlMessage(type: .pairAccept, payload: acceptPayload.serialize())   // last plaintext message
 
-                // Now send WELCOME to proceed
-                sendControlMessage(type: .welcome, payload: Data())
-                markAuthenticated(deviceName)
-                print("[Pairing] ✅ HMAC verified — auto-authenticated '\(deviceName)'")
-            } else {
-                sendControlMessage(type: .pairReject, payload: Data())
-                print("[Pairing] ❌ HMAC failed from '\(deviceName)'")
-            }
+        session = SecureSession(keys: keys)
+        handshake = nil
+        sendControlMessage(type: .welcome, payload: Data())
+        markAuthenticated(peerName)
+        Log.info(.pairing, "'\(peerName)' authenticated — session encrypted")
+    }
+
+    /// Refuse the handshake and close the connection once the reason is out
+    private func reject(_ reason: PairRejectReason) {
+        sendControlMessage(type: .pairReject, payload: PairRejectPayload(reason: reason).serialize())
+        pairingManager?.cancelRequest()
+        guard let connection = tcpConnection else { return }
+        networkQueue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.handleDisconnect(for: connection)
         }
     }
 
     /// Peer verified — switch to .connected, which the engine observes to start streaming
     private func markAuthenticated(_ peerName: String) {
-        isAuthenticated = true
         DispatchQueue.main.async { [weak self] in
             self?.state = .connected(peerName)
         }
     }
 
-    /// Forget the previous peer's authentication and hide any PIN still on screen
+    /// Forget the previous peer's keys and hide any pairing request still on screen
     private func resetAuthentication() {
-        isAuthenticated = false
-        pendingDeviceId = nil
-        pendingDeviceName = nil
-        pairingManager?.cancelPairing()
+        handshake = nil
+        session = nil
+        pairingManager?.cancelRequest()
     }
 
     /// Handle client disconnect — only if the disconnected connection is still current
@@ -578,7 +673,7 @@ final class StreamSender: ObservableObject {
         // Guard: only clean up if this is still the active connection
         // Prevents a stale callback from killing a new reconnection
         guard tcpConnection === connection else {
-            print("[Net] Ignoring stale disconnect callback")
+            Log.debug(.net, "Ignoring stale disconnect callback")
             return
         }
         stopHeartbeat()
@@ -589,7 +684,7 @@ final class StreamSender: ObservableObject {
         udpConnection = nil
         remoteHost = nil
         resetAuthentication()
-        print("[Net] Client disconnected — waiting for reconnection...")
+        Log.info(.net, "Client disconnected — waiting for reconnection...")
         DispatchQueue.main.async { [weak self] in
             self?.state = .listening
         }
@@ -608,7 +703,7 @@ final class StreamSender: ObservableObject {
             // Check if the peer has responded recently
             let now = CACurrentMediaTime()
             if now - self.lastPongReceived > self.heartbeatTimeout {
-                print("[Net] ⚠️ Heartbeat timeout — peer not responding (\(Int(now - self.lastPongReceived))s)")
+                Log.warning(.net, "Heartbeat timeout — peer not responding (\(Int(now - self.lastPongReceived))s)")
                 if let conn = self.tcpConnection {
                     self.handleDisconnect(for: conn)
                 }
@@ -640,11 +735,11 @@ final class StreamSender: ObservableObject {
 
     private func startStreamingOnNetworkQueue() {
         guard tcpConnection != nil, let host = remoteHost else {
-            print("[Net] Cannot start streaming — not connected")
+            Log.error(.net, "Cannot start streaming — not connected")
             return
         }
         guard isAuthenticated else {
-            print("[Net] Cannot start streaming — peer not authenticated")
+            Log.error(.net, "Cannot start streaming — peer not authenticated")
             return
         }
         guard udpConnection == nil else { return }  // already streaming
@@ -659,7 +754,7 @@ final class StreamSender: ObservableObject {
         )
         udp.stateUpdateHandler = { state in
             if case .ready = state {
-                print("[Net] UDP channel ready → \(host):\(self.remoteUDPPort)")
+                Log.info(.net, "UDP channel ready → \(host):\(self.remoteUDPPort)")
             }
         }
         udp.start(queue: networkQueue)
@@ -677,12 +772,12 @@ final class StreamSender: ObservableObject {
         frameSequenceNumber = 0
         udpPacketSequence = 0
 
-        let peerName = pendingDeviceName ?? "Receiver"
+        let name = peerName
         DispatchQueue.main.async { [weak self] in
-            self?.state = .streaming(peerName)
+            self?.state = .streaming(name)
         }
 
-        print("[Net] Streaming started: \(streamWidth)×\(streamHeight) @ \(streamFPS) FPS")
+        Log.info(.net, "Streaming started: \(streamWidth)×\(streamHeight) @ \(streamFPS) FPS")
     }
 
     /// Phase 15: capture restarted (possibly at a new resolution) — tell the
@@ -696,7 +791,7 @@ final class StreamSender: ObservableObject {
             startPayload.fps = self.streamFPS
             startPayload.bitrate = self.streamBitrate
             self.sendControlMessage(type: .startStream, payload: startPayload.serialize())
-            print("[Net] Stream parameters re-sent: \(self.streamWidth)×\(self.streamHeight)")
+            Log.info(.net, "Stream parameters re-sent: \(self.streamWidth)×\(self.streamHeight)")
         }
     }
 
@@ -733,7 +828,7 @@ final class StreamSender: ObservableObject {
     }
 
     private func sendVideoFrameOnNetworkQueue(_ frameData: Data, isKeyframe: Bool, timing: FrameTiming) {
-        guard let udp = udpConnection, frameData.count > FrameTimingPrefix.size else { return }
+        guard let udp = udpConnection, let session, frameData.count > FrameTimingPrefix.size else { return }
 
         let frameSeq = frameSequenceNumber
         frameSequenceNumber &+= 1
@@ -760,16 +855,9 @@ final class StreamSender: ObservableObject {
 
         if frame.count <= ProtocolConstants.maxFragmentPayload {
             // ── Single packet ───────────────────────────────────────────
-            var header = ProtocolHeader()
-            header.type = MessageType.videoFrame.rawValue
-            header.flags = flags.rawValue
-            header.sequence = nextUDPSequence()
-            header.timestamp = timestamp
-            header.payloadLength = UInt32(frame.count)
-
-            var packet = header.serialize()
-            packet.append(frame)
-            sealAndSend(&packet, on: udp)
+            let packet = encryptedPacket(type: .videoFrame, flags: flags, timestamp: timestamp,
+                                         payload: frame, session: session)
+            udp.send(content: packet, completion: .contentProcessed { _ in })
             packets = 1
             bytes = packet.count
         } else {
@@ -786,18 +874,12 @@ final class StreamSender: ObservableObject {
                 fragHeader.fragmentIndex = UInt16(i)
                 fragHeader.fragmentTotal = UInt16(fragmentCount)
 
-                var header = ProtocolHeader()
-                header.type = MessageType.videoFragment.rawValue
-                header.flags = flags.rawValue
-                header.sequence = nextUDPSequence()
-                header.timestamp = timestamp
-                header.payloadLength = UInt32(8 + end - offset)
-
-                var packet = Data(capacity: ProtocolConstants.headerSize + 8 + end - offset)
-                packet.append(header.serialize())
-                packet.append(fragHeader.serialize())
-                packet.append(frame[offset..<end])
-                sealAndSend(&packet, on: udp)
+                var payload = Data(capacity: 8 + end - offset)
+                payload.append(fragHeader.serialize())
+                payload.append(frame[offset..<end])
+                let packet = encryptedPacket(type: .videoFragment, flags: flags, timestamp: timestamp,
+                                             payload: payload, session: session)
+                udp.send(content: packet, completion: .contentProcessed { _ in })
                 packets += 1
                 bytes += packet.count
             }
@@ -814,11 +896,22 @@ final class StreamSender: ObservableObject {
         countersLock.unlock()
     }
 
-    /// Fill in the CRC32 (computed with the CRC field zeroed) and send
-    private func sealAndSend(_ packet: inout Data, on udp: NWConnection) {
-        let crc = CRC32.compute(packet)
-        packet.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
-        udp.send(content: packet, completion: .contentProcessed { _ in })
+    /// header ‖ counter(8, big-endian) ‖ AES-GCM(payload) ‖ tag.
+    /// Header and counter are authenticated as associated data.
+    private func encryptedPacket(type: MessageType, flags: MessageFlags, timestamp: UInt64,
+                                 payload: Data, session: SecureSession) -> Data {
+        var header = ProtocolHeader()
+        header.type = type.rawValue
+        header.flags = flags.union(.encrypted).rawValue
+        header.sequence = nextUDPSequence()
+        header.timestamp = timestamp
+        header.payloadLength = UInt32(ProtocolConstants.udpCounterSize + payload.count + PacketCipher.tagSize)
+
+        let counter = session.nextVideoCounter()
+        var packet = header.serialize()
+        withUnsafeBytes(of: counter.bigEndian) { packet.append(contentsOf: $0) }
+        packet.append(session.sealVideo(payload, counter: counter, aad: packet))
+        return packet
     }
 
     // ── Stats ───────────────────────────────────────────────────────────────
@@ -851,25 +944,34 @@ final class StreamSender: ObservableObject {
 
     // ── Control Messages ────────────────────────────────────────────────────
 
-    private func sendControlMessage(type: MessageType, payload: Data) {
+    /// Send on the TCP control channel (network queue only: the encryption
+    /// counter must advance in send order). Encrypted once authenticated;
+    /// handshake messages are plaintext with a CRC.
+    private func sendControlMessage(type: MessageType, payload: Data, sequence: UInt32? = nil) {
         guard let connection = tcpConnection else { return }
 
         var header = ProtocolHeader()
         header.type = type.rawValue
-        header.sequence = nextSequence()
+        header.sequence = sequence ?? nextSequence()
         header.timestamp = HostClock.nowUs()
-        header.payloadLength = UInt32(payload.count)
 
-        var data = header.serialize()
-        data.append(payload)
-
-        // CRC
-        let crc = CRC32.compute(data)
-        data.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
+        var data: Data
+        if let session {
+            header.flags = MessageFlags.encrypted.rawValue
+            header.payloadLength = UInt32(payload.count + PacketCipher.tagSize)
+            data = header.serialize()   // CRC 0: the tag authenticates header + payload
+            data.append(session.sealControl(payload, aad: data))
+        } else {
+            header.payloadLength = UInt32(payload.count)
+            data = header.serialize()
+            data.append(payload)
+            let crc = CRC32.compute(data)
+            data.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
+        }
 
         connection.send(content: data, completion: .contentProcessed { error in
             if let error = error {
-                print("[Net] TCP send error: \(error)")
+                Log.every(5, key: "tcp-send-error", .warning, .net, "TCP send error: \(error)")
             }
         })
     }
@@ -877,18 +979,9 @@ final class StreamSender: ObservableObject {
     /// PONG carries our clock in the header and echoes the PING's timestamp
     /// in the payload — the receiver derives RTT and the Mac↔PC clock offset.
     private func sendPong(sequence: UInt32, echoTimestamp: UInt64) {
-        var header = ProtocolHeader()
-        header.type = MessageType.pong.rawValue
-        header.sequence = sequence
-        header.timestamp = HostClock.nowUs()
-        header.payloadLength = 8
-
-        var data = header.serialize()
-        data.appendLE(echoTimestamp)
-        let crc = CRC32.compute(data)
-        data.replaceSubrange(24..<28, with: withUnsafeBytes(of: crc.littleEndian) { Data($0) })
-
-        tcpConnection?.send(content: data, completion: .contentProcessed { _ in })
+        var payload = Data()
+        payload.appendLE(echoTimestamp)
+        sendControlMessage(type: .pong, payload: payload, sequence: sequence)
     }
 
     private func nextSequence() -> UInt32 {

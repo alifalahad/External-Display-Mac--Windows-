@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "StreamReceiver.h"
+#include "App/Log.h"
 #include "../Performance/PipelineClock.h"
 #include <iostream>
 #include <chrono>
@@ -89,14 +90,14 @@ void StreamReceiver::networkThread(std::string hostIP) {
     try {
         runConnectionLoop(std::move(hostIP));
     } catch (const std::exception& e) {
-        std::cerr << "[Net] Fatal error in network thread: " << e.what() << std::endl;
+        LOG_CRITICAL("Net") << "Fatal error in network thread: " << e.what();
         m_state.store(State::Error);
     }
 }
 
 void StreamReceiver::runConnectionLoop(std::string host) {
     while (m_running.load()) {
-        std::cout << "[Net] Connecting to " << host << ":" << exdp::TCP_PORT << std::endl;
+        LOG_INFO("Net") << "Connecting to " << host << ":" << exdp::TCP_PORT;
         m_state.store(State::Connecting);
 
         // Step 1: Connect TCP (bounded by CONNECT_TIMEOUT_MS)
@@ -109,11 +110,11 @@ void StreamReceiver::runConnectionLoop(std::string host) {
             // Phase 15: the Mac may have a new IP (DHCP renew, other network)
             m_failedConnects++;
             if (m_hostResolver && m_failedConnects % REDISCOVER_AFTER == 0) {
-                std::cout << "[Net] Mac unreachable at " << host
-                          << " — searching the network (mDNS)..." << std::endl;
+                LOG_WARN("Net") << "Mac unreachable at " << host
+                          << " — searching the network (mDNS)...";
                 std::string found = m_hostResolver();
                 if (!found.empty() && found != host) {
-                    std::cout << "[Net] Mac found at new address " << found << std::endl;
+                    LOG_INFO("Net") << "Mac found at new address " << found;
                     host = found;
                     continue;
                 }
@@ -122,8 +123,13 @@ void StreamReceiver::runConnectionLoop(std::string host) {
             continue;
         }
         m_failedConnects = 0;
-        std::cout << "[Net] TCP connected" << std::endl;
+        LOG_INFO("Net") << "TCP connected";
         m_connectionId.fetch_add(1);
+        m_currentHost = host;
+        {
+            std::lock_guard<std::mutex> lock(m_sendMutex);
+            std::atomic_store(&m_session, std::shared_ptr<SecureSession>());
+        }
         m_clockSync.reset();   // the Mac's clock may differ after a reconnect (sleep, restart)
         m_pinWantedFor.store(0);
         m_lastRxTime = Clock::now();
@@ -135,20 +141,10 @@ void StreamReceiver::runConnectionLoop(std::string host) {
             waitBeforeReconnect();
             continue;
         }
-        std::cout << "[Net] UDP bound on port " << exdp::UDP_PORT << std::endl;
+        LOG_INFO("Net") << "UDP bound on port " << exdp::UDP_PORT;
 
-        // Step 3: Send HELLO (with device ID for pairing)
-        exdp::HelloPayload hello{};
-        strncpy_s(hello.receiverName, ComputerNameUTF8().c_str(), sizeof(hello.receiverName) - 1);
-        hello.udpPort = exdp::UDP_PORT;
-        if (m_pairingManager) {
-            strncpy_s(hello.deviceId, m_pairingManager->getDeviceId().c_str(),
-                      sizeof(hello.deviceId) - 1);
-        }
-        tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
-        std::cout << "[Net] HELLO sent as '" << hello.receiverName << "' (device: "
-                  << (m_pairingManager ? m_pairingManager->getDeviceId().substr(0, 16) : "none")
-                  << "...)" << std::endl;
+        // Step 3: HELLO starts the handshake (protocol v2)
+        sendHello();
 
         m_state.store(State::Connected);
 
@@ -159,14 +155,44 @@ void StreamReceiver::runConnectionLoop(std::string host) {
         bool keepConnection = true;
         while (m_running.load() && keepConnection) {
             exdp::ProtocolHeader header;
+            uint8_t rawHeader[exdp::HEADER_SIZE];
             std::vector<uint8_t> payload;
 
-            if (!tcpReceiveMessage(header, payload)) {
-                std::cout << "[Net] TCP connection lost" << std::endl;
+            if (!tcpReceiveMessage(header, rawHeader, payload)) {
+                LOG_WARN("Net") << "TCP connection lost";
+                break;
+            }
+
+            if (header.version != exdp::PROTOCOL_VERSION) {
+                LOG_ERROR("Net") << "The Mac app speaks protocol v" << int(header.version)
+                                 << ", this receiver v" << int(exdp::PROTOCOL_VERSION)
+                                 << " — update both apps";
+                setUserMessage("The Mac app and this receiver are different versions.\nUpdate both apps.");
+                m_versionMismatch = true;
                 break;
             }
 
             auto type = static_cast<exdp::MessageType>(header.type);
+            auto session = std::atomic_load(&m_session);
+            if (header.flags & exdp::FLAG_ENCRYPTED) {
+                std::vector<uint8_t> plaintext;
+                if (!session || !session->openControl(rawHeader, exdp::HEADER_SIZE, payload.data(),
+                                                      payload.size(), plaintext)) {
+                    LOG_ERROR("Net") << "Control message failed authentication — dropping connection";
+                    break;
+                }
+                payload.swap(plaintext);
+            } else if (session) {
+                LOG_WARN("Net") << "Unencrypted message (type " << int(header.type)
+                                << ") after authentication — dropping connection";
+                break;
+            } else if (type != exdp::MessageType::KeyExchange && type != exdp::MessageType::PairAccept &&
+                       type != exdp::MessageType::PairReject && type != exdp::MessageType::Ping &&
+                       type != exdp::MessageType::Pong && type != exdp::MessageType::Disconnect) {
+                LOG_WARN("Net") << "Ignoring message type " << int(header.type) << " before authentication";
+                continue;
+            }
+
             switch (type) {
                 case exdp::MessageType::Welcome:
                     handleWelcome(payload);
@@ -188,7 +214,7 @@ void StreamReceiver::runConnectionLoop(std::string host) {
                     handleSenderStats(payload);
                     break;
                 case exdp::MessageType::Disconnect:
-                    std::cout << "[Net] Disconnect received" << std::endl;
+                    LOG_INFO("Net") << "Disconnect received";
                     m_running.store(false);
                     break;
                 case exdp::MessageType::ClipboardData:
@@ -197,14 +223,14 @@ void StreamReceiver::runConnectionLoop(std::string host) {
                         m_clipboardCallback(text);
                     }
                     break;
-                case exdp::MessageType::PairChallenge:
-                    keepConnection = handlePairChallenge(payload);
+                case exdp::MessageType::KeyExchange:
+                    keepConnection = handleKeyExchange(payload);
                     break;
                 case exdp::MessageType::PairAccept:
-                    handlePairAccept(payload);
+                    keepConnection = handlePairAccept(payload);
                     break;
                 case exdp::MessageType::PairReject:
-                    keepConnection = handlePairReject();
+                    keepConnection = handlePairReject(payload);
                     break;
                 default:
                     break;
@@ -216,27 +242,40 @@ void StreamReceiver::runConnectionLoop(std::string host) {
         closeTcpSocket();
         closeUdpSocket();
         if (m_udpThread.joinable()) m_udpThread.join();
+        {
+            std::lock_guard<std::mutex> lock(m_handshakeMutex);
+            m_ephemeral.reset();
+            m_handshakeKeys.reset();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_sendMutex);
+            std::atomic_store(&m_session, std::shared_ptr<SecureSession>());
+        }
+        if (m_versionMismatch) {
+            m_versionMismatch = false;
+            m_reconnectAttempts = 10;   // longest backoff: retrying won't help until updated
+        }
 
         if (!m_running.load() || !m_autoReconnect.load()) break;
         waitBeforeReconnect();
     }
 
     m_state.store(State::Disconnected);
-    std::cout << "[Net] Network thread exiting" << std::endl;
+    LOG_DEBUG("Net") << "Network thread exiting";
 }
 
 void StreamReceiver::waitBeforeReconnect() {
     m_state.store(State::Reconnecting);
     if (m_skipBackoff.exchange(false)) {
-        std::cout << "[Net] Reconnecting now" << std::endl;
+        LOG_INFO("Net") << "Reconnecting now";
         return;
     }
 
     // Phase 15: exponential backoff 1 s, 2 s, 4 s, 8 s (cap)
     m_reconnectAttempts++;
     int delayMs = (std::min)(1000 << (std::min)(m_reconnectAttempts - 1, 3), MAX_BACKOFF_MS);
-    std::cout << "[Net] Reconnecting in " << delayMs / 1000 << "s (attempt "
-              << m_reconnectAttempts << ")" << std::endl;
+    LOG_INFO("Net") << "Reconnecting in " << delayMs / 1000 << "s (attempt "
+              << m_reconnectAttempts << ")";
     for (int waited = 0; waited < delayMs && m_running.load(); waited += 100) {
         if (m_skipBackoff.exchange(false)) break;
         Sleep(100);
@@ -248,7 +287,7 @@ void StreamReceiver::waitBeforeReconnect() {
 bool StreamReceiver::tcpConnect(const std::string& hostIP) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
-        std::cerr << "[Net] TCP socket creation failed" << std::endl;
+        LOG_ERROR("Net") << "TCP socket creation failed";
         return false;
     }
 
@@ -256,7 +295,7 @@ bool StreamReceiver::tcpConnect(const std::string& hostIP) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(exdp::TCP_PORT);
     if (inet_pton(AF_INET, hostIP.c_str(), &addr.sin_addr) != 1) {
-        std::cerr << "[Net] Invalid IPv4 address: " << hostIP << std::endl;
+        LOG_ERROR("Net") << "Invalid IPv4 address: " << hostIP;
         closesocket(s);
         return false;
     }
@@ -277,11 +316,11 @@ bool StreamReceiver::tcpConnect(const std::string& hostIP) {
         timeval tv{ CONNECT_TIMEOUT_MS / 1000, (CONNECT_TIMEOUT_MS % 1000) * 1000 };
         int ready = select(0, nullptr, &writeSet, &errorSet, &tv);
         connected = ready > 0 && FD_ISSET(s, &writeSet) && !FD_ISSET(s, &errorSet);
-        if (ready == 0) std::cerr << "[Net] TCP connect timed out" << std::endl;
+        if (ready == 0) LOG_WARN("Net") << "TCP connect timed out";
     }
 
     if (!connected) {
-        std::cerr << "[Net] TCP connect failed: " << WSAGetLastError() << std::endl;
+        LOG_WARN("Net") << "TCP connect failed: " << WSAGetLastError();
         closesocket(s);
         return false;
     }
@@ -316,10 +355,34 @@ void StreamReceiver::closeUdpSocket() {
 
 void StreamReceiver::tcpSendMessage(exdp::MessageType type, const void* payload, uint32_t payloadLen,
                                     uint64_t timestamp) {
-    // Serialize whole messages so concurrent senders can't interleave bytes
+    // Serialize whole messages so concurrent senders can't interleave bytes —
+    // and so the encryption counter advances in send order
     std::lock_guard<std::mutex> lock(m_sendMutex);
     if (m_tcpSocket == INVALID_SOCKET) return;
-    auto msg = exdp::buildMessage(type, 0, m_sequence++, timestamp, payload, payloadLen);
+
+    auto session = std::atomic_load(&m_session);
+    if (!session) {
+        auto msg = exdp::buildMessage(type, 0, m_sequence++, timestamp, payload, payloadLen);
+        send(m_tcpSocket, (const char*)msg.data(), (int)msg.size(), 0);
+        return;
+    }
+
+    // header (CRC 0, authenticated as associated data) | ciphertext | tag
+    exdp::ProtocolHeader hdr;
+    hdr.type = static_cast<uint8_t>(type);
+    hdr.flags = exdp::FLAG_ENCRYPTED;
+    hdr.sequence = m_sequence++;
+    hdr.timestamp = timestamp;
+    hdr.payloadLength = payloadLen + exdp::AEAD_TAG_SIZE;
+    std::vector<uint8_t> msg(exdp::HEADER_SIZE);
+    memcpy(msg.data(), &hdr, exdp::HEADER_SIZE);
+    std::vector<uint8_t> sealed;
+    if (!session->sealControl(msg.data(), exdp::HEADER_SIZE, static_cast<const uint8_t*>(payload),
+                              payloadLen, sealed)) {
+        LOG_ERROR("Net") << "Encrypting a control message failed";
+        return;
+    }
+    msg.insert(msg.end(), sealed.begin(), sealed.end());
     send(m_tcpSocket, (const char*)msg.data(), (int)msg.size(), 0);
 }
 
@@ -336,8 +399,8 @@ bool StreamReceiver::recvExact(uint8_t* dst, size_t len) {
             auto silentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 Clock::now() - m_lastRxTime).count();
             if (silentMs > PEER_TIMEOUT_MS) {
-                std::cerr << "[Net] No data from Mac for " << silentMs / 1000
-                          << "s — connection presumed dead" << std::endl;
+                LOG_WARN("Net") << "No data from Mac for " << silentMs / 1000
+                          << "s — connection presumed dead";
                 return false;
             }
             continue;
@@ -351,18 +414,18 @@ bool StreamReceiver::recvExact(uint8_t* dst, size_t len) {
     return true;
 }
 
-bool StreamReceiver::tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector<uint8_t>& payload) {
-    uint8_t headerBuf[exdp::HEADER_SIZE];
+bool StreamReceiver::tcpReceiveMessage(exdp::ProtocolHeader& header, uint8_t headerBuf[exdp::HEADER_SIZE],
+                                       std::vector<uint8_t>& payload) {
     if (!recvExact(headerBuf, exdp::HEADER_SIZE)) return false;
 
     if (!exdp::parseHeader(headerBuf, exdp::HEADER_SIZE, header)) {
-        std::cerr << "[Net] Bad message header (stream out of sync)" << std::endl;
+        LOG_ERROR("Net") << "Bad message header (stream out of sync)";
         return false;
     }
     // Never trust the length field: a corrupt value would allocate gigabytes
-    if (header.payloadLength > MAX_CONTROL_PAYLOAD) {
-        std::cerr << "[Net] Control payload too large (" << header.payloadLength
-                  << " bytes) — dropping connection" << std::endl;
+    if (header.payloadLength > MAX_CONTROL_PAYLOAD + exdp::AEAD_TAG_SIZE) {
+        LOG_ERROR("Net") << "Control payload too large (" << header.payloadLength
+                  << " bytes) — dropping connection";
         return false;
     }
 
@@ -378,7 +441,7 @@ bool StreamReceiver::tcpReceiveMessage(exdp::ProtocolHeader& header, std::vector
 bool StreamReceiver::udpBind() {
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) {
-        std::cerr << "[Net] UDP socket creation failed" << std::endl;
+        LOG_ERROR("Net") << "UDP socket creation failed";
         return false;
     }
 
@@ -400,7 +463,7 @@ bool StreamReceiver::udpBind() {
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(s, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        std::cerr << "[Net] UDP bind failed: " << WSAGetLastError() << std::endl;
+        LOG_ERROR("Net") << "UDP bind failed: " << WSAGetLastError();
         closesocket(s);
         return false;
     }
@@ -413,6 +476,8 @@ bool StreamReceiver::udpBind() {
 void StreamReceiver::udpReceiveLoop() {
     try {
         std::vector<uint8_t> buffer(65536);
+        std::vector<uint8_t> plaintext;
+        plaintext.reserve(2048);
         SOCKET s = m_udpSocket;
 
         m_haveUdpSequence = false;
@@ -440,7 +505,18 @@ void StreamReceiver::udpReceiveLoop() {
                 if (err != WSAETIMEDOUT && err != WSAECONNRESET) break;  // socket closed
             } else if (n >= exdp::HEADER_SIZE) {
                 exdp::ProtocolHeader header;
-                if (exdp::parseHeader(buffer.data(), n, header)) {
+                auto session = std::atomic_load(&m_session);
+                if (!exdp::parseHeader(buffer.data(), n, header)) {
+                    // not ours
+                } else if (!session || !(header.flags & exdp::FLAG_ENCRYPTED) ||
+                           header.version != exdp::PROTOCOL_VERSION) {
+                    LOG_EVERY_MS(5000, LogLevel::Warning, "Net") << "Dropping unauthenticated UDP packet";
+                } else if (!session->openVideo(buffer.data(), (size_t)n, exdp::HEADER_SIZE, plaintext)) {
+                    // Forged, corrupted or replayed: never reaches the decoder
+                    LOG_EVERY_MS(5000, LogLevel::Warning, "Net")
+                        << "Video packet failed authentication or was replayed ("
+                        << session->videoRejected() << " so far)";
+                } else {
                     {
                         std::lock_guard<std::mutex> lock(m_statsMutex);
                         m_stats.bytesReceived += n;
@@ -449,8 +525,8 @@ void StreamReceiver::udpReceiveLoop() {
                     trackUdpSequence(header.sequence);
 
                     auto type = static_cast<exdp::MessageType>(header.type);
-                    const uint8_t* payload = buffer.data() + exdp::HEADER_SIZE;
-                    size_t payloadLen = (size_t)n - exdp::HEADER_SIZE;
+                    const uint8_t* payload = plaintext.data();
+                    size_t payloadLen = plaintext.size();
 
                     if (type == exdp::MessageType::VideoFrame) {
                         handleVideoFrame(header, payload, payloadLen, rxUs);
@@ -481,10 +557,10 @@ void StreamReceiver::udpReceiveLoop() {
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "[Net] Fatal error in UDP thread: " << e.what() << std::endl;
+        LOG_CRITICAL("Net") << "Fatal error in UDP thread: " << e.what();
     }
 
-    std::cout << "[Net] UDP receive loop exiting" << std::endl;
+    LOG_DEBUG("Net") << "UDP receive loop exiting";
 }
 
 void StreamReceiver::trackUdpSequence(uint32_t sequence) {
@@ -531,7 +607,7 @@ void StreamReceiver::requestKeyframeAfterLoss() {
 void StreamReceiver::handleWelcome(const std::vector<uint8_t>&) {
     // The keyframe is requested by the UI thread once the decoder is ready
     // (requesting it here races with the decoder reset on START_STREAM).
-    std::cout << "[Net] WELCOME received" << std::endl;
+    LOG_INFO("Net") << "WELCOME received";
 }
 
 void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
@@ -540,9 +616,8 @@ void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
     exdp::StartStreamPayload info;
     memcpy(&info, payload.data(), sizeof(info));
 
-    std::cout << "[Net] START_STREAM: " << info.width << "x" << info.height
-              << " @ " << info.fps << " FPS, " << (info.bitrate / 1000000) << " Mbps"
-              << std::endl;
+    LOG_INFO("Net") << "START_STREAM: " << info.width << "x" << info.height
+              << " @ " << info.fps << " FPS, " << (info.bitrate / 1000000) << " Mbps";
 
     m_udpSequenceReset.store(true);
     m_frameSeqReset.store(true);     // the Mac restarts its frame numbering
@@ -556,7 +631,7 @@ void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
 }
 
 void StreamReceiver::handleStopStream() {
-    std::cout << "[Net] STOP_STREAM received" << std::endl;
+    LOG_INFO("Net") << "STOP_STREAM received";
     m_state.store(State::Connected);
 }
 
@@ -801,93 +876,207 @@ SenderSample StreamReceiver::senderStats() const {
     return m_senderSample;
 }
 
-// ── Pairing Handlers ───────────────────────────────────────────────────────────
+// ── Handshake (protocol v2, see Security/SecureChannel.h) ───────────────────
 
-bool StreamReceiver::handlePairChallenge(const std::vector<uint8_t>& payload) {
-    if (payload.size() < sizeof(exdp::PairChallengePayload)) return true;
+void StreamReceiver::sendHello() {
+    exdp::HelloPayload hello{};
+    strncpy_s(hello.receiverName, ComputerNameUTF8().c_str(), sizeof(hello.receiverName) - 1);
+    hello.udpPort = exdp::UDP_PORT;
+    std::string deviceId = m_pairingManager ? m_pairingManager->getDeviceId() : std::string();
+    strncpy_s(hello.deviceId, deviceId.c_str(), sizeof(hello.deviceId) - 1);
 
-    exdp::PairChallengePayload challenge;
-    memcpy(&challenge, payload.data(), sizeof(challenge));
+    // A fresh key for every connection; HELLO commits to it so the Mac can't
+    // be shown a key chosen after seeing its own
+    auto ephemeral = crypto::EcdhKeyPair::Generate();
+    if (!ephemeral) {
+        LOG_CRITICAL("Pairing") << "Could not generate a P-256 key (Windows CNG) — cannot connect securely";
+        setUserMessage("Windows could not create an encryption key.\nSee receiver.log.");
+        return;
+    }
+    crypto::Bytes commitment = KeySchedule::Commitment(ephemeral->publicKey());
+    memcpy(hello.commitment, commitment.data(), sizeof(hello.commitment));
 
-    if (challenge.type == exdp::PAIR_PIN) {
-        // First-time pairing — the UI thread shows the PIN dialog. Don't block
-        // here: this thread must keep answering heartbeat PINGs meanwhile.
-        std::cout << "[Pairing] PIN required — enter the PIN shown in the Mac app" << std::endl;
-        m_pinWantedFor.store(m_connectionId.load());
-        m_pinRequestNew.store(true);
+    {
+        std::lock_guard<std::mutex> lock(m_handshakeMutex);
+        m_ephemeral = std::move(ephemeral);
+        m_handshakeKeys.reset();
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&hello);
+        m_helloBytes.assign(bytes, bytes + sizeof(hello));
+    }
+    tcpSendMessage(exdp::MessageType::Hello, &hello, sizeof(hello));
+    LOG_INFO("Net") << "HELLO sent as '" << hello.receiverName << "' (device " << deviceId.substr(0, 8) << "…)";
+}
 
-    } else if (challenge.type == exdp::PAIR_HMAC) {
-        // Already paired — compute HMAC response
-        std::cout << "[Pairing] HMAC challenge received (auto-authenticating)" << std::endl;
+bool StreamReceiver::handleKeyExchange(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::KeyExchangePayload)) return false;
+    exdp::KeyExchangePayload kx;
+    memcpy(&kx, payload.data(), sizeof(kx));
+    crypto::Bytes kxBytes(payload.begin(), payload.begin() + sizeof(kx));
 
-        if (m_pairingManager && m_pairingManager->isPaired()) {
-            exdp::PairResponsePayload response{};
-            response.type = exdp::PAIR_HMAC;
-            if (m_pairingManager->computeHMAC(challenge.nonce, 32, response.data)) {
-                tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
-                std::cout << "[Pairing] HMAC response sent" << std::endl;
-            } else {
-                std::cerr << "[Pairing] HMAC computation failed" << std::endl;
-            }
-        } else {
-            // Mac remembers this device ID but we lost the key. Switch to a fresh
-            // device ID and reconnect so the Mac falls back to PIN pairing.
-            std::cerr << "[Pairing] Mac expects a paired device but we have no key — re-pairing" << std::endl;
-            if (m_pairingManager) m_pairingManager->clearPairing();
+    crypto::Bytes ourKey, helloBytes, shared;
+    {
+        std::lock_guard<std::mutex> lock(m_handshakeMutex);
+        if (!m_ephemeral || m_handshakeKeys) return false;   // unexpected
+        ourKey = m_ephemeral->publicKey();
+        helloBytes = m_helloBytes;
+        if (!m_ephemeral->agree(kx.publicKey, sizeof(kx.publicKey), shared)) {
+            LOG_ERROR("Pairing") << "The Mac sent an invalid public key";
             return false;
         }
     }
+
+    // Reveal the key HELLO committed to
+    tcpSendMessage(exdp::MessageType::KeyReveal, ourKey.data(), (uint32_t)ourKey.size());
+    crypto::Bytes transcript = KeySchedule::TranscriptHash(helloBytes, kxBytes, ourKey);
+
+    if (kx.mode == exdp::HANDSHAKE_PAIRED) {
+        crypto::Bytes pairingKey = m_pairingManager ? m_pairingManager->getPairingKey() : crypto::Bytes();
+        if (pairingKey.size() != 32) {
+            // The Mac remembers this device ID but the key is gone (pairing.dat
+            // deleted / another Windows user): start over with a new identity
+            LOG_WARN("Pairing") << "The Mac expects a paired receiver but the pairing key is missing — pairing again";
+            if (m_pairingManager) m_pairingManager->clearPairing();
+            m_skipBackoff.store(true);
+            return false;
+        }
+        auto keys = std::make_unique<SessionKeys>(KeySchedule::Derive(shared, &pairingKey, transcript));
+        crypto::Bytes mac = KeySchedule::Confirmation(keys->confirmWin, transcript);
+        {
+            std::lock_guard<std::mutex> lock(m_handshakeMutex);
+            m_handshakeKeys = std::move(keys);
+        }
+        tcpSendMessage(exdp::MessageType::PairConfirm, mac.data(), (uint32_t)mac.size());
+        LOG_INFO("Pairing") << "Authenticating with the stored pairing";
+        return true;
+    }
+
+    // New pairing: the user types the code the Mac shows; it must equal ours
+    auto keys = std::make_unique<SessionKeys>(KeySchedule::Derive(shared, nullptr, transcript));
+    {
+        std::lock_guard<std::mutex> lock(m_handshakeMutex);
+        m_handshakeKeys = std::move(keys);
+    }
+    if (m_pairingManager && m_pairingManager->isPaired()) {
+        LOG_INFO("Pairing") << "The Mac does not know this receiver (any more) — pairing again";
+    }
+    LOG_INFO("Pairing") << "New pairing — enter the code shown in the Mac app";
+    m_pinWantedFor.store(m_connectionId.load());
+    m_pinRequestNew.store(true);
     return true;
 }
 
-bool StreamReceiver::takePinRequest(uint32_t& outRequestId) {
+bool StreamReceiver::takeCodeRequest(uint32_t& outRequestId) {
     if (!m_pinRequestNew.exchange(false)) return false;
     outRequestId = m_pinWantedFor.load();
     return outRequestId != 0;
 }
 
-void StreamReceiver::submitPIN(uint32_t requestId, const std::string& pin) {
+StreamReceiver::CodeResult StreamReceiver::submitVerificationCode(uint32_t requestId, const std::string& typed) {
     // Claim the request so a double submit or a stale dialog can't send twice
     uint32_t expected = requestId;
     if (requestId == 0 || !m_pinWantedFor.compare_exchange_strong(expected, 0)) {
-        std::cout << "[Pairing] PIN request expired — waiting for a new one" << std::endl;
-        return;
+        LOG_INFO("Pairing") << "Pairing request expired — waiting for a new one";
+        return CodeResult::Expired;
     }
 
-    exdp::PairResponsePayload response{};
-    response.type = exdp::PAIR_PIN;
-    strncpy_s((char*)response.data, sizeof(response.data),
-              pin.c_str(), sizeof(response.data) - 1);
-    tcpSendMessage(exdp::MessageType::PairResponse, &response, sizeof(response));
-    std::cout << "[Pairing] PIN sent" << std::endl;
+    std::string code;
+    for (char c : typed) {
+        if (c >= '0' && c <= '9') code += c;
+    }
+
+    std::string wanted;
+    crypto::Bytes mac;
+    {
+        std::lock_guard<std::mutex> lock(m_handshakeMutex);
+        if (!m_handshakeKeys) return CodeResult::Expired;
+        wanted = m_handshakeKeys->verificationCode;
+        mac = KeySchedule::Confirmation(m_handshakeKeys->confirmWin, m_handshakeKeys->transcriptHash);
+    }
+
+    if (code.size() != wanted.size() ||
+        !crypto::ConstantTimeEqual(reinterpret_cast<const uint8_t*>(code.data()),
+                                   reinterpret_cast<const uint8_t*>(wanted.data()), wanted.size())) {
+        // A typo — or a man in the middle, who causes different codes on the two sides
+        LOG_WARN("Pairing") << "The code does not match this connection — restarting pairing with a new code";
+        forceReconnect();
+        return CodeResult::Mismatch;
+    }
+
+    tcpSendMessage(exdp::MessageType::PairConfirm, mac.data(), (uint32_t)mac.size());
+    LOG_INFO("Pairing") << "Code verified — approve the pairing on the Mac";
+    return CodeResult::Sent;
 }
 
-void StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
-    if (payload.size() < sizeof(exdp::PairAcceptPayload)) return;
-    m_pinWantedFor.store(0);
-
+bool StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
+    if (payload.size() < sizeof(exdp::PairAcceptPayload)) return false;
     exdp::PairAcceptPayload accept;
     memcpy(&accept, payload.data(), sizeof(accept));
-
-    if (accept.newlyPaired && m_pairingManager) {
-        // Save the new pairing key
-        m_pairingManager->savePairing("Mac Sender", accept.pairingKey, 32);
-        std::cout << "[Pairing] \xe2\x9c\x85 Paired successfully!" << std::endl;
-    } else {
-        std::cout << "[Pairing] \xe2\x9c\x85 Auto-authenticated" << std::endl;
-    }
-}
-
-bool StreamReceiver::handlePairReject() {
-    std::cerr << "[Pairing] \xe2\x9d\x8c Pairing rejected by Mac (wrong PIN or unknown key)" << std::endl;
     m_pinWantedFor.store(0);
 
-    // Clear any stored pairing that might be invalid
-    if (m_pairingManager) {
-        m_pairingManager->clearPairing();
+    std::unique_ptr<SessionKeys> keys;
+    {
+        std::lock_guard<std::mutex> lock(m_handshakeMutex);
+        keys = std::move(m_handshakeKeys);
+        m_ephemeral.reset();
+    }
+    // The Mac proves it derived the same keys (mutual authentication)
+    if (!keys || !KeySchedule::Verify(accept.mac, keys->confirmMac, keys->transcriptHash)) {
+        LOG_ERROR("Pairing") << "The Mac could not prove the shared keys — not trusting this connection";
+        return false;
     }
 
-    // Drop this connection; auto-reconnect gets a fresh PIN from the Mac
-    std::cerr << "[Pairing] Reconnecting for a new PIN..." << std::endl;
+    auto session = std::make_shared<SecureSession>(*keys);
+    if (!session->valid()) {
+        LOG_CRITICAL("Pairing") << "Could not set up AES-GCM (Windows CNG)";
+        return false;
+    }
+    if (accept.newlyPaired && m_pairingManager) {
+        m_pairingManager->savePairing("Mac at " + m_currentHost, keys->pairingKey);
+    }
+    {
+        // Under the send lock: every message after this point is encrypted
+        std::lock_guard<std::mutex> lock(m_sendMutex);
+        std::atomic_store(&m_session, session);
+    }
+    LOG_INFO("Pairing") << (accept.newlyPaired ? "Paired with the Mac" : "Authenticated")
+                        << " — connection encrypted (AES-256-GCM)";
+    return true;
+}
+
+bool StreamReceiver::handlePairReject(const std::vector<uint8_t>& payload) {
+    m_pinWantedFor.store(0);
+    uint8_t reason = payload.empty() ? static_cast<uint8_t>(exdp::REJECT_GENERIC) : payload[0];
+    switch (reason) {
+        case exdp::REJECT_USER_REJECTED:
+            LOG_WARN("Pairing") << "Pairing was rejected on the Mac";
+            setUserMessage("Pairing was rejected on the Mac.\nRestart the receiver to try again.");
+            m_autoReconnect.store(false);   // don't pester the Mac with new requests
+            break;
+        case exdp::REJECT_UNKNOWN_DEVICE:
+            LOG_WARN("Pairing") << "The Mac no longer accepts this receiver's pairing — pairing again";
+            if (m_pairingManager) m_pairingManager->clearPairing();
+            m_skipBackoff.store(true);
+            break;
+        case exdp::REJECT_VERSION_MISMATCH:
+            LOG_ERROR("Pairing") << "The Mac app uses a different protocol version — update both apps";
+            setUserMessage("The Mac app and this receiver are different versions.\nUpdate both apps.");
+            m_versionMismatch = true;
+            break;
+        default:
+            LOG_WARN("Pairing") << "The Mac refused the handshake (reason " << int(reason) << ")";
+            break;
+    }
     return false;
+}
+
+void StreamReceiver::setUserMessage(const std::string& text) {
+    std::lock_guard<std::mutex> lock(m_messageMutex);
+    m_userMessage = text;
+}
+
+std::string StreamReceiver::takeUserMessage() {
+    std::lock_guard<std::mutex> lock(m_messageMutex);
+    std::string text;
+    text.swap(m_userMessage);
+    return text;
 }

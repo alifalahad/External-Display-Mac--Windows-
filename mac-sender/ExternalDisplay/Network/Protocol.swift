@@ -9,6 +9,13 @@
 //   Sequence(4) | Timestamp(8) | PayloadLen(4) | CRC32(4)
 //
 // All multi-byte integers are little-endian on the wire.
+//
+// Version 2 (Phase 14 rework): every message after the handshake is encrypted
+// (MessageFlags.encrypted, AES-256-GCM, header = associated data):
+//   TCP: header ‖ ciphertext ‖ tag(16)               nonce counter implicit
+//   UDP: header ‖ counter(8, BE) ‖ ciphertext ‖ tag   counter explicit
+// The CRC field is 0 on encrypted messages: the GCM tag protects them.
+// See SecureChannel.swift and docs/PROTOCOL.md.
 // =============================================================================
 
 import Foundation
@@ -17,11 +24,13 @@ import Foundation
 
 enum ProtocolConstants {
     static let magic: UInt32 = 0x50445845    // "EXDP" in little-endian
-    static let version: UInt8 = 0x01
+    static let version: UInt8 = 0x02
     static let headerSize = 28
     static let tcpPort: UInt16 = 9876
     static let udpPort: UInt16 = 9877
-    static let maxFragmentPayload = 1364     // 1400 - 28 header - 8 frag header
+    /// 1400-byte datagrams: 28 header + 8 counter + 16 tag + 8 fragment header
+    static let maxFragmentPayload = 1340
+    static let udpCounterSize = 8
     static let bonjourType = "_externaldisplay._tcp"
 }
 
@@ -40,10 +49,11 @@ enum MessageType: UInt8 {
     case senderStats    = 0x51   // Mac → Win: sender-side performance (1 Hz)
     case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
     case clipboardData  = 0x70   // Both: clipboard text sync
-    case pairChallenge  = 0x80   // Mac → Win: pairing challenge
-    case pairResponse   = 0x81   // Win → Mac: pairing response (PIN or HMAC)
-    case pairAccept     = 0x82   // Mac → Win: pairing accepted
-    case pairReject     = 0x83   // Mac → Win: pairing rejected
+    case keyExchange    = 0x80   // Mac → Win: handshake mode + Mac's ephemeral key
+    case pairConfirm    = 0x81   // Win → Mac: HMAC over the handshake transcript
+    case pairAccept     = 0x82   // Mac → Win: Mac's HMAC; encryption starts after it
+    case pairReject     = 0x83   // Mac → Win: handshake refused (reason)
+    case keyReveal      = 0x84   // Win → Mac: Windows' ephemeral key (was committed in HELLO)
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)
@@ -55,9 +65,11 @@ enum MessageType: UInt8 {
 
 struct MessageFlags: OptionSet {
     let rawValue: UInt16
-    static let keyframe = MessageFlags(rawValue: 1 << 0)
+    static let keyframe  = MessageFlags(rawValue: 1 << 0)
     /// Video: the reassembled frame starts with a FrameTimingPrefix
-    static let timing   = MessageFlags(rawValue: 1 << 1)
+    static let timing    = MessageFlags(rawValue: 1 << 1)
+    /// Payload is AES-GCM sealed (protocol v2, after the handshake)
+    static let encrypted = MessageFlags(rawValue: 1 << 2)
 }
 
 // ── Protocol Header ────────────────────────────────────────────────────────
@@ -133,133 +145,121 @@ struct FragmentHeader {
 
 // ── Control Message Payloads ────────────────────────────────────────────────
 
-/// HELLO payload (Windows → Mac, 130 bytes)
+/// HELLO payload (Windows → Mac, 162 bytes)
 struct HelloPayload {
+    static let size = 162
+
     var receiverName: String = "Windows Receiver"
     var udpPort: UInt16 = ProtocolConstants.udpPort
-    var deviceId: String = ""   // Unique device identifier for pairing
+    var deviceId: String = ""             // identifies a paired receiver
+    var commitment = Data(count: 32)      // SHA256(Windows' ephemeral public key)
 
     func serialize() -> Data {
         var data = Data()
-        // Name as null-terminated UTF-8, max 64 bytes
-        let nameData = receiverName.utf8.prefix(63)
-        data.append(contentsOf: nameData)
-        data.append(0) // null terminator
-        // Pad to 64 bytes
-        data.append(contentsOf: [UInt8](repeating: 0, count: 64 - data.count))
+        data.append(Self.fixedField(receiverName, size: 64))
         data.appendLE(udpPort)
-        // Device ID as null-terminated UTF-8, 64 bytes
-        let idData = deviceId.utf8.prefix(63)
-        data.append(contentsOf: idData)
-        data.append(0)
-        let idPadding = 64 - (idData.count + 1)
-        if idPadding > 0 {
-            data.append(contentsOf: [UInt8](repeating: 0, count: idPadding))
-        }
+        data.append(Self.fixedField(deviceId, size: 64))
+        data.append(commitment.prefix(32))
+        data.append(Data(count: 32 - min(commitment.count, 32)))
         return data
     }
 
     static func deserialize(from data: Data) -> HelloPayload? {
-        guard data.count >= 66 else { return nil }
+        guard data.count >= size else { return nil }
         var h = HelloPayload()
         let base = data.startIndex
         h.receiverName = data.subdata(in: base..<base + 64).nullTerminatedUTF8String()
-        var offset = 64
+        var offset = base + 64
         h.udpPort = data.readLE(at: &offset)
-        // Device ID (added in Phase 14) — empty if the receiver is too old to send it
-        if data.count >= 130 {
-            h.deviceId = data.subdata(in: base + 66..<base + 130).nullTerminatedUTF8String()
-        }
+        h.deviceId = data.subdata(in: base + 66..<base + 130).nullTerminatedUTF8String()
+        h.commitment = data.subdata(in: base + 130..<base + 162)
         return h
     }
+
+    /// Null-terminated, zero-padded UTF-8 (never splits a character)
+    static func fixedField(_ text: String, size: Int) -> Data {
+        var bytes = Data()
+        for ch in text {
+            let utf8 = Data(String(ch).utf8)
+            if bytes.count + utf8.count > size - 1 { break }
+            bytes.append(utf8)
+        }
+        bytes.append(Data(count: size - bytes.count))
+        return bytes
+    }
 }
 
-// ── Pairing Payloads ────────────────────────────────────────────────────────
+// ── Handshake Payloads (protocol v2) ────────────────────────────────────────
 
-/// Challenge types for PAIR_CHALLENGE
-enum PairChallengeType: UInt8 {
-    case pin  = 0   // First-time pairing: user must enter PIN
-    case hmac = 1   // Already paired: HMAC challenge-response
+/// Handshake mode chosen by the Mac
+enum HandshakeMode: UInt8 {
+    case newPairing = 0   // unknown device: verification code + user approval
+    case paired     = 1   // stored pairing key mixed into the keys
 }
 
-/// PAIR_CHALLENGE payload (Mac → Windows, 40 bytes)
-struct PairChallengePayload {
-    var type: UInt8 = 0          // PairChallengeType
-    var nonce: Data = Data(repeating: 0, count: 32)  // 32-byte random nonce
+/// KEY_EXCHANGE payload (Mac → Windows, 73 bytes)
+struct KeyExchangePayload {
+    static let size = 8 + KeySchedule.publicKeySize
+
+    var mode: HandshakeMode = .newPairing
+    var publicKey = Data(count: KeySchedule.publicKeySize)
 
     func serialize() -> Data {
-        var data = Data(capacity: 40)
-        data.append(type)
-        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
-        data.append(nonce.prefix(32))
-        // Pad nonce if needed
-        if nonce.count < 32 {
-            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - nonce.count))
-        }
+        var data = Data([mode.rawValue])
+        data.append(Data(count: 7))
+        data.append(publicKey)
         return data
-    }
-
-    static func deserialize(from data: Data) -> PairChallengePayload? {
-        guard data.count >= 40 else { return nil }
-        var p = PairChallengePayload()
-        p.type = data[0]
-        p.nonce = data.subdata(in: 8..<40)
-        return p
     }
 }
 
-/// PAIR_RESPONSE payload (Windows → Mac, 40 bytes)
-struct PairResponsePayload {
-    var type: UInt8 = 0          // 0 = PIN response, 1 = HMAC response
-    var data_: Data = Data(repeating: 0, count: 32)  // PIN (null-padded) or HMAC-SHA256
+/// KEY_REVEAL payload (Windows → Mac, 65 bytes)
+struct KeyRevealPayload {
+    var publicKey = Data()
 
-    func serialize() -> Data {
-        var data = Data(capacity: 40)
-        data.append(type)
-        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
-        data.append(data_.prefix(32))
-        if data_.count < 32 {
-            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - data_.count))
-        }
-        return data
-    }
-
-    static func deserialize(from data: Data) -> PairResponsePayload? {
-        guard data.count >= 40 else { return nil }
-        var p = PairResponsePayload()
-        p.type = data[0]
-        p.data_ = data.subdata(in: 8..<40)
-        return p
-    }
-
-    /// Extract PIN string from data_ field
-    var pinString: String {
-        data_.nullTerminatedUTF8String()
+    static func deserialize(from data: Data) -> KeyRevealPayload? {
+        guard data.count >= KeySchedule.publicKeySize else { return nil }
+        return KeyRevealPayload(publicKey: Data(data.prefix(KeySchedule.publicKeySize)))
     }
 }
 
-/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes)
+/// PAIR_CONFIRM payload (Windows → Mac, 32 bytes): HMAC(confirm-win, TH)
+struct PairConfirmPayload {
+    var mac = Data()
+
+    static func deserialize(from data: Data) -> PairConfirmPayload? {
+        guard data.count >= 32 else { return nil }
+        return PairConfirmPayload(mac: Data(data.prefix(32)))
+    }
+}
+
+/// PAIR_ACCEPT payload (Mac → Windows, 40 bytes): HMAC(confirm-mac, TH)
 struct PairAcceptPayload {
-    var newlyPaired: UInt8 = 0   // 1 = new pairing (key included), 0 = existing
-    var pairingKey: Data = Data(repeating: 0, count: 32)  // 256-bit pairing key
+    var newlyPaired: Bool = false
+    var mac = Data(count: 32)
 
     func serialize() -> Data {
-        var data = Data(capacity: 40)
-        data.append(newlyPaired)
-        data.append(contentsOf: [UInt8](repeating: 0, count: 7))  // reserved
-        data.append(pairingKey.prefix(32))
-        if pairingKey.count < 32 {
-            data.append(contentsOf: [UInt8](repeating: 0, count: 32 - pairingKey.count))
-        }
+        var data = Data([newlyPaired ? 1 : 0])
+        data.append(Data(count: 7))
+        data.append(mac.prefix(32))
         return data
     }
+}
 
-    static func deserialize(from data: Data) -> PairAcceptPayload? {
-        guard data.count >= 40 else { return nil }
-        var p = PairAcceptPayload()
-        p.newlyPaired = data[0]
-        p.pairingKey = data.subdata(in: 8..<40)
-        return p
+/// PAIR_REJECT reasons
+enum PairRejectReason: UInt8 {
+    case generic          = 0
+    case userRejected     = 1   // Mac user clicked Reject / wrong code
+    case unknownDevice    = 2   // stored keys don't match: pair again
+    case versionMismatch  = 3   // update both apps
+    case badHandshake     = 4   // malformed handshake / commitment mismatch
+}
+
+/// PAIR_REJECT payload (Mac → Windows, 4 bytes)
+struct PairRejectPayload {
+    var reason: PairRejectReason = .generic
+
+    func serialize() -> Data {
+        Data([reason.rawValue, 0, 0, 0])
     }
 }
 

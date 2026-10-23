@@ -1,201 +1,155 @@
 // =============================================================================
-// PairingManager.cpp — Secure device pairing for Windows receiver
+// PairingManager.cpp — Device ID and DPAPI-protected pairing key
 // =============================================================================
 
-#include "PairingManager.h"
+#include "Security/PairingManager.h"
+#include "Security/Crypto.h"
+#include "App/Log.h"
 
 #include <Windows.h>
-#include <bcrypt.h>
-#include <iostream>
+
 #include <fstream>
-#include <sstream>
 #include <iomanip>
-#include <algorithm>
+#include <iterator>
+#include <sstream>
 
-#pragma comment(lib, "bcrypt.lib")
+namespace {
 
-// ── Lifecycle ───────────────────────────────────────────────────────────────
-
-PairingManager::PairingManager() {}
-
-void PairingManager::initialize() {
-    loadPairing();
-    if (isPaired()) {
-        loadOrCreateDeviceId();
-    } else {
-        createDeviceId();
-    }
-    std::cout << "[Pairing] Device ID: " << m_deviceId.substr(0, 16) << "..." << std::endl;
-    if (isPaired()) {
-        std::cout << "[Pairing] Paired with: " << m_pairedServerName << std::endl;
-    } else {
-        std::cout << "[Pairing] Not yet paired" << std::endl;
-    }
-}
-
-// ── HMAC-SHA256 ─────────────────────────────────────────────────────────────
-
-bool PairingManager::computeHMAC(const uint8_t* nonce, size_t nonceLen,
-                                  uint8_t output[32]) {
-    if (m_pairingKey.size() != 32) return false;
-
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    bool success = false;
-
-    NTSTATUS status = BCryptOpenAlgorithmProvider(
-        &hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!BCRYPT_SUCCESS(status)) return false;
-
-    status = BCryptCreateHash(
-        hAlg, &hHash, nullptr, 0,
-        (PUCHAR)m_pairingKey.data(), (ULONG)m_pairingKey.size(), 0);
-    if (BCRYPT_SUCCESS(status)) {
-        status = BCryptHashData(hHash, (PUCHAR)nonce, (ULONG)nonceLen, 0);
-        if (BCRYPT_SUCCESS(status)) {
-            status = BCryptFinishHash(hHash, output, 32, 0);
-            success = BCRYPT_SUCCESS(status);
-        }
-        BCryptDestroyHash(hHash);
-    }
-
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    return success;
-}
-
-// ── Random Number Generation ────────────────────────────────────────────────
-
-bool PairingManager::generateRandom(uint8_t* buffer, size_t size) {
-    return BCRYPT_SUCCESS(
-        BCryptGenRandom(nullptr, buffer, (ULONG)size, BCRYPT_USE_SYSTEM_PREFERRED_RNG));
-}
-
-// ── Pairing Data Persistence ────────────────────────────────────────────────
-
-void PairingManager::savePairing(const std::string& serverName,
-                                  const uint8_t* key, size_t keyLen) {
-    m_pairingKey.assign(key, key + keyLen);
-    m_pairedServerName = serverName;
-    savePairingToFile();
-    std::cout << "[Pairing] \u2705 Paired with: " << serverName << std::endl;
-}
-
-void PairingManager::clearPairing() {
-    m_pairingKey.clear();
-    m_pairedServerName.clear();
-
-    std::string path = getPairingFilePath();
-    DeleteFileA(path.c_str());
-    createDeviceId();
-    std::cout << "[Pairing] Pairing data cleared (new device ID: "
-              << m_deviceId.substr(0, 16) << "...)" << std::endl;
-}
-
-std::string PairingManager::getPairingFilePath() const {
-    // Store next to the executable
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    std::string path(exePath);
-    auto pos = path.find_last_of("\\/");
-    if (pos != std::string::npos) path = path.substr(0, pos + 1);
-    return path + "paired_server.dat";
-}
-
-std::string PairingManager::getDeviceIdFilePath() const {
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    std::string path(exePath);
-    auto pos = path.find_last_of("\\/");
-    if (pos != std::string::npos) path = path.substr(0, pos + 1);
-    return path + "device_id.dat";
-}
-
-void PairingManager::loadPairing() {
-    std::ifstream file(getPairingFilePath());
-    if (!file.is_open()) return;
-
-    std::string line;
-    std::string serverName;
-    std::string keyHex;
-
-    while (std::getline(file, line)) {
-        if (line.substr(0, 7) == "SERVER=") {
-            serverName = line.substr(7);
-        } else if (line.substr(0, 4) == "KEY=") {
-            keyHex = line.substr(4);
-        }
-    }
-
-    if (!serverName.empty() && keyHex.size() == 64) {
-        m_pairedServerName = serverName;
-        m_pairingKey = hexToBytes(keyHex);
-    }
-}
-
-void PairingManager::savePairingToFile() {
-    std::ofstream file(getPairingFilePath());
-    if (!file.is_open()) {
-        std::cerr << "[Pairing] Failed to save pairing data" << std::endl;
-        return;
-    }
-
-    file << "SERVER=" << m_pairedServerName << std::endl;
-    file << "KEY=" << bytesToHex(m_pairingKey.data(), m_pairingKey.size()) << std::endl;
-}
-
-// ── Device ID ───────────────────────────────────────────────────────────────
-
-void PairingManager::loadOrCreateDeviceId() {
-    // Try to load existing device ID
-    std::ifstream file(getDeviceIdFilePath());
-    if (file.is_open()) {
-        std::getline(file, m_deviceId);
-        if (!m_deviceId.empty()) return;
-    }
-    createDeviceId();
-}
-
-void PairingManager::createDeviceId() {
-    // Generate a new device ID (random UUID-like string)
-    uint8_t randomBytes[16];
-    if (generateRandom(randomBytes, 16)) {
-        // Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        std::ostringstream oss;
-        for (int i = 0; i < 16; i++) {
-            if (i == 4 || i == 6 || i == 8 || i == 10) oss << "-";
-            oss << std::hex << std::setw(2) << std::setfill('0') << (int)randomBytes[i];
-        }
-        m_deviceId = oss.str();
-    } else {
-        // Fallback: use computer name + time
-        char compName[256];
-        DWORD size = sizeof(compName);
-        GetComputerNameA(compName, &size);
-        m_deviceId = std::string(compName) + "-" + std::to_string(GetTickCount64());
-    }
-
-    // Save for future runs
-    std::ofstream outFile(getDeviceIdFilePath());
-    if (outFile.is_open()) {
-        outFile << m_deviceId;
-    }
-}
-
-// ── Hex Conversion Helpers ──────────────────────────────────────────────────
-
-std::string PairingManager::bytesToHex(const uint8_t* data, size_t len) {
+std::string ToHex(const std::vector<uint8_t>& bytes) {
     std::ostringstream oss;
-    for (size_t i = 0; i < len; i++) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << (int)data[i];
-    }
+    for (uint8_t b : bytes) oss << std::hex << std::setw(2) << std::setfill('0') << int(b);
     return oss.str();
 }
 
-std::vector<uint8_t> PairingManager::hexToBytes(const std::string& hex) {
+std::vector<uint8_t> FromHex(const std::string& hex) {
     std::vector<uint8_t> bytes;
     for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        uint8_t byte = (uint8_t)std::strtol(hex.substr(i, 2).c_str(), nullptr, 16);
-        bytes.push_back(byte);
+        bytes.push_back(static_cast<uint8_t>(std::strtol(hex.substr(i, 2).c_str(), nullptr, 16)));
     }
     return bytes;
+}
+
+} // namespace
+
+void PairingManager::initialize() {
+    // Protocol v1 stored a key that had been sent over the network in
+    // plaintext: never use it again
+    if (DeleteFileA(filePath("paired_server.dat").c_str())) {
+        LOG_WARN("Pairing") << "Removed the old (protocol v1) pairing — pair with the Mac again";
+    }
+
+    loadPairing();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_pairingKey.empty()) {
+        std::ifstream file(filePath("device_id.dat"));
+        if (file) std::getline(file, m_deviceId);
+    }
+    if (m_deviceId.empty()) createDeviceId();
+    LOG_INFO("Pairing") << "Device ID " << m_deviceId.substr(0, 8) << "…, "
+                        << (m_pairingKey.empty() ? "not paired yet" : "paired with " + m_pairedServerName);
+}
+
+std::string PairingManager::getDeviceId() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_deviceId;
+}
+
+bool PairingManager::isPaired() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_pairingKey.size() == 32;
+}
+
+std::vector<uint8_t> PairingManager::getPairingKey() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_pairingKey;
+}
+
+std::string PairingManager::pairedServerName() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_pairedServerName;
+}
+
+void PairingManager::savePairing(const std::string& serverName, const std::vector<uint8_t>& key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_pairingKey = key;
+    m_pairedServerName = serverName;
+
+    std::string text = "SERVER=" + serverName + "\nKEY=" + ToHex(key) + "\n";
+    crypto::Bytes sealed;
+    if (!crypto::DpapiProtect(crypto::Bytes(text.begin(), text.end()), sealed)) {
+        LOG_ERROR("Pairing") << "Could not encrypt the pairing key (DPAPI) — pairing kept for this session only";
+        SecureZeroMemory(&text[0], text.size());
+        return;
+    }
+    SecureZeroMemory(&text[0], text.size());
+    std::ofstream file(filePath("pairing.dat"), std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(sealed.data()), static_cast<std::streamsize>(sealed.size()));
+    if (!file) {
+        LOG_ERROR("Pairing") << "Could not write pairing.dat next to the .exe";
+        return;
+    }
+    LOG_INFO("Pairing") << "Paired with " << serverName;
+}
+
+void PairingManager::clearPairing() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_pairingKey.clear();
+    m_pairedServerName.clear();
+    DeleteFileA(filePath("pairing.dat").c_str());
+    createDeviceId();
+    LOG_INFO("Pairing") << "Pairing cleared (new device ID " << m_deviceId.substr(0, 8) << "…)";
+}
+
+std::string PairingManager::filePath(const char* name) const {
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    std::string path(exePath);
+    auto pos = path.find_last_of("\\/");
+    if (pos != std::string::npos) path = path.substr(0, pos + 1);
+    return path + name;
+}
+
+void PairingManager::loadPairing() {
+    std::ifstream file(filePath("pairing.dat"), std::ios::binary);
+    if (!file) return;
+    crypto::Bytes sealed((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    crypto::Bytes plain;
+    if (!crypto::DpapiUnprotect(sealed, plain)) {
+        // Another Windows user, or a copy from another PC: DPAPI can't open it
+        LOG_WARN("Pairing") << "pairing.dat cannot be decrypted for this Windows user — pair again";
+        return;
+    }
+
+    std::istringstream text(std::string(plain.begin(), plain.end()));
+    SecureZeroMemory(plain.data(), plain.size());
+    std::string line, server, keyHex;
+    while (std::getline(text, line)) {
+        if (line.rfind("SERVER=", 0) == 0) server = line.substr(7);
+        else if (line.rfind("KEY=", 0) == 0) keyHex = line.substr(4);
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (keyHex.size() == 64) {
+        m_pairingKey = FromHex(keyHex);
+        m_pairedServerName = server;
+    }
+}
+
+void PairingManager::createDeviceId() {
+    // Called with m_mutex held. Random UUID-style ID (not secret).
+    uint8_t random[16];
+    if (crypto::Random(random, sizeof(random))) {
+        std::ostringstream oss;
+        for (int i = 0; i < 16; i++) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) oss << "-";
+            oss << std::hex << std::setw(2) << std::setfill('0') << int(random[i]);
+        }
+        m_deviceId = oss.str();
+    } else {
+        char name[256];
+        DWORD size = sizeof(name);
+        GetComputerNameA(name, &size);
+        m_deviceId = std::string(name) + "-" + std::to_string(GetTickCount64());
+    }
+    std::ofstream out(filePath("device_id.dat"), std::ios::trunc);
+    out << m_deviceId;
 }

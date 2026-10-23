@@ -1,68 +1,46 @@
 // =============================================================================
-// PairingManager.h — Secure device pairing for Windows receiver
+// PairingManager.h — This receiver's identity and its pairing with a Mac
 // =============================================================================
-// Handles PIN-based pairing and HMAC challenge-response authentication.
-// Uses Windows BCrypt API for HMAC-SHA256 and random number generation.
+// Protocol v2 (see SecureChannel.h): the pairing key is derived by both sides
+// during pairing — it never crosses the network. It is stored next to the
+// .exe in pairing.dat, encrypted with DPAPI for the current Windows user.
+// The device ID (not secret) lets the Mac recognise this receiver.
 //
-// Stores pairing data in a file next to the executable.
+// Thread-safe: the network thread reads the key during the handshake.
 // =============================================================================
 
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <mutex>
+#include <string>
 #include <vector>
 
 class PairingManager {
 public:
-    PairingManager();
-    ~PairingManager() = default;
-
-    /// Initialize: loads existing pairing data and the device ID.
-    /// An unpaired receiver always gets a fresh device ID, so a Mac that still
-    /// remembers an old key falls back to PIN pairing instead of HMAC.
+    /// Load the device ID and any stored pairing. A receiver without a pairing
+    /// gets a fresh device ID, so a Mac that remembers an old key pairs anew.
     void initialize();
 
-    /// Get this device's unique ID (generated on first run, persisted)
-    const std::string& getDeviceId() const { return m_deviceId; }
+    std::string getDeviceId() const;
+    bool isPaired() const;
 
-    /// Check if we have a stored pairing key for a server
-    bool isPaired() const { return !m_pairingKey.empty(); }
+    /// Stored 32-byte pairing key (empty if not paired)
+    std::vector<uint8_t> getPairingKey() const;
+    std::string pairedServerName() const;
 
-    /// Get the stored pairing key (32 bytes)
-    const std::vector<uint8_t>& getPairingKey() const { return m_pairingKey; }
+    void savePairing(const std::string& serverName, const std::vector<uint8_t>& key);
 
-    /// Store a new pairing key (received from Mac after PIN verification)
-    void savePairing(const std::string& serverName, const uint8_t* key, size_t keyLen);
-
-    /// Compute HMAC-SHA256(nonce, pairingKey) for challenge-response
-    bool computeHMAC(const uint8_t* nonce, size_t nonceLen,
-                     uint8_t output[32]);
-
-    /// Generate random bytes using Windows CNG
-    static bool generateRandom(uint8_t* buffer, size_t size);
-
-    /// Remove stored pairing (unpair) and switch to a fresh device ID
+    /// Forget the pairing and switch to a fresh device ID
     void clearPairing();
 
 private:
-    std::string m_deviceId;            // Persistent unique device identifier
-    std::vector<uint8_t> m_pairingKey; // 32-byte pairing key
-    std::string m_pairedServerName;    // Name of paired Mac server
-
-    /// File path for pairing data
-    std::string getPairingFilePath() const;
-    std::string getDeviceIdFilePath() const;
-
-    /// Load/save pairing data
+    std::string filePath(const char* name) const;
     void loadPairing();
-    void savePairingToFile();
-
-    /// Load/save device ID
-    void loadOrCreateDeviceId();
     void createDeviceId();
 
-    /// Convert bytes to hex string and back
-    static std::string bytesToHex(const uint8_t* data, size_t len);
-    static std::vector<uint8_t> hexToBytes(const std::string& hex);
+    mutable std::mutex m_mutex;
+    std::string m_deviceId;
+    std::vector<uint8_t> m_pairingKey;
+    std::string m_pairedServerName;
 };

@@ -130,13 +130,13 @@ bool PromptForPIN(HWND owner, std::string& outPIN,
     }
 
     CreateChild(L"STATIC",
-                L"Enter the 6-digit PIN shown in the Mac app\nto pair this receiver.",
+                L"Type the 6-digit code shown in the Mac app.\nIt proves no one is in between.",
                 SS_LEFT, 20, 14, 320, 40, dlg, -1, uiFont);
     st.edit = CreateChild(L"EDIT", L"",
                           WS_BORDER | WS_TABSTOP | ES_CENTER | ES_NUMBER,
                           20, 62, 320, 44, dlg, kIdEdit, pinFont);
     SendMessageW(st.edit, EM_LIMITTEXT, kPinLength, 0);
-    CreateChild(L"BUTTON", L"Pair", WS_TABSTOP | BS_DEFPUSHBUTTON,
+    CreateChild(L"BUTTON", L"Verify", WS_TABSTOP | BS_DEFPUSHBUTTON,
                 150, 124, 90, 30, dlg, IDOK, uiFont);
     CreateChild(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON,
                 250, 124, 90, 30, dlg, IDCANCEL, uiFont);
