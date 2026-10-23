@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Swift / Xcode build outputs and per-user editor state
+mac-sender/.build/
+.build/
+DerivedData/
+xcuserdata/
+
+# Windows receiver (also windows-receiver/.gitignore): build folder, benchmark output
+windows-receiver/build/
+bench-*.csv
+bench-*.txt
