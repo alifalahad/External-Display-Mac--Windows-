@@ -3,14 +3,18 @@
 // =============================================================================
 
 #include "Renderer/D3D11Renderer.h"
+#include "App/Log.h"
 #include "Renderer/TestPatternShader.h"
 #include "Performance/PipelineClock.h"
+#include "App/Utf8.h"
+#include "Input/VideoViewport.h"
 
 #include <d3dcompiler.h>
 #include <d3d10.h>     // ID3D10Multithread (required by Media Foundation on a shared device)
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>
 #include <dxgi1_6.h>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <cstdio>
@@ -34,14 +38,24 @@ static void ThrowIfFailed(HRESULT hr, const char* operation) {
 // Construction
 // =============================================================================
 
-D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height, GpuPreference gpuPreference)
-    : hwnd_(hwnd), width_(width), height_(height)
+D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height, GpuPreference gpuPreference,
+                             RendererMode mode)
+    : hwnd_(hwnd), mode_(mode), width_(width), height_(height)
 {
     CreateDeviceAndSwapChain(hwnd, width, height, gpuPreference);
     CreateRenderTarget();
     CompileShaders();
     CreateConstantBuffer();
-    CreateD2DResources();
+
+    // The diagnostics overlay is optional: a Direct2D/DirectWrite failure must
+    // not take the display down with it
+    try {
+        CreateD2DResources();
+        overlayAvailable_ = true;
+    } catch (const std::exception& e) {
+        LOG_WARN("Renderer") << "Diagnostics overlay unavailable: " << e.what();
+        d2dContext_.Reset();
+    }
     CreateNV12Resources();
 }
 
@@ -62,9 +76,10 @@ void D3D11Renderer::LogAdapters() {
         DXGI_ADAPTER_DESC1 desc;
         adapter->GetDesc1(&desc);
         if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            wprintf(L"  GPU %u: %s (%llu MB VRAM)%s\n", i, desc.Description,
-                    (unsigned long long)(desc.DedicatedVideoMemory / (1024 * 1024)),
-                    i == 0 ? L"  <- Windows default" : L"");
+            LOGF_INFO("Renderer", "GPU %u: %s (%llu MB VRAM, vendor 0x%04X)%s", i,
+                      WideToUtf8(desc.Description).c_str(),
+                      (unsigned long long)(desc.DedicatedVideoMemory / (1024 * 1024)),
+                      desc.VendorId, i == 0 ? "  <- Windows default" : "");
         }
         adapter.Reset();
     }
@@ -74,7 +89,7 @@ void D3D11Renderer::CheckDeviceLost(HRESULT hr, const char* operation) {
     if (hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET) return;
     if (!deviceLost_) {
         HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : hr;
-        printf("[Renderer] GPU device lost during %s (0x%08lX, reason 0x%08lX)\n",
+        LOGF_ERROR("Renderer", "GPU device lost during %s (0x%08lX, reason 0x%08lX)",
                operation, (unsigned long)hr, (unsigned long)reason);
     }
     deviceLost_ = true;
@@ -85,7 +100,7 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
     // 0. Pick the adapter. Default (nullptr) = Windows' choice, which on hybrid
     //    laptops is the integrated GPU that drives the built-in panel.
     ComPtr<IDXGIAdapter1> chosenAdapter;
-    if (pref != GpuPreference::Default) {
+    if (pref != GpuPreference::Default && mode_ != RendererMode::Software) {
         ComPtr<IDXGIFactory6> factory6;
         if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory6)))) {
             factory6->EnumAdapterByGpuPreference(
@@ -96,32 +111,39 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
                 IID_PPV_ARGS(&chosenAdapter));
         }
         if (!chosenAdapter) {
-            printf("[Renderer] GPU preference needs Windows 10 1803+ — using default adapter\n");
+            LOGF_WARN("Renderer", "GPU preference needs Windows 10 1803+ — using default adapter");
         }
     }
 
     // 1. Create D3D11 device with BGRA support (needed for D2D interop) and
     //    video support (the hardware H.264 decoder shares this device)
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    if (mode_ == RendererMode::Full) flags |= D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
 
-    D3D_FEATURE_LEVEL featureLevels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
+    // 11_1 is refused outright (E_INVALIDARG) by runtimes that predate it, so
+    // the compatible path starts at 11_0. Shaders are compiled for whatever level we get.
+    D3D_FEATURE_LEVEL fullLevels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
     };
+    D3D_FEATURE_LEVEL compatibleLevels[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,
+    };
+    const bool full = mode_ == RendererMode::Full;
+    D3D_DRIVER_TYPE driverType = mode_ == RendererMode::Software ? D3D_DRIVER_TYPE_WARP
+                               : chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
 
     auto createDevice = [&](UINT createFlags) {
         D3D_FEATURE_LEVEL featureLevel;
         return D3D11CreateDevice(
-            chosenAdapter.Get(),        // nullptr = default adapter
-            chosenAdapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,                    // no software rasterizer
+            mode_ == RendererMode::Software ? nullptr : chosenAdapter.Get(),
+            driverType,
+            nullptr,
             createFlags,
-            featureLevels,
-            _countof(featureLevels),
+            full ? fullLevels : compatibleLevels,
+            full ? (UINT)_countof(fullLevels) : (UINT)_countof(compatibleLevels),
             D3D11_SDK_VERSION,
             &device_,
             &featureLevel,
@@ -129,13 +151,16 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         );
     };
     HRESULT hr = createDevice(flags);
-    bool videoDevice = SUCCEEDED(hr);
-    if (!videoDevice) {
-        printf("[Renderer] No video support on this adapter (0x%08lX) — software decoding\n",
+    bool videoDevice = SUCCEEDED(hr) && full;
+    if (FAILED(hr) && full) {
+        LOGF_WARN("Renderer", "No video support on this adapter (0x%08lX) — software decoding",
                (unsigned long)hr);
         hr = createDevice(flags & ~D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
     }
     ThrowIfFailed(hr, "D3D11CreateDevice");
+    LOGF_INFO("Renderer", "Device: feature level %X.%X, %s mode",
+              (device_->GetFeatureLevel() >> 12) & 0xF, (device_->GetFeatureLevel() >> 8) & 0xF,
+              RendererModeName(mode_));
 
     // Hardware decode writes NV12 textures that we sample as R8 (Y) + R8G8 (UV)
     UINT nv12Support = 0;
@@ -147,7 +172,7 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         multithread->SetMultithreadProtected(TRUE);   // MF may touch the device internally
         supportsHardwareVideo_ = true;
     } else if (videoDevice) {
-        printf("[Renderer] GPU cannot sample NV12 textures — software decoding\n");
+        LOGF_WARN("Renderer", "GPU cannot sample NV12 textures — software decoding");
     }
 
     // 2. Get DXGI factory from the device
@@ -169,30 +194,7 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
     ThrowIfFailed(hr, "Get IDXGIFactory2");
 
     // 3. Create swap chain
-    DXGI_SWAP_CHAIN_DESC1 scd = {};
-    scd.Width       = static_cast<UINT>(width);
-    scd.Height      = static_cast<UINT>(height);
-    scd.Format      = DXGI_FORMAT_B8G8R8A8_UNORM;
-    scd.SampleDesc  = { 1, 0 };
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.BufferCount = 2;
-    scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    scd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
-    // Phase 17: a waitable swap chain lets us render only when a frame can go
-    // straight to the screen (Windows 8.1+; retried without on older systems)
-    scd.Flags       = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-
-    hr = factory->CreateSwapChainForHwnd(
-        device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_
-    );
-    if (FAILED(hr)) {
-        scd.Flags = 0;
-        hr = factory->CreateSwapChainForHwnd(
-            device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_
-        );
-    }
-    ThrowIfFailed(hr, "CreateSwapChainForHwnd");
-    swapChainFlags_ = scd.Flags;
+    CreateSwapChain(factory.Get(), hwnd, width, height);
 
     // By default DXGI queues up to 3 frames: measured as ~3 refreshes (45-50 ms)
     // between Present() and scan-out. One frame in flight is enough.
@@ -205,12 +207,57 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         ComPtr<IDXGIDevice1> dxgiDevice1;
         if (SUCCEEDED(device_.As(&dxgiDevice1))) dxgiDevice1->SetMaximumFrameLatency(1);
     }
-    printf("[Renderer] Frame latency: 1 frame (%s), hardware video: %s\n",
+    LOGF_INFO("Renderer", "Frame latency: 1 frame (%s), hardware video: %s",
            frameLatencyWaitable_ ? "waitable swap chain" : "device limit",
            supportsHardwareVideo_ ? "yes" : "no");
 
     // Disable Alt+Enter fullscreen toggle (we handle it ourselves)
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+}
+
+void D3D11Renderer::CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height) {
+    // Newest first. FLIP_DISCARD needs Windows 10, FLIP_SEQUENTIAL Windows 8;
+    // the waitable object (Phase 17: render only when the frame goes straight
+    // out) needs a flip model and Windows 8.1. Compatible mode skips it.
+    struct Attempt { DXGI_SWAP_EFFECT effect; UINT flags; const char* name; };
+    const Attempt attempts[] = {
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, "flip-discard, waitable" },
+        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    0, "flip-discard" },
+        { DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 0, "flip-sequential" },
+        { DXGI_SWAP_EFFECT_DISCARD,         0, "blt-discard" },
+    };
+
+    HRESULT hr = E_FAIL;
+    for (const Attempt& a : attempts) {
+        if (a.flags && mode_ != RendererMode::Full) continue;
+        DXGI_SWAP_CHAIN_DESC1 scd = {};
+        scd.Width       = static_cast<UINT>(width);
+        scd.Height      = static_cast<UINT>(height);
+        scd.Format      = DXGI_FORMAT_B8G8R8A8_UNORM;
+        scd.SampleDesc  = { 1, 0 };
+        scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        scd.BufferCount = 2;
+        scd.SwapEffect  = a.effect;
+        scd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
+        scd.Flags       = a.flags;
+
+        hr = factory->CreateSwapChainForHwnd(device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_);
+        if (SUCCEEDED(hr)) {
+            swapChainFlags_ = a.flags;
+            LOGF_INFO("Renderer", "Swap chain: %s", a.name);
+            return;
+        }
+        LOGF_WARN("Renderer", "Swap chain (%s) refused: 0x%08lX", a.name, (unsigned long)hr);
+    }
+    ThrowIfFailed(hr, "CreateSwapChainForHwnd");
+}
+
+std::string D3D11Renderer::ShaderProfile(const char* stage) const {
+    // Shader Model 5 needs feature level 11; 10.x devices take SM 4.x bytecode
+    D3D_FEATURE_LEVEL level = device_->GetFeatureLevel();
+    const char* model = level >= D3D_FEATURE_LEVEL_11_0 ? "5_0"
+                      : level >= D3D_FEATURE_LEVEL_10_1 ? "4_1" : "4_0";
+    return std::string(stage) + "_" + model;
 }
 
 // =============================================================================
@@ -249,7 +296,7 @@ void D3D11Renderer::CompileShaders() {
         source, strlen(source),
         "TestPattern.hlsl",
         nullptr, nullptr,
-        "VSMain", "vs_5_0",
+        "VSMain", ShaderProfile("vs").c_str(),
         compileFlags, 0,
         &vsBlob, &errorBlob
     );
@@ -275,7 +322,7 @@ void D3D11Renderer::CompileShaders() {
         source, strlen(source),
         "TestPattern.hlsl",
         nullptr, nullptr,
-        "PSMain", "ps_5_0",
+        "PSMain", ShaderProfile("ps").c_str(),
         compileFlags, 0,
         &psBlob, &errorBlob
     );
@@ -369,6 +416,19 @@ void D3D11Renderer::CreateD2DResources() {
         &titleTextFormat_
     );
     ThrowIfFailed(hr, "CreateTextFormat (title)");
+
+    // Status card: centered title, body and key hints
+    auto centered = [this](float size, DWRITE_FONT_WEIGHT weight, ComPtr<IDWriteTextFormat>& out,
+                           const char* what) {
+        HRESULT r = dwriteFactory_->CreateTextFormat(L"Segoe UI", nullptr, weight,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &out);
+        ThrowIfFailed(r, what);
+        out->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    };
+    centered(30.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, statusTitleFormat_, "CreateTextFormat (status title)");
+    centered(19.0f, DWRITE_FONT_WEIGHT_NORMAL, statusBodyFormat_, "CreateTextFormat (status body)");
+    centered(14.0f, DWRITE_FONT_WEIGHT_NORMAL, statusFooterFormat_, "CreateTextFormat (status footer)");
 }
 
 // =============================================================================
@@ -400,7 +460,7 @@ void D3D11Renderer::Resize(int width, int height) {
         DXGI_FORMAT_UNKNOWN, swapChainFlags_   // flags must match creation
     );
     if (FAILED(hr)) {
-        printf("[Renderer] ResizeBuffers failed (0x%08lX) — recreating renderer\n",
+        LOGF_ERROR("Renderer", "ResizeBuffers failed (0x%08lX) — recreating renderer",
                (unsigned long)hr);
         deviceLost_ = true;
         return;
@@ -410,7 +470,7 @@ void D3D11Renderer::Resize(int width, int height) {
     try {
         CreateRenderTarget();
     } catch (const std::exception& e) {
-        printf("[Renderer] %s — recreating renderer\n", e.what());
+        LOGF_ERROR("Renderer", "%s — recreating renderer", e.what());
         deviceLost_ = true;
     }
 }
@@ -419,7 +479,8 @@ void D3D11Renderer::Resize(int width, int height) {
 // Render
 // =============================================================================
 
-void D3D11Renderer::Render(float time, float frameCount, const std::wstring* overlayText) {
+void D3D11Renderer::Render(float time, float frameCount, const std::wstring* overlayText,
+                           const StatusCard* status) {
     if (deviceLost_ || !rtv_) return;  // owner recreates the renderer
 
     // ── 1. Update constant buffer ───────────────────────────────────────────
@@ -437,9 +498,12 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
     // ── 2. Set up pipeline ──────────────────────────────────────────────────
     context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
 
-    // Clear to black (for letterbox/pillarbox bars)
+    // Black for letterbox/pillarbox bars; a calm dark background behind a
+    // status card when there is no picture yet
+    const bool showVideo = hasVideoFrame_ && frameYSRV_ && frameUVSRV_;
     float black[] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    context_->ClearRenderTargetView(rtv_.Get(), black);
+    float slate[] = { 0.055f, 0.063f, 0.082f, 1.0f };
+    context_->ClearRenderTargetView(rtv_.Get(), (!showVideo && status) ? slate : black);
 
     D3D11_VIEWPORT viewport = {};
     viewport.MaxDepth = 1.0f;
@@ -447,22 +511,15 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
     // ── 3. Draw fullscreen triangle ─────────────────────────────────────────
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->IASetInputLayout(nullptr);
-    if (hasVideoFrame_ && frameYSRV_ && frameUVSRV_) {
-        // Calculate letterboxed viewport to maintain video aspect ratio
-        float videoAspect  = (float)nv12Width_ / (float)nv12Height_;
-        float windowAspect = (float)width_ / (float)height_;
-
-        if (windowAspect > videoAspect) {
-            // Window wider than video → pillarbox (black bars on sides)
-            viewport.Height = (float)height_;
-            viewport.Width  = (float)height_ * videoAspect;
-            viewport.TopLeftX = ((float)width_ - viewport.Width) / 2.0f;
-        } else {
-            // Window taller than video → letterbox (black bars top/bottom)
-            viewport.Width  = (float)width_;
-            viewport.Height = (float)width_ / videoAspect;
-            viewport.TopLeftY = ((float)height_ - viewport.Height) / 2.0f;
-        }
+    if (showVideo) {
+        // Letterbox / pillarbox to keep the video's aspect ratio (the mouse
+        // mapping in InputCapture uses the same rectangle)
+        VideoViewport fit = ComputeVideoViewport((float)width_, (float)height_,
+                                                 (float)nv12Width_ / (float)nv12Height_);
+        viewport.TopLeftX = fit.x;
+        viewport.TopLeftY = fit.y;
+        viewport.Width    = fit.width;
+        viewport.Height   = fit.height;
         context_->RSSetViewports(1, &viewport);
 
         // Render NV12 video frame via GPU YUV→RGB shader
@@ -477,7 +534,7 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
         // Unbind SRVs
         ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
         context_->PSSetShaderResources(0, 2, nullSRVs);
-    } else {
+    } else if (!status) {
         // Render test pattern (full window)
         viewport.Width  = (float)width_;
         viewport.Height = (float)height_;
@@ -489,13 +546,13 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
         context_->Draw(3, 0);
     }
 
-    // ── 4. D2D diagnostics overlay ──────────────────────────────────────────
-    if (overlayText && !overlayText->empty() && d2dContext_) {
-        // Get current back buffer as DXGI surface for D2D target
+    // ── 4. Direct2D: status card and diagnostics overlay ───────────────────
+    const bool wantOverlay = overlayText && !overlayText->empty();
+    if ((wantOverlay || status) && d2dContext_) {
         ComPtr<IDXGISurface> surface;
         hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&surface));
+        ComPtr<ID2D1Bitmap1> d2dTarget;
         if (SUCCEEDED(hr)) {
-            // Create D2D bitmap from the surface
             D2D1_BITMAP_PROPERTIES1 bitmapProps = {};
             bitmapProps.pixelFormat.format    = DXGI_FORMAT_B8G8R8A8_UNORM;
             bitmapProps.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
@@ -503,75 +560,105 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
                                               | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
             bitmapProps.dpiX = 96.0f;
             bitmapProps.dpiY = 96.0f;
-
-            ComPtr<ID2D1Bitmap1> d2dTarget;
-            hr = d2dContext_->CreateBitmapFromDxgiSurface(
-                surface.Get(), &bitmapProps, &d2dTarget
-            );
-
-            // Lay the text out first so the panel fits it exactly
-            const float margin = 12.0f, padding = 10.0f, titleHeight = 24.0f;
-            ComPtr<IDWriteTextLayout> layout;
-            if (SUCCEEDED(hr)) {
-                hr = dwriteFactory_->CreateTextLayout(
-                    overlayText->c_str(), static_cast<UINT32>(overlayText->size()),
-                    statsTextFormat_.Get(), static_cast<float>(width_), static_cast<float>(height_),
-                    &layout);
-            }
-
-            if (SUCCEEDED(hr)) {
-                DWRITE_TEXT_METRICS metrics{};
-                layout->GetMetrics(&metrics);
-                float panelWidth  = (std::max)(metrics.widthIncludingTrailingWhitespace, 400.0f) + 2 * padding;
-                float panelHeight = metrics.height + titleHeight + 2 * padding;
-
-                d2dContext_->SetTarget(d2dTarget.Get());
-                d2dContext_->BeginDraw();
-
-                // Create brushes (recreated each frame since target changes)
-                ComPtr<ID2D1SolidColorBrush> textBrush, bgBrush, accentBrush;
-                d2dContext_->CreateSolidColorBrush(
-                    D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), &textBrush
-                );
-                d2dContext_->CreateSolidColorBrush(
-                    D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.70f), &bgBrush
-                );
-                d2dContext_->CreateSolidColorBrush(
-                    D2D1::ColorF(0.2f, 0.7f, 1.0f, 0.95f), &accentBrush
-                );
-
-                D2D1_ROUNDED_RECT panelRect = D2D1::RoundedRect(
-                    D2D1::RectF(margin, margin, margin + panelWidth, margin + panelHeight),
-                    6.0f, 6.0f
-                );
-                d2dContext_->FillRoundedRectangle(panelRect, bgBrush.Get());
-
-                const wchar_t* title = L"Diagnostics   F2 hide · F11 fullscreen · Esc quit";
-                d2dContext_->DrawText(
-                    title, static_cast<UINT32>(wcslen(title)), titleTextFormat_.Get(),
-                    D2D1::RectF(margin + padding, margin + 6, margin + panelWidth - padding,
-                                margin + titleHeight + 4),
-                    accentBrush.Get()
-                );
-                d2dContext_->DrawLine(
-                    D2D1::Point2F(margin + padding, margin + titleHeight + 6),
-                    D2D1::Point2F(margin + panelWidth - padding, margin + titleHeight + 6),
-                    accentBrush.Get(), 0.5f
-                );
-                d2dContext_->DrawTextLayout(
-                    D2D1::Point2F(margin + padding, margin + titleHeight + padding),
-                    layout.Get(), textBrush.Get()
-                );
-
-                d2dContext_->EndDraw();
-                d2dContext_->SetTarget(nullptr);
-            }
+            hr = d2dContext_->CreateBitmapFromDxgiSurface(surface.Get(), &bitmapProps, &d2dTarget);
+        }
+        if (SUCCEEDED(hr)) {
+            d2dContext_->SetTarget(d2dTarget.Get());
+            d2dContext_->BeginDraw();
+            if (status) DrawStatusCard(*status, showVideo);
+            if (wantOverlay) DrawOverlay(*overlayText);
+            d2dContext_->EndDraw();
+            d2dContext_->SetTarget(nullptr);
         }
     }
 
     // ── 5. Present (VSync) ──────────────────────────────────────────────────
     hr = swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
     CheckDeviceLost(hr, "Present");
+}
+
+// =============================================================================
+// Direct2D text (called between BeginDraw and EndDraw)
+// =============================================================================
+
+void D3D11Renderer::DrawStatusCard(const StatusCard& status, bool overVideo) {
+    ComPtr<ID2D1SolidColorBrush> titleBrush, bodyBrush, footerBrush, cardBrush, accentBrush;
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.97f), &titleBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.80f, 0.83f, 0.88f, 1.0f), &bodyBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.55f, 0.58f, 0.64f, 1.0f), &footerBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.12f, 0.13f, 0.16f, overVideo ? 0.88f : 1.0f), &cardBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.7f, 1.0f, 1.0f), &accentBrush);
+
+    const float w = static_cast<float>(width_), h = static_cast<float>(height_);
+    const float cardWidth = (std::min)(640.0f, w - 40.0f);
+    const float padding = 28.0f;
+
+    // Measure the body so the card fits it
+    ComPtr<IDWriteTextLayout> body;
+    float bodyHeight = 0;
+    if (!status.body.empty() &&
+        SUCCEEDED(dwriteFactory_->CreateTextLayout(status.body.c_str(), (UINT32)status.body.size(),
+                                                   statusBodyFormat_.Get(), cardWidth - 2 * padding,
+                                                   h, &body))) {
+        DWRITE_TEXT_METRICS m{};
+        body->GetMetrics(&m);
+        bodyHeight = m.height;
+    }
+    const float titleHeight = 44.0f;
+    const float cardHeight = padding + titleHeight + 10.0f + bodyHeight + padding;
+    const float left = (w - cardWidth) / 2.0f, top = (h - cardHeight) / 2.0f;
+
+    d2dContext_->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(left, top, left + cardWidth, top + cardHeight), 14.0f, 14.0f),
+        cardBrush.Get());
+    d2dContext_->FillRectangle(D2D1::RectF(left + padding, top + padding + titleHeight + 2,
+                                           left + padding + 48.0f, top + padding + titleHeight + 4),
+                               accentBrush.Get());
+    d2dContext_->DrawText(status.title.c_str(), (UINT32)status.title.size(), statusTitleFormat_.Get(),
+                          D2D1::RectF(left + padding, top + padding, left + cardWidth - padding,
+                                      top + padding + titleHeight),
+                          titleBrush.Get());
+    if (body) {
+        d2dContext_->DrawTextLayout(D2D1::Point2F(left + padding, top + padding + titleHeight + 10.0f),
+                                    body.Get(), bodyBrush.Get());
+    }
+    if (!status.footer.empty()) {
+        d2dContext_->DrawText(status.footer.c_str(), (UINT32)status.footer.size(), statusFooterFormat_.Get(),
+                              D2D1::RectF(20.0f, h - 44.0f, w - 20.0f, h - 12.0f), footerBrush.Get());
+    }
+}
+
+void D3D11Renderer::DrawOverlay(const std::wstring& text) {
+    // Lay the text out first so the panel fits it exactly
+    const float margin = 12.0f, padding = 10.0f, titleHeight = 24.0f;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(dwriteFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
+            statsTextFormat_.Get(), static_cast<float>(width_), static_cast<float>(height_), &layout))) {
+        return;
+    }
+    DWRITE_TEXT_METRICS metrics{};
+    layout->GetMetrics(&metrics);
+    float panelWidth  = (std::max)(metrics.widthIncludingTrailingWhitespace, 400.0f) + 2 * padding;
+    float panelHeight = metrics.height + titleHeight + 2 * padding;
+
+    ComPtr<ID2D1SolidColorBrush> textBrush, bgBrush, accentBrush;
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.95f), &textBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.70f), &bgBrush);
+    d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.7f, 1.0f, 0.95f), &accentBrush);
+
+    d2dContext_->FillRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(margin, margin, margin + panelWidth, margin + panelHeight), 6.0f, 6.0f),
+        bgBrush.Get());
+    const wchar_t* title = L"Diagnostics   F2 hide · F11 fullscreen · Esc quit";
+    d2dContext_->DrawText(title, static_cast<UINT32>(wcslen(title)), titleTextFormat_.Get(),
+                          D2D1::RectF(margin + padding, margin + 6, margin + panelWidth - padding,
+                                      margin + titleHeight + 4),
+                          accentBrush.Get());
+    d2dContext_->DrawLine(D2D1::Point2F(margin + padding, margin + titleHeight + 6),
+                          D2D1::Point2F(margin + panelWidth - padding, margin + titleHeight + 6),
+                          accentBrush.Get(), 0.5f);
+    d2dContext_->DrawTextLayout(D2D1::Point2F(margin + padding, margin + titleHeight + padding),
+                                layout.Get(), textBrush.Get());
 }
 
 // =============================================================================
@@ -661,11 +748,10 @@ void D3D11Renderer::CreateNV12Resources() {
 
     ComPtr<ID3DBlob> psBlob, errBlob;
     HRESULT hr = D3DCompile(nv12PS, strlen(nv12PS), "nv12PS",
-        nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errBlob);
+        nullptr, nullptr, "main", ShaderProfile("ps").c_str(), 0, 0, &psBlob, &errBlob);
     if (FAILED(hr)) {
-        if (errBlob) {
-            OutputDebugStringA((char*)errBlob->GetBufferPointer());
-        }
+        LOGF_ERROR("Renderer", "NV12 shader compilation failed: %s",
+                   errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "(no message)");
         return;
     }
 
@@ -727,7 +813,7 @@ void D3D11Renderer::EnsureNV12Textures(uint32_t width, uint32_t height) {
     hr = device_->CreateShaderResourceView(uvTexture_.Get(), &srvDesc, &uvSRV_);
     if (FAILED(hr)) return;
 
-    printf("[Renderer] NV12 textures: Y=%ux%u, UV=%ux%u\n",
+    LOGF_DEBUG("Renderer", "NV12 textures: Y=%ux%u, UV=%ux%u",
         width, evenHeight, width/2, evenHeight/2);
 }
 
@@ -840,7 +926,7 @@ bool D3D11Renderer::UpdateFrameTexture(ID3D11Texture2D* source, UINT subresource
         srv.Format = DXGI_FORMAT_R8G8_UNORM;
         if (FAILED(device_->CreateShaderResourceView(hwTexture_.Get(), &srv, &hwUVSRV_))) return false;
 
-        printf("[Renderer] Hardware frame texture: %ux%u NV12 (picture %ux%u)\n",
+        LOGF_INFO("Renderer", "Hardware frame texture: %ux%u NV12 (picture %ux%u)",
                srcDesc.Width, srcDesc.Height, frameWidth, frameHeight);
     }
 

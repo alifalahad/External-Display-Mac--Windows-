@@ -16,21 +16,31 @@
 #include <cstdint>
 #include <string>
 
-/// Which GPU renders on hybrid (Intel + NVIDIA/AMD) laptops.
-/// Default = the adapter Windows picks (normally the one wired to the panel).
-enum class GpuPreference { Default, HighPerformance, MinimumPower };
+#include "Renderer/RendererTypes.h"
+
+/// Centered message shown instead of (or over) the video: connecting,
+/// pairing, waiting for the picture, errors
+struct StatusCard {
+    std::wstring title;
+    std::wstring body;
+    std::wstring footer;     // key hints along the bottom edge
+};
 
 class D3D11Renderer {
 public:
+    /// Throws std::runtime_error naming the step and HRESULT that failed
     D3D11Renderer(HWND hwnd, int width, int height,
-                  GpuPreference gpuPreference = GpuPreference::Default);
+                  GpuPreference gpuPreference = GpuPreference::Default,
+                  RendererMode mode = RendererMode::Full);
     ~D3D11Renderer();
     D3D11Renderer(const D3D11Renderer&) = delete;
     D3D11Renderer& operator=(const D3D11Renderer&) = delete;
 
-    // Render one frame: video (or test pattern) + optional diagnostics text.
+    // Render one frame: video (or test pattern when there is neither video nor
+    // a status card), optional status card, optional diagnostics text.
     // Presents with VSync. Call WaitForFrameSlot() first.
-    void Render(float time, float frameCount, const std::wstring* overlayText = nullptr);
+    void Render(float time, float frameCount, const std::wstring* overlayText = nullptr,
+                const StatusCard* status = nullptr);
 
     // Phase 17: block until the swap chain can take a frame without queueing
     // behind older ones (max frame latency 1). Rendering right after this —
@@ -50,6 +60,8 @@ public:
 
     // Get GPU adapter name
     std::wstring GetAdapterName() const { return adapterName_; }
+    RendererMode GetMode() const { return mode_; }
+    bool HasOverlay() const { return overlayAvailable_; }
 
     // Software-decoded frame: upload NV12 Y and UV planes from system memory
     void UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
@@ -79,6 +91,8 @@ private:
     using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     void CreateDeviceAndSwapChain(HWND hwnd, int width, int height, GpuPreference pref);
+    void CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height);
+    std::string ShaderProfile(const char* stage) const;   // "vs_5_0", "ps_4_0", ...
     void CheckDeviceLost(HRESULT hr, const char* operation);
     void CreateRenderTarget();
     void CompileShaders();
@@ -102,11 +116,18 @@ private:
     ComPtr<IDWriteFactory>         dwriteFactory_;
     ComPtr<IDWriteTextFormat>      statsTextFormat_;
     ComPtr<IDWriteTextFormat>      titleTextFormat_;
+    ComPtr<IDWriteTextFormat>      statusTitleFormat_;
+    ComPtr<IDWriteTextFormat>      statusBodyFormat_;
+    ComPtr<IDWriteTextFormat>      statusFooterFormat_;
+    void DrawStatusCard(const StatusCard& status, bool overVideo);
+    void DrawOverlay(const std::wstring& text);
     ComPtr<ID2D1SolidColorBrush>   textBrush_;
     ComPtr<ID2D1SolidColorBrush>   bgBrush_;
     ComPtr<ID2D1SolidColorBrush>   accentBrush_;
 
     HWND hwnd_ = nullptr;
+    RendererMode mode_ = RendererMode::Full;
+    bool overlayAvailable_ = false;   // Direct2D/DirectWrite initialised
     int  width_  = 0;
     int  height_ = 0;
     std::wstring adapterName_;
