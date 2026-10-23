@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "ClipboardSync.h"
+#include "App/Log.h"
 #include <iostream>
 #include <functional>
 
@@ -31,7 +32,7 @@ void ClipboardSync::start(HINSTANCE hInstance) {
     );
 
     if (!m_clipboardWindow) {
-        std::cerr << "[Clipboard] Failed to create notification window" << std::endl;
+        LOG_ERROR("Clipboard") << "Failed to create notification window";
         return;
     }
 
@@ -40,14 +41,14 @@ void ClipboardSync::start(HINSTANCE hInstance) {
 
     // Register for clipboard change notifications
     if (!AddClipboardFormatListener(m_clipboardWindow)) {
-        std::cerr << "[Clipboard] Failed to register clipboard listener: " << GetLastError() << std::endl;
+        LOG_ERROR("Clipboard") << "Failed to register clipboard listener: " << GetLastError();
         DestroyWindow(m_clipboardWindow);
         m_clipboardWindow = nullptr;
         return;
     }
 
     m_running.store(true);
-    std::cout << "[Clipboard] Monitoring started" << std::endl;
+    LOG_INFO("Clipboard") << "Monitoring started";
 }
 
 void ClipboardSync::stop() {
@@ -60,7 +61,7 @@ void ClipboardSync::stop() {
         m_clipboardWindow = nullptr;
     }
 
-    std::cout << "[Clipboard] Monitoring stopped" << std::endl;
+    LOG_INFO("Clipboard") << "Monitoring stopped";
 }
 
 // ── Message Processing ──────────────────────────────────────────────────────
@@ -110,7 +111,7 @@ void ClipboardSync::onClipboardUpdate() {
 
     // Size guard
     if (text.size() > MAX_TEXT_SIZE) {
-        std::cout << "[Clipboard] Skipping oversized clipboard (" << text.size() << " bytes)" << std::endl;
+        LOG_WARN("Clipboard") << "Skipping oversized clipboard (" << text.size() << " bytes)";
         return;
     }
 
@@ -126,9 +127,7 @@ void ClipboardSync::onClipboardUpdate() {
 
     if (m_callback) {
         m_callback(text);
-        std::cout << "[Clipboard] -> Sending to Mac: "
-                  << text.substr(0, 50) << (text.size() > 50 ? "..." : "")
-                  << " (" << text.size() << " bytes)" << std::endl;
+        LOG_DEBUG("Clipboard") << "-> Sent to Mac (" << text.size() << " bytes)";
     }
 }
 
@@ -152,9 +151,7 @@ void ClipboardSync::applyRemoteClipboard(const std::string& utf8Text) {
 
     setClipboardTextUTF8(utf8Text);
 
-    std::cout << "[Clipboard] <- Received from Mac: "
-              << utf8Text.substr(0, 50) << (utf8Text.size() > 50 ? "..." : "")
-              << " (" << utf8Text.size() << " bytes)" << std::endl;
+    LOG_DEBUG("Clipboard") << "<- Received from Mac (" << utf8Text.size() << " bytes)";
 }
 
 // ── Win32 Clipboard Helpers ─────────────────────────────────────────────────

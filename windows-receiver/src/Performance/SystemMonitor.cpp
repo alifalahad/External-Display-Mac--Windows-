@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "Performance/SystemMonitor.h"
+#include "App/Log.h"
 #include "Performance/PipelineClock.h"
 
 #include <Windows.h>
@@ -115,7 +116,7 @@ SystemSample SystemMonitor::latest() const {
 void SystemMonitor::run() {
     GpuEngineCounters gpu;
     if (!gpu.available()) {
-        printf("[Perf] GPU utilization counters unavailable — GPU %% will not be shown\n");
+        LOGF_INFO("Perf", "GPU utilization counters unavailable — GPU %% will not be shown");
     }
     const double cores = static_cast<double>((std::max)(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), 1UL));
 

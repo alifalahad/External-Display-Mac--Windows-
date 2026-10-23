@@ -59,7 +59,7 @@ final class VirtualDisplayManager: ObservableObject {
     @discardableResult
     func createDisplay(width: Int, height: Int) -> Bool {
         guard !isActive else {
-            print("[VDisplay] Already active")
+            Log.debug(.display, "Already active")
             return false
         }
 
@@ -68,7 +68,7 @@ final class VirtualDisplayManager: ObservableObject {
 
         // Snapshot existing displays before creating the virtual one
         preExistingDisplayIDs = getCurrentDisplayIDs()
-        print("[VDisplay] Pre-existing displays: \(preExistingDisplayIDs)")
+        Log.debug(.display, "Pre-existing displays: \(preExistingDisplayIDs)")
 
         // ── 1. Load private classes ─────────────────────────────────────────
         guard let descriptorClass = NSClassFromString("CGVirtualDisplayDescriptor"),
@@ -108,7 +108,7 @@ final class VirtualDisplayManager: ObservableObject {
         // Set the dispatch queue (required — it's a DispatchQueue, NOT an array)
         desc.setValue(displayQueue, forKey: "queue")
 
-        print("[VDisplay] Descriptor: \(width)×\(height), vendor=0xED5F, product=0x\(String(productID, radix: 16))")
+        Log.debug(.display, "Descriptor: \(width)×\(height), vendor=0xED5F, product=0x\(String(productID, radix: 16))")
 
         // ── 3. Create CGVirtualDisplay ──────────────────────────────────────
         let initSel = NSSelectorFromString("initWithDescriptor:")
@@ -128,7 +128,7 @@ final class VirtualDisplayManager: ObservableObject {
             return false
         }
 
-        print("[VDisplay] CGVirtualDisplay created, applying settings...")
+        Log.debug(.display, "CGVirtualDisplay created, applying settings...")
 
         // ── 4. Create CGVirtualDisplaySettings with modes ───────────────────
         if let settings = objcAllocInit(settingsClass) {
@@ -136,18 +136,18 @@ final class VirtualDisplayManager: ObservableObject {
             // Since perform() can't pass primitive args, we use NSInvocation
             if let mode = createMode(modeClass: modeClass, w: width, h: height, hz: 60.0) {
                 settings.setValue([mode], forKey: "modes")
-                print("[VDisplay] Mode set: \(width)×\(height) @ 60Hz")
+                Log.debug(.display, "Mode set: \(width)×\(height) @ 60Hz")
             } else {
-                print("[VDisplay] ⚠️ Could not create display mode, continuing without explicit modes")
+                Log.warning(.display, "Could not create display mode, continuing without explicit modes")
             }
 
             // Apply settings to the display
             let applySel = NSSelectorFromString("applySettings:")
             if display.responds(to: applySel) {
                 _ = display.perform(applySel, with: settings)
-                print("[VDisplay] Settings applied")
+                Log.debug(.display, "Settings applied")
             } else {
-                print("[VDisplay] ⚠️ applySettings: not available")
+                Log.warning(.display, "applySettings: not available")
             }
         }
 
@@ -165,7 +165,7 @@ final class VirtualDisplayManager: ObservableObject {
             let rawID = UInt32(UInt(bitPattern: rawPtr) & 0xFFFFFFFF)
             if rawID != 0 {
                 foundID = rawID
-                print("[VDisplay] displayID property returned: \(foundID)")
+                Log.debug(.display, "displayID property returned: \(foundID)")
             }
         }
 
@@ -175,7 +175,7 @@ final class VirtualDisplayManager: ObservableObject {
             Thread.sleep(forTimeInterval: 0.5)
             let currentIDs = getCurrentDisplayIDs()
             let newIDs = currentIDs.subtracting(preExistingDisplayIDs)
-            print("[VDisplay] Displays after creation: \(currentIDs), new: \(newIDs)")
+            Log.debug(.display, "Displays after creation: \(currentIDs), new: \(newIDs)")
             if let newID = newIDs.first {
                 foundID = newID
             }
@@ -187,7 +187,7 @@ final class VirtualDisplayManager: ObservableObject {
                 self.isActive = true
                 self.errorMessage = nil
             }
-            print("[VDisplay] ✅ Created: \(width)×\(height) @ 60Hz, ID=\(foundID)")
+            Log.info(.display, "Created: \(width)×\(height) @ 60Hz, ID=\(foundID)")
             return true
         }
 
@@ -202,7 +202,7 @@ final class VirtualDisplayManager: ObservableObject {
                 self.isActive = true
                 self.errorMessage = nil
             }
-            print("[VDisplay] ✅ Created (delayed detection): \(width)×\(height), ID=\(newID)")
+            Log.info(.display, "Created (delayed detection): \(width)×\(height), ID=\(newID)")
             return true
         }
 
@@ -220,7 +220,7 @@ final class VirtualDisplayManager: ObservableObject {
             self.virtualDisplayID = 0
             self.errorMessage = nil
         }
-        print("[VDisplay] Destroyed virtual display")
+        Log.info(.display, "Destroyed virtual display")
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ final class VirtualDisplayManager: ObservableObject {
     }
 
     private func setError(_ msg: String) {
-        print("[VDisplay] ❌ \(msg)")
+        Log.error(.display, msg)
         DispatchQueue.main.async { self.errorMessage = msg }
     }
 

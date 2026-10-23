@@ -3,7 +3,7 @@
 // =============================================================================
 
 #include "H264Decoder.h"
-#include <iostream>
+#include "App/Log.h"
 #include <cstdio>
 
 H264Decoder::H264Decoder() {}
@@ -16,7 +16,7 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
 
     HRESULT hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
-        std::cerr << "[Decoder] MFStartup failed: 0x" << std::hex << hr << std::dec << std::endl;
+        LOG_ERROR("Decoder") << "MFStartup failed: 0x" << std::hex << hr << std::dec;
         return false;
     }
     m_mfStarted = true;
@@ -27,7 +27,7 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
     m_hardware = enableHardware();
     if (!configureInput() || !configureOutput()) {
         if (!m_hardware) return false;
-        std::cout << "[Decoder] Hardware decoding rejected this stream — using software" << std::endl;
+        LOG_WARN("Decoder") << "Hardware decoding rejected this stream — using software";
         m_decoder->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
         m_deviceManager.Reset();
         m_hardware = false;
@@ -38,9 +38,8 @@ bool H264Decoder::initialize(uint32_t width, uint32_t height) {
     m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
     m_initialized = true;
-    std::cout << "[Decoder] Initialized: " << width << "x" << height
-              << (m_hardware ? " (hardware, D3D11 video engine)" : " (SOFTWARE — CPU decoding)")
-              << std::endl;
+    LOG_INFO("Decoder") << "Initialized: " << width << "x" << height
+              << (m_hardware ? " (hardware, D3D11 video engine)" : " (SOFTWARE — CPU decoding)");
     return true;
 }
 
@@ -57,7 +56,7 @@ bool H264Decoder::createDecoder() {
         &inputType, nullptr, &activateArr, &count);
 
     if (FAILED(hr) || count == 0) {
-        std::cerr << "[Decoder] No H.264 decoder found" << std::endl;
+        LOG_ERROR("Decoder") << "No H.264 decoder found";
         return false;
     }
 
@@ -81,7 +80,7 @@ bool H264Decoder::enableHardware() {
     UINT32 d3d11Aware = 0;
     if (FAILED(m_decoder->GetAttributes(&attrs)) || !attrs ||
         FAILED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) || !d3d11Aware) {
-        std::cout << "[Decoder] Decoder is not D3D11-aware — software decoding" << std::endl;
+        LOG_WARN("Decoder") << "Decoder is not D3D11-aware — software decoding";
         return false;
     }
 
@@ -92,7 +91,7 @@ bool H264Decoder::enableHardware() {
                                        reinterpret_cast<ULONG_PTR>(m_deviceManager.Get()));
     }
     if (FAILED(hr)) {
-        printf("[Decoder] GPU decoding unavailable (0x%08lX) — software decoding\n", (unsigned long)hr);
+        LOGF_WARN("Decoder", "GPU decoding unavailable (0x%08lX) — software decoding", (unsigned long)hr);
         m_deviceManager.Reset();
         return false;
     }
@@ -128,7 +127,7 @@ bool H264Decoder::configureOutput() {
         m_decoder->GetOutputStreamInfo(0, &info);
         m_providesSamples = (info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
                                              MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
-        std::cout << "[Decoder] Output configured: NV12" << std::endl;
+        LOG_DEBUG("Decoder") << "Output configured: NV12";
         return true;
     }
     return false;
@@ -152,8 +151,8 @@ void H264Decoder::updateFrameSizeFrom(IMFMediaType* outputType) {
     }
 
     if (w > 0 && h > 0 && (w != m_width || h != m_height)) {
-        std::cout << "[Decoder] Stream size changed: " << m_width << "x" << m_height
-                  << " -> " << w << "x" << h << std::endl;
+        LOG_INFO("Decoder") << "Stream size changed: " << m_width << "x" << m_height
+                  << " -> " << w << "x" << h;
         m_width = w;
         m_height = h;
     }
@@ -310,7 +309,7 @@ void H264Decoder::deliverSoftwareSample(IMFSample* sample, int64_t sampleTime) {
         m_stats.framesDecoded++;
         m_rawCallback(data, data + (size_t)stride * alignedH, stride, m_width, m_height, sampleTime);
     } else {
-        printf("[Decoder] ERROR: UV plane out of bounds! bufLen=%lu, stride=%d, alignedH=%u\n",
+        LOGF_ERROR("Decoder", "UV plane out of bounds: bufLen=%lu, stride=%d, alignedH=%u",
                (unsigned long)dataLen, stride, alignedH);
     }
     contiguous->Unlock();
@@ -322,7 +321,7 @@ void H264Decoder::shutdown() {
         m_decoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         if (m_hardware) m_decoder->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
         m_decoder.Reset();
-        std::cout << "[Decoder] Shutdown. Decoded " << m_stats.framesDecoded << " frames" << std::endl;
+        LOG_INFO("Decoder") << "Shutdown. Decoded " << m_stats.framesDecoded << " frames";
     }
     m_deviceManager.Reset();
     m_hardware = false;

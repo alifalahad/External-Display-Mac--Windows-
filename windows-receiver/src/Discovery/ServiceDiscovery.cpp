@@ -9,6 +9,7 @@
 // =============================================================================
 
 #include "ServiceDiscovery.h"
+#include "App/Log.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -59,7 +60,7 @@ void ServiceDiscovery::startBrowsing() {
     if (m_browsing.load()) return;
     m_browsing.store(true);
     m_browseThread = std::thread(&ServiceDiscovery::browseThread, this);
-    std::cout << "[Discovery] Started browsing for External Display senders..." << std::endl;
+    LOG_INFO("Discovery") << "Started browsing for External Display senders...";
 }
 
 void ServiceDiscovery::stopBrowsing() {
@@ -67,7 +68,7 @@ void ServiceDiscovery::stopBrowsing() {
     if (m_browseThread.joinable()) {
         m_browseThread.join();
     }
-    std::cout << "[Discovery] Stopped browsing" << std::endl;
+    LOG_INFO("Discovery") << "Stopped browsing";
 }
 
 std::vector<DiscoveredService> ServiceDiscovery::getServices() const {
@@ -92,7 +93,7 @@ void ServiceDiscovery::browseThread() {
     // Create UDP socket for mDNS
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == INVALID_SOCKET) {
-        std::cerr << "[Discovery] Failed to create mDNS socket: " << WSAGetLastError() << std::endl;
+        LOG_ERROR("Discovery") << "Failed to create mDNS socket: " << WSAGetLastError();
         return;
     }
 
@@ -107,7 +108,7 @@ void ServiceDiscovery::browseThread() {
     bindAddr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sock, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-        std::cerr << "[Discovery] Failed to bind mDNS socket: " << WSAGetLastError() << std::endl;
+        LOG_ERROR("Discovery") << "Failed to bind mDNS socket: " << WSAGetLastError();
         closesocket(sock);
         return;
     }
@@ -118,7 +119,7 @@ void ServiceDiscovery::browseThread() {
     mreq.imr_interface.s_addr = INADDR_ANY;
 
     if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&mreq, sizeof(mreq)) == SOCKET_ERROR) {
-        std::cerr << "[Discovery] Failed to join mDNS multicast group: " << WSAGetLastError() << std::endl;
+        LOG_ERROR("Discovery") << "Failed to join mDNS multicast group: " << WSAGetLastError();
         // Continue anyway — we can still send queries and get unicast replies
     }
 
@@ -308,7 +309,7 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
                 // The RDATA is the instance name (e.g. "ExternalDisplay-Alif's Mac._externaldisplay._tcp.local")
                 size_t ptrOffset = rdataStart;
                 foundInstanceName = parseDNSName(data, length, ptrOffset);
-                std::cout << "[Discovery] PTR: Found service instance: " << foundInstanceName << std::endl;
+                LOG_DEBUG("Discovery") << "PTR: Found service instance: " << foundInstanceName;
             }
         }
 
@@ -321,8 +322,8 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
                 foundPort = readU16BE(data + rdataStart + 4);
                 size_t targetOffset = rdataStart + 6;
                 foundHostname = parseDNSName(data, length, targetOffset);
-                std::cout << "[Discovery] SRV: host=" << foundHostname
-                          << " port=" << foundPort << std::endl;
+                LOG_DEBUG("Discovery") << "SRV: host=" << foundHostname
+                          << " port=" << foundPort;
             }
         }
 
@@ -332,7 +333,7 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
                 char ipBuf[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, data + rdataStart, ipBuf, sizeof(ipBuf));
                 foundIP = ipBuf;
-                std::cout << "[Discovery] A: " << recordName << " -> " << foundIP << std::endl;
+                LOG_DEBUG("Discovery") << "A: " << recordName << " -> " << foundIP;
             }
         }
 
@@ -374,9 +375,9 @@ void ServiceDiscovery::parseMDNSResponse(const uint8_t* data, size_t length,
             m_services[friendlyName] = svc;
 
             if ((isNew || isUpdated) && m_discoveryCallback) {
-                std::cout << "[Discovery] " << (isNew ? "New" : "Updated")
+                LOG_INFO("Discovery") << (isNew ? "New" : "Updated")
                           << " service: " << friendlyName
-                          << " @ " << serviceIP << ":" << svc.port << std::endl;
+                          << " @ " << serviceIP << ":" << svc.port;
                 m_discoveryCallback(svc);
             }
         }

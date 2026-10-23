@@ -65,7 +65,7 @@ final class ClipboardSync {
             }
         }
 
-        print("[Clipboard] Monitoring started (poll interval: \(pollInterval)s)")
+        Log.info(.clipboard, "Monitoring started (poll interval: \(pollInterval)s)")
     }
 
     /// Stop monitoring
@@ -74,7 +74,7 @@ final class ClipboardSync {
         isActive = false
         pollTimer?.invalidate()
         pollTimer = nil
-        print("[Clipboard] Monitoring stopped")
+        Log.info(.clipboard, "Monitoring stopped")
     }
 
     // ── Receive from Remote ─────────────────────────────────────────────────
@@ -82,7 +82,7 @@ final class ClipboardSync {
     /// Called when clipboard data arrives from Windows
     func receiveRemoteClipboard(_ data: Data) {
         guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
-            print("[Clipboard] Received empty or invalid clipboard data")
+            Log.warning(.clipboard, "Received empty or invalid clipboard data")
             return
         }
 
@@ -102,7 +102,7 @@ final class ClipboardSync {
         lastRemoteContentHash = hash
         lastChangeCount = pb.changeCount
 
-        print("[Clipboard] ← Received from Windows: \(text.prefix(50))\(text.count > 50 ? "…" : "") (\(data.count) bytes)")
+        Log.debug(.clipboard, "← Received from Windows (\(data.count) bytes)")   // never the text itself
     }
 
     // ── Poll for Local Changes ──────────────────────────────────────────────
@@ -120,7 +120,7 @@ final class ClipboardSync {
 
         // Size guard
         guard text.count <= maxTextSize else {
-            print("[Clipboard] Skipping oversized clipboard (\(text.count) chars)")
+            Log.warning(.clipboard, "Skipping oversized clipboard (\(text.count) chars)")
             return
         }
 
@@ -142,7 +142,7 @@ final class ClipboardSync {
         lastSentContentHash = hash
         onClipboardChanged?(data)
 
-        print("[Clipboard] → Sending to Windows: \(text.prefix(50))\(text.count > 50 ? "…" : "") (\(data.count) bytes)")
+        Log.debug(.clipboard, "→ Sending to Windows (\(data.count) bytes)")   // never the text itself
     }
 
     deinit {
