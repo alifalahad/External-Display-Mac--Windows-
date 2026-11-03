@@ -54,8 +54,8 @@ Clock offset cancels out, so it needs no sync.
 
 - **Windows overlay (F2).** FPS at every stage (capture, encode, receive, decode, shown), whether
   decoding runs on the GPU or CPU, presents per second and render CPU time, bitrate, RTT, jitter,
-  drops, packet loss, per-stage latency (avg / p95 / max over the last ~2 s), Mac and PC
-  CPU/RAM, and GPU usage.
+  drops, packet loss, keyframes (received / asked for / frames held waiting for one), per-stage
+  latency (avg / p95 / max over the last ~2 s), Mac and PC CPU/RAM, and GPU usage.
 - **Windows console.** A two-line summary every 5 s.
 - **Mac window.** Capture FPS and latency, encoder FPS, latency and bitrate (actual / target),
   send rate, RTT, end-to-end latency, packet loss, and this process's CPU and memory. Updated once
@@ -78,7 +78,7 @@ directory:
 | File | Content |
 |------|---------|
 | `bench-<time>-frames.csv`  | one row per displayed frame: every stage in ms (empty = not measurable) |
-| `bench-<time>-seconds.csv` | one row per second: FPS per stage, bitrate, loss, drops, jitter, RTT, PC CPU/RAM/GPU, Mac CPU/RAM/FPS |
+| `bench-<time>-seconds.csv` | one row per second: FPS per stage, bitrate, loss, drops, jitter, RTT, PC CPU/RAM/GPU, Mac CPU/RAM/FPS, keyframes / keyframe requests / frames held in that second |
 | `bench-<time>-summary.txt` | avg / p50 / p95 / p99 / max per stage, averages of the per-second values, RAM start → end |
 
 Percentiles come from fixed-size histograms (0.1 ms bins), so memory stays flat even in
@@ -168,6 +168,18 @@ What it showed:
 Same benchmark after the changes below. Compare against the table above. The benchmark summary
 now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
 different laptops can be compared.
+
+### Keyframes only on request (smoothness step 2)
+
+Loopback, 2026-11-03 (real VideoToolbox encoder, 720p60, 64- and 32-bit receiver):
+
+| | Before | After |
+|---|---|---|
+| Keyframes in a 20 s stream | ~20 (one per second) | 2 (stream start, one repair) |
+| A frame missing (dropped on purpose in the test) | decoded damaged until a keyframe: the requested one after packet loss, or the next periodic one (≤ 1 s) when the frame went missing on the PC | noticed at once, the picture held; keyframe 8–27 ms after the request; 1–3 frames held |
+
+On real Wi-Fi the benchmark's Network p95/p99 and frame drops show the effect of the missing
+bursts (step 0 vs. step 2 runs).
 
 ### Encryption cost (protocol v2)
 

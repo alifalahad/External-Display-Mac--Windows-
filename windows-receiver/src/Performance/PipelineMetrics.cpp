@@ -181,6 +181,8 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
         haveFirst_ = true;
         firstExpected_ = net.framesExpected;
         firstReceived_ = net.framesReceived;
+        firstKeyframes_ = net.keyframesReceived;
+        firstKeyframeRequests_ = net.keyframeRequests;
     }
 
     if (haveTick_ && !restarted && nowUs > lastTickUs_) {
@@ -203,6 +205,11 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
         uint64_t shown = presented_ - lastPresented_;
         rates_.frameDropPercent = expected > shown
             ? 100.0 * static_cast<double>(expected - shown) / static_cast<double>(expected) : 0;
+
+        auto delta = [](uint64_t now, uint64_t before) { return now >= before ? now - before : 0; };
+        rates_.keyframesLastInterval = delta(net.keyframesReceived, lastNet_.keyframesReceived);
+        rates_.keyframeRequestsLastInterval = delta(net.keyframeRequests, lastNet_.keyframeRequests);
+        rates_.framesHeldLastInterval = delta(held_, lastHeld_);
     }
 
     rates_.jitterMs = net.jitterMs;
@@ -210,6 +217,10 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
     uint64_t receivedTotal = net.framesReceived - firstReceived_;
     rates_.framesLostInNetwork = expectedTotal > receivedTotal ? expectedTotal - receivedTotal : 0;
     rates_.framesDroppedHere = skipped_;
+    rates_.keyframes = net.keyframesReceived >= firstKeyframes_ ? net.keyframesReceived - firstKeyframes_ : 0;
+    rates_.keyframeRequests = net.keyframeRequests >= firstKeyframeRequests_
+                            ? net.keyframeRequests - firstKeyframeRequests_ : 0;
+    rates_.framesHeld = held_;
 
     haveTick_ = true;
     lastTickUs_ = nowUs;
@@ -217,6 +228,7 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
     lastRenders_ = renders_;
     lastDecoded_ = decoded_;
     lastPresented_ = presented_;
+    lastHeld_ = held_;
 }
 
 MetricsSnapshot PipelineMetrics::snapshot() const {
@@ -252,7 +264,7 @@ bool BenchmarkRecorder::start(const std::string& basePath, int durationSeconds, 
                 "packet_loss_pct,frame_drop_pct,jitter_ms,rtt_ms,clock_error_ms,"
                 "pc_cpu_pct,pc_ram_mb,pc_private_mb,gpu_3d_pct,gpu_decode_pct,"
                 "mac_capture_fps,mac_encode_fps,mac_cpu_pct,mac_ram_mb,mac_encoder_mbps,mac_target_mbps,"
-                "total_avg_ms,total_p95_ms\n";
+                "total_avg_ms,total_p95_ms,keyframes,keyframe_requests,frames_held\n";
     startUs_ = nowUs;
     durationUs_ = static_cast<int64_t>(durationSeconds) * 1'000'000;
     active_ = true;
@@ -298,7 +310,9 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
              << opt(mac.valid, mac.captureFps) << ',' << opt(mac.valid, mac.encodeFps) << ','
              << opt(mac.valid, mac.cpuPercent) << ',' << opt(mac.valid, mac.memoryMB) << ','
              << opt(mac.valid, mac.encoderMbps) << ',' << opt(mac.valid, mac.targetMbps) << ','
-             << opt(total.samples > 0, total.avgMs) << ',' << opt(total.samples > 0, total.p95Ms) << '\n';
+             << opt(total.samples > 0, total.avgMs) << ',' << opt(total.samples > 0, total.p95Ms) << ','
+             << m.keyframesLastInterval << ',' << m.keyframeRequestsLastInterval << ','
+             << m.framesHeldLastInterval << '\n';
 
     presentedFps_.add(m.presentedFps);
     receivedFps_.add(m.receivedFps);
@@ -321,6 +335,9 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
     }
     lostFrames_ = m.framesLostInNetwork;
     droppedFrames_ = m.framesDroppedHere;
+    keyframes_ += m.keyframesLastInterval;
+    keyframeRequests_ += m.keyframeRequestsLastInterval;
+    framesHeld_ += m.framesHeldLastInterval;
 }
 
 std::string BenchmarkRecorder::finish(int64_t nowUs) {
@@ -362,6 +379,11 @@ std::string BenchmarkRecorder::finish(int64_t nowUs) {
     snprintf(line, sizeof(line), "Drops      %.3f%% of frames avg   lost in network %llu   dropped on PC %llu\n",
              drop_.avg(), static_cast<unsigned long long>(lostFrames_),
              static_cast<unsigned long long>(droppedFrames_));
+    o << line;
+    const double minutes = (nowUs - startUs_) / 60e6;
+    snprintf(line, sizeof(line), "Keyframes  %llu (%.1f per minute)   asked for %llu   frames held waiting for one %llu\n",
+             static_cast<unsigned long long>(keyframes_), minutes > 0 ? keyframes_ / minutes : 0.0,
+             static_cast<unsigned long long>(keyframeRequests_), static_cast<unsigned long long>(framesHeld_));
     o << line;
     if (pcCpu_.n) {
         snprintf(line, sizeof(line), "PC         CPU %.1f%% avg (%.1f%% max, all cores)   RAM %.0f -> %.0f MB (peak %.0f)\n",
@@ -442,6 +464,9 @@ std::wstring FormatDiagnostics(const OverlayInputs& in) {
             m.frameDropPercent, static_cast<unsigned long long>(m.framesLostInNetwork),
             static_cast<unsigned long long>(m.framesDroppedHere));
     Appendf(out, L"Loss     %.2f%% packets\n", m.packetLossPercent);
+    Appendf(out, L"Keyframe %llu  (asked %llu)  held %llu frames\n",
+            static_cast<unsigned long long>(m.keyframes), static_cast<unsigned long long>(m.keyframeRequests),
+            static_cast<unsigned long long>(m.framesHeld));
 
     out += L"Latency ms    avg    p95    max\n";
     AppendStage(out, L"Capture", stage(Stage::Capture), L"Mac");

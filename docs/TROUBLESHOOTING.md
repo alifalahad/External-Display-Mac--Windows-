@@ -62,6 +62,11 @@ changes; move a window.
 **The mouse lands in the wrong place.** Fixed in version 2: clicks are mapped through the
 letterboxed picture. If it still happens, send `receiver.log` with `--verbose`.
 
+**The picture freezes for a moment, then continues.** After a lost packet the PC keeps the
+last good picture until the Mac's keyframe arrives, usually within a few hundredths of a second
+([SMOOTHNESS.md](SMOOTHNESS.md), step 2). If it happens often, the Wi-Fi is losing packets:
+watch the `Loss` and `Keyframe` lines in the F2 overlay, and see step 8 of SMOOTHNESS.md.
+
 **Two pointers, no pointer, or the pointer looks wrong.** Since step 1 of
 [SMOOTHNESS.md](SMOOTHNESS.md), Windows draws the Mac's pointer. With F3 off you see Windows'
 own arrow *and* the Mac's pointer: that is intended. Press **F4** (or start with

@@ -101,8 +101,9 @@ public:
     /// Set the re-discovery hook used when the Mac is unreachable
     void setHostResolver(HostResolver resolver) { m_hostResolver = std::move(resolver); }
 
-    /// Request a keyframe from the sender (decoder reset / recovery)
-    void requestKeyframe() { if (isSecure()) tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0); }
+    /// Request a keyframe from the sender (decoder reset / recovery). The Mac
+    /// sends keyframes only when asked (docs/SMOOTHNESS.md, step 2). Any thread.
+    void requestKeyframe();
 
     // ── Pairing (the code is typed on the UI thread, never on the network thread) ──
 
@@ -140,7 +141,8 @@ public:
         uint64_t framesReceived = 0;
         uint64_t framesDropped = 0;    // incomplete fragments
         uint64_t fragmentsReceived = 0;
-        uint64_t keyframeRequests = 0;
+        uint64_t keyframeRequests = 0;   // every KEYFRAME_REQ sent
+        uint64_t keyframesReceived = 0;  // complete keyframes
         uint64_t framesExpected = 0;   // from Mac frame numbers (gaps = whole frames lost)
         double   jitterMs = 0;         // RFC 3550 interarrival jitter
     };

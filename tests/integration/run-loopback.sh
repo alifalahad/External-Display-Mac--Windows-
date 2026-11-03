@@ -15,7 +15,9 @@
 # Streaming runs send encrypted synthetic 720p60 video and check frames,
 # timing, H.264 start codes, clock sync and statistics, and the pointer drawn
 # by the receiver (RECEIVER_CAPS → CURSOR_SHAPE / CURSOR_POSITION; switched
-# off and on again in the paired run, never asked for in the wrongcode run).
+# off and on again in the paired run, never asked for in the wrongcode run), and
+# keyframes only on request: one frame is dropped on purpose and must be
+# repaired by a keyframe within 300 ms.
 # Nothing is advertised on the network (Bonjour stripped, localhost only).
 # =============================================================================
 set -euo pipefail
@@ -48,7 +50,7 @@ cp -R "$WIN" "$WORK/src"
 sed -i '' -e 's/TCP_PORT         = 9876/TCP_PORT         = 19876/' -e 's/UDP_PORT         = 9877/UDP_PORT         = 19877/' "$WORK/src/Network/Protocol.h"
 "$ARCH-w64-mingw32-g++" -std=c++17 -O2 -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_WIN32_WINNT=0x0A00 \
     -Wno-unknown-pragmas -I"$WORK/src" "$ROOT/tests/integration/ReceiverClient.cpp" \
-    "$WORK"/src/Network/StreamReceiver.cpp "$WORK"/src/Security/{PairingManager,Crypto,SecureChannel}.cpp "$WORK"/src/Input/Pointer.cpp \
+    "$WORK"/src/Network/StreamReceiver.cpp "$WORK"/src/Security/{PairingManager,Crypto,SecureChannel}.cpp "$WORK"/src/Input/Pointer.cpp "$WORK"/src/Decoder/KeyframeGate.cpp \
     "$WORK"/src/Performance/{ClockSync,PipelineMetrics}.cpp "$WORK"/src/App/Log.cpp \
     -o "$WORK/client.exe" -static -lws2_32 -lbcrypt -lcrypt32
 

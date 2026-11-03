@@ -38,7 +38,7 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 |---|---|---|---|
 | 0 | Measure the current build on the PCs | waiting for a Windows run | the "before" numbers for every step |
 | 1 | Pointer drawn on the PC | **done here, to test on the PCs** | the mouse feels instant; moving the pointer no longer sends video |
-| 2 | Keyframes only when needed | to do | removes the burst once a second |
+| 2 | Keyframes only when needed | **done here, to test on the PCs** | removes the burst once a second; a lost packet costs a short freeze, not smeared blocks |
 | 3 | Display path: DPI-aware, present without waiting | to do | up to one refresh less; sharper picture |
 | 4 | Capture in the encoder's format | to do | 1–3 ms less, less GPU work on the Mac |
 | 5 | Packet pacing and loss repair | to do | fewer Wi-Fi spikes; no long wait after a lost packet |
@@ -135,20 +135,49 @@ standard arrow, and F4 / `--cursor=video` bring back the pointer in the video.
 
 ### Step 2 — Keyframes only when needed
 
-**Why.** The encoder makes a keyframe every 60 frames (`EncoderConfig.keyframeInterval = 60`):
-once per second at 60 FPS. The 10-minute soak test had 600 keyframes in 36,000 frames. A keyframe
-is several times larger than a normal frame, so once a second the Wi-Fi gets a burst that can
-delay that frame and the ones after it.
+**Why.** The encoder made a keyframe every 60 frames (`keyframeInterval = 60`): once per second
+at 60 FPS. The 10-minute soak test had 600 keyframes in 36,000 frames. A keyframe is several
+times larger than a normal frame, so once a second the Wi-Fi got a burst that could delay that
+frame and the ones after it.
 
-**How.**
-- Make the keyframe interval very long (VideoToolbox `MaxKeyFrameInterval` and
-  `MaxKeyFrameIntervalDuration`).
-- Send keyframes only on request. That path already exists: decoder start, lost packets, and
-  rate-limited `KEYFRAME_REQ`.
-- Step 5's loss repair makes requests rare.
+**How (implemented).**
+- **Mac:** keyframes only when the PC asks (`KEYFRAME_REQ`). One a minute remains as a safety
+  net (`EncoderConfig.keyframeIntervalSeconds = 60`). A static screen sends nothing at all.
+  - If a frame ever fails to convert before sending, the Mac makes the next one a keyframe
+    itself. The PC could not notice that frame missing.
+- **PC:** without a keyframe every second, a missing frame must be noticed at once, because the
+  frames after it build on it. A new *keyframe gate* in front of the decoder checks the Mac's
+  frame numbers. It catches frames lost on the network, frames that arrived incomplete, and
+  frames trimmed from the PC's own decode queue (that last case went unnoticed before).
+  - After a missing frame it **holds the last good picture** instead of showing smeared blocks.
+  - It **asks for a keyframe at once**, then every 250 ms until one arrives. Before, the request
+    was limited to once per 500 ms, with no retry if that keyframe was lost too.
+  - If the keyframe is late, decoding continues after 300 ms (damaged until the keyframe
+    repairs it), so the picture never stops for long.
+- **F2 overlay:** new line `Keyframe N (asked M) held K frames`. The benchmark files get the
+  columns `keyframes`, `keyframe_requests`, `frames_held` per second, and a summary line.
 
-**Check.** Count keyframes per second (add the count to `SENDER_STATS` and the overlay). Then
-compare the Network p95/p99 and the frame drops before and after.
+**Check.**
+- Automated, all passing (2026-11-03):
+  - Mac: the encoder makes keyframes only at frame 0 and where one was asked for (150 frames:
+    `[0, 100]`). With the old setting the same test gives `[0, 60, 100]`.
+  - Windows: 334 checks on x64 and x86, 49 of them new. They cover the gate (hold, ask, retry,
+    300 ms limit, late and duplicate frames, renumbering, older Mac apps) and the new counters,
+    overlay line and benchmark columns.
+  - Loopback, all scenarios, 64- and 32-bit, with the real VideoToolbox encoder: **2 keyframes
+    per 20-second run instead of about 20**. One frame is lost on purpose 12 s in; the gate
+    noticed it, and the Mac's keyframe arrived **8–27 ms** after the request. 1–3 frames were
+    held meanwhile (≤ 1/20 s).
+- On the PC: see "Checklist for step 2" below.
+
+#### Checklist for step 2 (on each laptop)
+1. Stream something moving and press **F2**. The `Keyframe` line counts up only when something
+   happens (connecting, a lost packet), not every second.
+2. Walk away from the router or start a big download, so that some packets get lost (the `Loss`
+   line). You see short freezes instead of smeared or grey blocks, and the picture is sharp
+   again right away.
+3. Run `--bench=60` and compare with the step 0 run: Network p95/p99 and the frame drops should
+   be lower. The summary has a new `Keyframes` line.
 
 ### Step 3 — Display path
 
@@ -194,7 +223,10 @@ packet ruins the frame until a keyframe arrives (at least one round trip, plus a
 - Spread each frame's packets over 1–2 ms.
 - Add parity packets (XOR or Reed–Solomon) so the PC can rebuild one or two lost packets per
   frame.
-- Ask for a keyframe only when the repair fails.
+- Ask for a keyframe only when the repair fails (step 2's gate already does the asking).
+- Option: VideoToolbox long-term reference frames (`kVTCompressionPropertyKey_EnableLTR`, macOS
+  12+). The PC acknowledges frames; after a loss the Mac refers back to an acknowledged frame
+  (`ForceLTRRefresh`) instead of sending a full keyframe.
 
 **Check.** A loopback test that drops 1–5 % of packets on purpose: frames are rebuilt and none
 are lost. Then the benchmark's Network p95 and frame drops on Wi-Fi.

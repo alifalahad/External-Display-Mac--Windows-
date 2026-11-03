@@ -18,6 +18,7 @@
 #include "App/Window.h"
 #include "Clipboard/ClipboardSync.h"
 #include "Decoder/H264Decoder.h"
+#include "Decoder/KeyframeGate.h"
 #include "Input/InputCapture.h"
 #include "Input/Pointer.h"
 #include "Network/StreamReceiver.h"
@@ -115,6 +116,8 @@ private:
     std::deque<std::pair<int64_t, FrameTimeline>> decoding_;
     int64_t nextSampleTime_ = 0;
     int consecutiveDecodeFailures_ = 0;
+    KeyframeGate keyframeGate_;              // docs/SMOOTHNESS.md, step 2
+    uint64_t heldReported_ = 0;
     bool pictureFresh_ = false;              // in the renderer, not presented yet
     FrameTimeline pictureTimeline_;
     uint64_t picturesOverwritten_ = 0;

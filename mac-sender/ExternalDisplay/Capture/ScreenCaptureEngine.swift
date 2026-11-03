@@ -181,6 +181,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 if let frame = H264Converter.annexBData(from: sampleBuffer, isKeyframe: isKeyframe,
                                                        reservedPrefix: FrameTimingPrefix.size) {
                     self.sender.sendVideoFrame(frameData: frame, isKeyframe: isKeyframe, timing: timing)
+                } else {
+                    // Never sent, never numbered: the receiver cannot notice the
+                    // gap, and the next frames build on this one
+                    Log.every(5, key: "annexb-failed", .warning, .encoder, "Could not convert a frame — sending a keyframe")
+                    self.requestKeyframe()
                 }
             }
 

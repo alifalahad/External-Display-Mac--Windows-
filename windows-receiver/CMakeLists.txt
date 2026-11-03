@@ -25,6 +25,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Performance/SystemMonitor.cpp
     src/Network/StreamReceiver.cpp
     src/Decoder/H264Decoder.cpp
+    src/Decoder/KeyframeGate.cpp
     src/Input/InputCapture.cpp
     src/Input/Pointer.cpp
     src/Input/PointerCursor.cpp
@@ -79,7 +80,7 @@ endif()
 # Tests (Phase 20):
 #   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build
 #   .\build\PipelineMetricsTests.exe   metrics, clock sync, benchmark files, payload layout
-#   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window
+#   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window, keyframe gate
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
 #   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
 #   ctest --test-dir build               all of them
@@ -96,6 +97,7 @@ if(EXDP_BUILD_TESTS)
         src/App/Options.cpp
         src/App/StatusText.cpp
         src/App/Log.cpp
+        src/Decoder/KeyframeGate.cpp
     )
     add_executable(SecureChannelTests
         tests/SecureChannelTests.cpp

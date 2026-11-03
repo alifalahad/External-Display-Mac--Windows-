@@ -129,6 +129,8 @@ struct NetworkCounters {
     uint64_t framesExpected = 0;     // from Mac frame sequence numbers
     uint64_t framesReceived = 0;     // complete frames
     double   jitterMs = 0;
+    uint64_t keyframesReceived = 0;  // docs/SMOOTHNESS.md, step 2
+    uint64_t keyframeRequests = 0;   // KEYFRAME_REQ sent
 };
 
 struct MetricsSnapshot {
@@ -144,6 +146,15 @@ struct MetricsSnapshot {
     double jitterMs = 0;
     uint64_t framesLostInNetwork = 0;   // since stream start
     uint64_t framesDroppedHere = 0;     // received but replaced/skipped before display
+
+    // Keyframes come only when asked (docs/SMOOTHNESS.md, step 2): since
+    // stream start, and in the last interval
+    uint64_t keyframes = 0;
+    uint64_t keyframeRequests = 0;
+    uint64_t framesHeld = 0;            // not decoded while waiting for a keyframe
+    uint64_t keyframesLastInterval = 0;
+    uint64_t keyframeRequestsLastInterval = 0;
+    uint64_t framesHeldLastInterval = 0;
 };
 
 class PipelineMetrics {
@@ -153,6 +164,8 @@ public:
     void onFrameDecoded()  { decoded_++; }
     /// Received frames that will never reach the screen (queue trim, overwritten)
     void onFramesSkipped(uint64_t count) { skipped_ += count; }
+    /// Frames the KeyframeGate kept from the decoder (freeze until a keyframe)
+    void onFramesHeld(uint64_t count) { held_ += count; }
     /// The frame's timeline is complete (shown, display time known or given up)
     StageTimes onFrameDisplayed(const FrameTimeline& t, const ClockSync::Estimate& sync);
 
@@ -165,14 +178,15 @@ private:
     std::array<RollingSamples, kStageCount> live_{};
     RollingSamples renderCall_;
 
-    uint64_t renders_ = 0, decoded_ = 0, presented_ = 0, skipped_ = 0;
+    uint64_t renders_ = 0, decoded_ = 0, presented_ = 0, skipped_ = 0, held_ = 0;
 
     // Previous tick
     bool            haveTick_ = false;
     int64_t         lastTickUs_ = 0;
     NetworkCounters lastNet_{};
-    uint64_t        lastRenders_ = 0, lastDecoded_ = 0, lastPresented_ = 0;
+    uint64_t        lastRenders_ = 0, lastDecoded_ = 0, lastPresented_ = 0, lastHeld_ = 0;
     uint64_t        firstExpected_ = 0, firstReceived_ = 0;
+    uint64_t        firstKeyframes_ = 0, firstKeyframeRequests_ = 0;
     bool            haveFirst_ = false;
 
     MetricsSnapshot rates_{};
@@ -243,6 +257,7 @@ private:
     };
     Agg presentedFps_, receivedFps_, renderedFps_, bitrate_, loss_, drop_, jitter_, rtt_;
     Agg pcCpu_, pcRam_, gpu3d_, gpuDecode_, macCpu_, macRam_, macCaptureFps_, macEncodeFps_;
+    uint64_t keyframes_ = 0, keyframeRequests_ = 0, framesHeld_ = 0;
     double clockErrorMs_ = 0;
     std::vector<std::string> notes_;
     uint64_t lostFrames_ = 0, droppedFrames_ = 0;

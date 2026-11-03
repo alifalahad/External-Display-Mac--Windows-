@@ -79,12 +79,15 @@ It renders only when the picture, the overlay or the status card changed.
 1. **Capture:** ScreenCaptureKit delivers only changed frames, as IOSurface-backed buffers.
    `displayTime` is when the frame was on screen.
 2. **Encode:** VideoToolbox H.264 in hardware, *low-latency rate control*, Constrained High, no
-   B-frames, keyframe at least every 60 frames or on request.
+   B-frames. Keyframes only on request, plus one a minute as a safety net
+   ([SMOOTHNESS.md](SMOOTHNESS.md), step 2).
 3. **Send:** Annex B plus a 40-byte timing prefix. The frame is cut into fragments of up to
    1,340 bytes, and each datagram is encrypted with AES-256-GCM.
 4. **Receive:** authenticate, check for replays, reassemble, then queue for decoding.
 5. **Decode:** the Media Foundation H.264 decoder on the renderer's D3D11 device (DXVA).
    Pictures stay in GPU memory and are copied GPU→GPU into the texture the shader samples.
+   In front of it, the keyframe gate holds frames that follow a missing one until a keyframe
+   arrives.
 6. **Present:** wait for the swap chain's frame slot (maximum frame latency 1), decode whatever
    arrived meanwhile, draw the newest picture, then present with VSync.
 
@@ -95,15 +98,18 @@ the Mac's. That is how the overlay and the benchmark measure each stage
 ## Design decisions
 
 **TCP + UDP with our own framing (rather than WebRTC, QUIC or one TCP stream).**
-- Video goes over UDP: a lost packet costs one frame until the next keyframe, while TCP would
-  stall every following frame (head-of-line blocking).
+- Video goes over UDP: a lost packet costs a short freeze until the requested keyframe (about
+  one round trip), while TCP would stall every following frame (head-of-line blocking).
 - Control messages go over TCP: they must arrive and stay in order.
 - QUIC (Network.framework on the Mac, MsQuic on Windows) would add a dependency on Windows and
   a second congestion controller on top of our adaptive bitrate.
 - WebRTC is far larger than the problem.
-- Recovery on UDP: lost packets show up as gaps in the per-packet sequence. Frames lost entirely
-  show up as gaps in the frame numbers. Either one triggers a keyframe request (at most every
-  0.5 s).
+- Recovery on UDP:
+  - Lost packets show up as gaps in the per-packet sequence, and the network thread asks for a
+    keyframe at once (at most every 0.5 s).
+  - The keyframe gate in front of the decoder checks the Mac's frame numbers. That covers frames
+    lost entirely, incomplete ones, and ones trimmed from the decode queue. After a gap it holds
+    the picture (at most 300 ms) and asks every 250 ms until a keyframe arrives.
 
 **The Mac listens; Windows discovers and connects.**
 - The Mac app advertises `_externaldisplay._tcp` with Bonjour; the receiver browses with its own

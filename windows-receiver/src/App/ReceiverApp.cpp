@@ -247,13 +247,14 @@ void ReceiverApp::onPictureDecoded(const FrameTimeline& timeline) {
 
 void ReceiverApp::restartDecoder(uint32_t width, uint32_t height) {
     // On the renderer's current device: hardware decoding when the GPU allows
-    // it. The decoder can only start from a keyframe.
+    // it. The decoder can only start from a keyframe: the gate holds the
+    // other frames and asks the Mac for one (decodePending).
     decoder_->shutdown();
     decoding_.clear();
     pictureFresh_ = false;
     decoder_->setD3D11Device(renderer_->GetVideoDevice());
     decoder_->initialize(width, height);
-    if (receiver_) receiver_->requestKeyframe();
+    keyframeGate_.reset();
 }
 
 void ReceiverApp::decodePending() {
@@ -263,7 +264,13 @@ void ReceiverApp::decodePending() {
         std::lock_guard<std::mutex> lock(inputMutex_);
         frames.swap(inputQueue_);   // don't hold the lock while decoding
     }
+    const int64_t nowUs = PipelineClock::NowUs();
     for (auto& frame : frames) {
+        // A frame after a missing one waits for the keyframe (KeyframeGate.h)
+        if (!keyframeGate_.admit(frame.timeline.frameSequence, frame.timeline.hasSenderTiming,
+                                 frame.timeline.keyframe, nowUs)) {
+            continue;
+        }
         const int64_t sampleTime = nextSampleTime_;
         nextSampleTime_ += kSampleTimeStep;
         frame.timeline.decodeStartUs = PipelineClock::NowUs();
@@ -282,6 +289,14 @@ void ReceiverApp::decodePending() {
     }
     // Pictures the decoder finished after the last input
     if (!decoding_.empty()) decoder_->drainOutput();
+
+    // The Mac sends keyframes only when asked: at once, then every 250 ms
+    // until one arrives
+    if (receiver_ && receiver_->getState() == StreamReceiver::State::Streaming &&
+        keyframeGate_.shouldRequestKeyframe(nowUs)) {
+        LOG_DEBUG("Decoder") << "Asking the Mac for a keyframe";
+        receiver_->requestKeyframe();
+    }
 
     // Inputs that never produced a picture (e.g. before the first keyframe)
     // must not keep the loop polling
@@ -753,6 +768,12 @@ void ReceiverApp::tickOncePerSecond(int64_t nowUs) {
         net.framesExpected = ns.framesExpected;
         net.framesReceived = ns.framesReceived;
         net.jitterMs = ns.jitterMs;
+        net.keyframesReceived = ns.keyframesReceived;
+        net.keyframeRequests = ns.keyframeRequests;
+    }
+    if (keyframeGate_.framesHeld() > heldReported_) {
+        metrics_.onFramesHeld(keyframeGate_.framesHeld() - heldReported_);
+        heldReported_ = keyframeGate_.framesHeld();
     }
     uint64_t skippedNow;
     {

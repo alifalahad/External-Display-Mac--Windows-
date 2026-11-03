@@ -78,11 +78,11 @@ Files next to the exe:
 See [TESTING.md](TESTING.md).
 
 ```bash
-# Mac (35 tests)
+# Mac (36 tests)
 cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
 ```
 ```bat
-:: Windows (4 suites, 285 checks)
+:: Windows (4 suites, 334 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build

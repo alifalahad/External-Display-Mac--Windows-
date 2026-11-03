@@ -55,4 +55,54 @@ final class EncoderTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(timing.encodeEndUs, timing.encodeStartUs)
         }
     }
+
+    // docs/SMOOTHNESS.md, step 2: no keyframe every second, only when asked
+    func testKeyframesOnlyWhenAsked() throws {
+        var config = EncoderConfig()
+        config.width = 640
+        config.height = 360
+        let encoder = try VideoEncoder(config: config)
+
+        let frameCount = 150   // 2.5 s at 60 FPS: the old 60-frame interval gave keyframes at 0, 60, 120
+        let done = expectation(description: "frames")
+        done.expectedFulfillmentCount = frameCount
+        var keyframes: [Int] = []
+        var index = 0
+        let lock = NSLock()
+        encoder.onEncodedFrame = { _, key, _ in
+            lock.lock()
+            if key { keyframes.append(index) }
+            index += 1
+            lock.unlock()
+            done.fulfill()
+        }
+
+        var pool: CVPixelBufferPool?
+        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                                      kCVPixelBufferWidthKey: 640, kCVPixelBufferHeightKey: 360,
+                                      kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]]
+        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+        for i in 0..<frameCount {
+            if i == 100 { encoder.forceKeyframe() }   // what a KEYFRAME_REQ does
+            var pb: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &pb)
+            // A moving bar, so every frame has something to encode
+            CVPixelBufferLockBaseAddress(pb!, [])
+            let base = CVPixelBufferGetBaseAddress(pb!)!.assumingMemoryBound(to: UInt8.self)
+            let bpr = CVPixelBufferGetBytesPerRow(pb!)
+            for y in 0..<360 {
+                memset(base + y * bpr, 40, 640 * 4)
+                memset(base + y * bpr + (i * 4 % 600) * 4, 0xFF, 40 * 4)
+            }
+            CVPixelBufferUnlockBaseAddress(pb!, [])
+            encoder.encode(pixelBuffer: pb!, presentationTime: CMTime(value: Int64(i), timescale: 60),
+                           duration: CMTime(value: 1, timescale: 60), captureUs: HostClock.nowUs(),
+                           captureIsReal: true)
+        }
+        wait(for: [done], timeout: 20)
+        encoder.stop()
+
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(keyframes, [0, 100], "the first frame and the requested one only")
+    }
 }

@@ -14,12 +14,17 @@
 // drawn here (docs/SMOOTHNESS.md, step 1): RECEIVER_CAPS asks for it, the Mac
 // sends CURSOR_SHAPE / CURSOR_POSITION, ending with a scripted path. The
 // paired run switches it off and on again (F4); wrongcode never asks.
+// Keyframes (docs/SMOOTHNESS.md, step 2): the receiver's KeyframeGate runs on
+// the real stream; 12 s in one frame is "lost" on purpose. The gate must
+// notice the gap, ask at once, and the Mac's keyframe must come within
+// 300 ms. No keyframes except the ones asked for.
 //
 //   ReceiverClient <host> <seconds> <code-file> <mode>
 // =============================================================================
 
 #include "Network/StreamReceiver.h"
 #include "Input/Pointer.h"
+#include "Decoder/KeyframeGate.h"
 #include "Security/PairingManager.h"
 #include "Performance/PipelineMetrics.h"
 #include "Performance/PipelineClock.h"
@@ -49,6 +54,9 @@ int main(int argc, char** argv) {
     std::mutex m;
     std::vector<FrameTimeline> frames;
     size_t badStartCodes = 0, keyframes = 0;
+    KeyframeGate gate;                       // as in ReceiverApp::decodePending
+    int64_t firstFrameUs = 0, lostAtUs = 0, recoveryAskedUs = 0, recoveredUs = 0;
+    uint64_t heldAfterLoss = 0;
     rx.setFrameCallback([&](const uint8_t* d, size_t n, const FrameTimeline& t) {
         std::lock_guard<std::mutex> lock(m);
         if (n < 5 || d[0] != 0 || d[1] != 0 || d[2] != 0 || d[3] != 1) badStartCodes++;
@@ -56,10 +64,24 @@ int main(int argc, char** argv) {
         FrameTimeline copy = t;
         copy.decodeStartUs = copy.decodeEndUs = copy.presentUs = t.completeUs;   // no decoder here
         frames.push_back(copy);
+
+        if (!firstFrameUs) firstFrameUs = t.completeUs;
+        if (!lostAtUs && !t.keyframe && t.completeUs - firstFrameUs > 12'000'000) {
+            lostAtUs = t.completeUs;         // never reaches the gate: lost on the way
+            return;
+        }
+        const uint64_t heldBefore = gate.framesHeld();
+        gate.admit(t.frameSequence, t.hasSenderTiming, t.keyframe, t.completeUs);
+        if (lostAtUs && !recoveredUs) {
+            heldAfterLoss += gate.framesHeld() - heldBefore;
+            if (t.keyframe && recoveryAskedUs) recoveredUs = t.completeUs;
+        }
     });
     bool streamStarted = false;
     rx.setStreamInfoCallback([&](uint32_t w, uint32_t h, uint32_t fps) {
         std::printf("[Client] START_STREAM %ux%u @ %u\n", w, h, fps);
+        std::lock_guard<std::mutex> lock(m);
+        gate.reset();                        // new stream, new decoder
         streamStarted = true;
     });
 
@@ -86,7 +108,6 @@ int main(int argc, char** argv) {
     int codeRequests = 0;
     int64_t streamStartUs = 0;
     int pointerToggle = 0;
-    bool askedKeyframe = false;
     int64_t end = PipelineClock::NowUs() + (int64_t)seconds * 1000000;
     while (PipelineClock::NowUs() < end) {
         uint32_t req = 0;
@@ -107,7 +128,14 @@ int main(int argc, char** argv) {
                         result == StreamReceiver::CodeResult::Sent ? "verified"
                         : result == StreamReceiver::CodeResult::Mismatch ? "mismatch (refused)" : "expired");
         }
-        if (streamStarted && !askedKeyframe) { rx.requestKeyframe(); askedKeyframe = true; }
+        // Ask while the gate waits for a keyframe: at once, then every 250 ms
+        bool askKeyframe = false;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            askKeyframe = streamStarted && gate.shouldRequestKeyframe(PipelineClock::NowUs());
+            if (askKeyframe && lostAtUs && !recoveryAskedUs) recoveryAskedUs = PipelineClock::NowUs();
+        }
+        if (askKeyframe) rx.requestKeyframe();
         // Paired run: F4 off and on again, sent at once over the running session
         if (streamStarted && !streamStartUs) streamStartUs = PipelineClock::NowUs();
         const int64_t sinceStartUs = streamStartUs ? PipelineClock::NowUs() - streamStartUs : 0;
@@ -170,6 +198,12 @@ int main(int argc, char** argv) {
         std::printf("[Client] pointer: no shapes, %zu positions, asked %d time(s)\n", positions.size(), pointerRequests);
     }
 
+    const int64_t recoveryUs = recoveredUs && recoveryAskedUs ? recoveredUs - recoveryAskedUs : -1;
+    std::printf("[Client] keyframes: %zu received, %llu asked for; frame lost on purpose: %s, "
+                "keyframe after %.1f ms, %llu frames held meanwhile\n",
+                keyframes, (unsigned long long)gate.requests(), lostAtUs ? "yes" : "no",
+                recoveryUs >= 0 ? recoveryUs / 1000.0 : -1.0, (unsigned long long)heldAfterLoss);
+
     int failures = 0;
     auto expect = [&](bool c, const char* what) { if (!c) { failures++; std::printf("  FAIL: %s\n", what); } };
     if (mode == "rejected") {
@@ -189,7 +223,11 @@ int main(int argc, char** argv) {
     expect(streams && frames.size() > (size_t)(seconds - 8) * 40, "encrypted frames received (~60 FPS)");
     expect(withTiming == frames.size(), "every frame carries the timing prefix");
     expect(badStartCodes == 0, "decrypted frames start with an H.264 start code");
-    expect(keyframes >= 1, "keyframe received");
+    expect(keyframes >= 2, "keyframes on request: stream start and after the lost frame");
+    expect(keyframes <= gate.requests() + 1, "no periodic keyframes (one per second before)");
+    expect(lostAtUs > 0 && recoveryAskedUs > lostAtUs && recoveryAskedUs - lostAtUs < 100'000,
+           "the missing frame was noticed and a keyframe asked for at once");
+    expect(recoveryUs >= 0 && recoveryUs < 300'000, "the Mac's keyframe arrived within 300 ms");
     expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
     expect(sync.valid && sync.smoothedRttMs < 50, "clock sync converged over the encrypted channel");
     expect(mac.valid && mac.encodeFps > 30, "SENDER_STATS received (encrypted control message)");

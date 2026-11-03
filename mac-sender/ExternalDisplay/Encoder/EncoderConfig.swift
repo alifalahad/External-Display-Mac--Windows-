@@ -39,8 +39,11 @@ struct EncoderConfig {
     /// Average bitrate in bits per second (default: 25 Mbps for good text clarity)
     var bitrateBps: Int = 25_000_000
 
-    /// Maximum keyframe interval in frames (1 second at 60 FPS)
-    var keyframeInterval: Int = 60
+    /// Keyframes come when the receiver asks: stream start, a lost frame
+    /// (docs/SMOOTHNESS.md, step 2). They are several times larger than other
+    /// frames, and one per second made the Wi-Fi burst every second. This
+    /// periodic one is only a safety net.
+    var keyframeIntervalSeconds: Double = 60
 
     /// H.264 profile. Constrained High = High's compression without B-frames,
     /// the profile Apple's low-latency encoder mode is built for.

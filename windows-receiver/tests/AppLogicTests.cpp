@@ -1,5 +1,6 @@
 // =============================================================================
-// AppLogicTests.cpp — Options, status texts, Mac choice, logging, replay window
+// AppLogicTests.cpp — Options, status texts, Mac choice, logging, replay window,
+//                     keyframe gate
 // =============================================================================
 // Portable (no Windows headers): builds with MSVC and with clang/gcc anywhere.
 // =============================================================================
@@ -8,6 +9,7 @@
 #include "App/Options.h"
 #include "App/StatusText.h"
 #include "Security/ReplayWindow.h"
+#include "Decoder/KeyframeGate.h"
 #include "Input/VideoViewport.h"
 
 #include <cstdio>
@@ -189,6 +191,55 @@ static void TestVideoViewport() {
     CHECK(Near(x, 0) && Near(y, 1));
 }
 
+static void TestKeyframeGate() {
+    std::printf("Keyframe gate: hold after a missing frame, ask, recover (SMOOTHNESS.md step 2)\n");
+    KeyframeGate g;
+    int64_t t = 1'000'000;
+    // Stream start: nothing before the first keyframe; ask at once, then every 250 ms
+    CHECK(g.waitingForKeyframe());
+    CHECK(!g.admit(5, true, false, t));
+    CHECK(g.shouldRequestKeyframe(t));
+    CHECK(!g.shouldRequestKeyframe(t + 100'000));
+    CHECK(g.shouldRequestKeyframe(t + 250'000));
+    CHECK(!g.admit(6, true, false, t + 900'000));      // never decoded without a keyframe
+    CHECK(g.admit(7, true, true, t + 950'000));        // the keyframe
+    CHECK(!g.waitingForKeyframe() && !g.shouldRequestKeyframe(t + 2'000'000));
+    for (uint32_t n = 8; n < 20; n++) CHECK(g.admit(n, true, false, t + 1'000'000));
+    CHECK(g.framesHeld() == 2 && g.requests() == 2);
+
+    // Frame 20 lost: 21 builds on it → hold, ask at once
+    t = 5'000'000;
+    CHECK(!g.admit(21, true, false, t));
+    CHECK(g.waitingForKeyframe());
+    CHECK(g.shouldRequestKeyframe(t));
+    CHECK(!g.admit(22, true, false, t + 100'000));
+    CHECK(!g.admit(23, true, false, t + 299'000));
+    // Keyframe late: after 300 ms decode anyway (damaged), still asking
+    CHECK(g.admit(24, true, false, t + 300'000));
+    CHECK(g.shouldRequestKeyframe(t + 300'000));
+    CHECK(g.admit(25, true, true, t + 320'000));       // repaired
+    CHECK(!g.waitingForKeyframe());
+    CHECK(g.admit(26, true, false, t + 330'000));
+    // A keyframe right after a gap is fine: nothing missing it builds on
+    CHECK(g.admit(30, true, true, t + 400'000) && !g.waitingForKeyframe());
+
+    // Late or duplicate frames are dropped without damaging anything
+    CHECK(!g.admit(29, true, false, t + 410'000));
+    CHECK(!g.admit(30, true, false, t + 410'000));
+    CHECK(g.admit(31, true, false, t + 420'000) && !g.waitingForKeyframe());
+
+    // The Mac restarted its numbering (huge jump): not a loss
+    CHECK(g.admit(1'000'000, true, false, t + 430'000) && !g.waitingForKeyframe());
+    // Frames without numbers (older Mac app): decoded, never checked
+    CHECK(g.admit(0, false, false, t + 440'000) && g.admit(0, false, false, t + 450'000));
+
+    // New decoder: back to waiting, asks at once
+    g.reset();
+    CHECK(g.waitingForKeyframe() && g.shouldRequestKeyframe(t + 460'000));
+    CHECK(!g.admit(1'000'001, true, false, t + 470'000));
+    CHECK(g.admit(3, true, true, t + 480'000));        // new numbering after reset: no gap check
+}
+
 int main() {
     TestVideoViewport();
     TestOptions();
@@ -197,6 +248,7 @@ int main() {
     TestWiden();
     TestLogging();
     TestReplayWindow();
+    TestKeyframeGate();
     std::printf("\n%d checks, %d failed\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }

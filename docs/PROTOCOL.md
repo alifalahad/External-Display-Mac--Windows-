@@ -41,7 +41,7 @@ Integers are **little-endian**, except the two security fields marked *big-endia
 | 0x10 | START_STREAM | Mac → PC | width, height, fps, bitrate, codec (u32 each) | yes |
 | 0x11 | STOP_STREAM | Mac → PC | — | yes |
 | 0x20 / 0x21 | PING / PONG | both | PONG: the PING's timestamp (u64), so the PC can sync clocks | after auth |
-| 0x30 | KEYFRAME_REQ | PC → Mac | — | yes |
+| 0x30 | KEYFRAME_REQ | PC → Mac | — (the Mac makes keyframes only when asked, plus one a minute) | yes |
 | 0x50 | QUALITY_REPORT | PC → Mac | loss ×100, RTT ms, frames dropped, queue depth, latency µs (u32 each) | yes |
 | 0x51 | SENDER_STATS | Mac → PC | capture FPS ×100, encode FPS ×100, CPU % ×100, RAM MB, encoder kbps, target kbps, flags, reserved | yes |
 | 0x60 | INPUT_EVENT | PC → Mac | 24 bytes: type, button, key code, modifiers, x, y, scroll x, scroll y (x, y are 0…1 across the video) | yes |
@@ -148,7 +148,9 @@ Prefix fields (u32 frame number, u32 flags, then u64 µs on the Mac clock):
 | encode end | encoder output |
 | send | packetization started |
 
-Keyframes start with SPS and PPS.
+Keyframes start with SPS and PPS. They come at the start of a stream, after a KEYFRAME_REQ, and
+once a minute. Frame numbers are consecutive, so the receiver notices a missing frame and asks for
+a keyframe.
 
 ## Versioning
 

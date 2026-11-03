@@ -602,8 +602,12 @@ void StreamReceiver::requestKeyframeAfterLoss() {
     if (now - m_lastLossKeyframeRequest <
         std::chrono::milliseconds(KEYFRAME_REQUEST_INTERVAL_MS)) return;
     m_lastLossKeyframeRequest = now;
-
     requestKeyframe();
+}
+
+void StreamReceiver::requestKeyframe() {
+    if (!isSecure()) return;
+    tcpSendMessage(exdp::MessageType::KeyframeReq, nullptr, 0);
     std::lock_guard<std::mutex> lock(m_statsMutex);
     m_stats.keyframeRequests++;
 }
@@ -772,6 +776,7 @@ void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool is
         std::lock_guard<std::mutex> lock(m_statsMutex);
         m_stats.framesReceived++;
         m_stats.framesExpected += newlyExpected;
+        if (isKeyframe) m_stats.keyframesReceived++;
         m_stats.jitterMs = m_jitter.jitterMs();
     }
 

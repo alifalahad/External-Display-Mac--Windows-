@@ -136,9 +136,12 @@ final class VideoEncoder {
         statsLock.unlock()
         applyBitrate(bitrate)
 
-        // Keyframe interval
+        // Keyframes on request (forceKeyframe); both limits apply, whichever
+        // comes first. Frames only exist while the screen changes.
         setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                     value: config.keyframeInterval as CFNumber)
+                     value: Int((config.fps * config.keyframeIntervalSeconds).rounded()) as CFNumber)
+        setProperty(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                     value: config.keyframeIntervalSeconds as CFNumber)
 
         // Expected frame rate (helps encoder allocate bits)
         setProperty(kVTCompressionPropertyKey_ExpectedFrameRate,

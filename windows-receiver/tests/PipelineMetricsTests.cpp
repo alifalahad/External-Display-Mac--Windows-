@@ -241,6 +241,9 @@ static void TestRates() {
     net.packetsReceived = 990;
     net.packetsLost = 10;
     net.jitterMs = 0.7;
+    net.keyframesReceived = 2;         // docs/SMOOTHNESS.md, step 2
+    net.keyframeRequests = 3;
+    m.onFramesHeld(4);
     m.tick(1'000'000, net);
 
     MetricsSnapshot s = m.snapshot();
@@ -257,15 +260,25 @@ static void TestRates() {
     CHECK(s.framesDroppedHere == 1);
     CHECK_NEAR(s.jitterMs, 0.7, 1e-9);
     CHECK(s.stages[static_cast<size_t>(Stage::Decode)].samples == 57);
+    CHECK(s.keyframes == 2 && s.keyframeRequests == 3 && s.framesHeld == 4);
+    CHECK(s.keyframesLastInterval == 2 && s.keyframeRequestsLastInterval == 3 && s.framesHeldLastInterval == 4);
+    // Next second: one more keyframe, nothing else
+    net.keyframesReceived = 3;
+    m.tick(2'000'000, net);
+    s = m.snapshot();
+    CHECK(s.keyframes == 3 && s.keyframesLastInterval == 1 && s.keyframeRequestsLastInterval == 0);
+    CHECK(s.framesHeld == 4 && s.framesHeldLastInterval == 0);
 
     // Receiver counters restarted (reconnect): no negative or huge rates
     NetworkCounters restarted;
     restarted.framesReceived = 3;
     restarted.bytesReceived = 1000;
-    m.tick(2'000'000, restarted);
+    restarted.keyframesReceived = 1;
+    m.tick(3'000'000, restarted);
     s = m.snapshot();
     CHECK(s.receivedFps >= 0 && s.receivedFps < 1000);
     CHECK(s.framesLostInNetwork == 0);
+    CHECK(s.keyframes == 0);                       // counted from the new stream on
 }
 
 // ── Benchmark files ─────────────────────────────────────────────────────────
@@ -296,6 +309,9 @@ static void TestBenchmarkRecorder() {
     }
     MetricsSnapshot m;
     m.presentedFps = 60;
+    m.keyframesLastInterval = 1;
+    m.keyframeRequestsLastInterval = 1;
+    m.framesHeldLastInterval = 2;
     SystemSample sys;
     sys.valid = true;
     sys.cpuPercent = 3;
@@ -310,6 +326,16 @@ static void TestBenchmarkRecorder() {
     CHECK(summary.find("Total") != std::string::npos);
     CHECK(summary.find("18.00") != std::string::npos); // total latency of every frame
     CHECK(summary.find("Frames displayed: 120") != std::string::npos);
+    CHECK(summary.find("Keyframes  2 (60.0 per minute)   asked for 2   frames held waiting for one 4")
+          != std::string::npos);
+    {
+        std::ifstream sec(base + "-seconds.csv");
+        std::string header, row;
+        std::getline(sec, header);
+        std::getline(sec, row);
+        CHECK(header.find(",keyframes,keyframe_requests,frames_held") != std::string::npos);
+        CHECK(row.size() > 6 && row.compare(row.size() - 6, 6, ",1,1,2") == 0);
+    }
     std::ifstream written(base + "-summary.txt");
     std::stringstream ss;
     ss << written.rdbuf();
@@ -333,7 +359,11 @@ static void TestOverlayText() {
     in.pc.gpuValid = true;
     in.metrics.stages[static_cast<size_t>(Stage::Total)].samples = 10;
     in.metrics.stages[static_cast<size_t>(Stage::Total)].avgMs = 27.5;
+    in.metrics.keyframes = 3;
+    in.metrics.keyframeRequests = 2;
+    in.metrics.framesHeld = 5;
     std::wstring text = FormatDiagnostics(in);
+    CHECK(text.find(L"Keyframe 3  (asked 2)  held 5 frames") != std::wstring::npos);
     CHECK(text.find(L"capture 59.9") != std::wstring::npos);
     CHECK(text.find(L"RTT 3.2 ms") != std::wstring::npos);
     CHECK(text.find(L"27.5") != std::wstring::npos);
