@@ -272,6 +272,15 @@ void ReceiverApp::decodePending() {
                                  frame.timeline.keyframe, nowUs)) {
             continue;
         }
+        // A keyframe's SPS says how its colours map to RGB (VideoColor.h)
+        VideoColor color;
+        if (frame.timeline.keyframe && FindSpsColor(frame.data.data(), frame.data.size(), color) &&
+            (!videoColorKnown_ || color != videoColor_)) {
+            videoColor_ = color;
+            videoColorKnown_ = true;
+            renderer_->SetVideoColor(color, streamHeight_);
+            LOG_INFO("Decoder") << "Video colours: " << VideoColorName(color, streamHeight_);
+        }
         const int64_t sampleTime = nextSampleTime_;
         nextSampleTime_ += kSampleTimeStep;
         frame.timeline.decodeStartUs = PipelineClock::NowUs();
@@ -423,6 +432,7 @@ void ReceiverApp::handleRendererLoss() {
     pendingDisplay_.clear();
     // A hardware decoder is bound to the old device, and so was the pointer image
     if (decoder_ && streamWidth_) restartDecoder(streamWidth_, streamHeight_);
+    renderer_->SetVideoColor(videoColor_, streamHeight_);
     spriteShapeId_ = 0;
     spriteW_ = spriteH_ = 0;
     forceRender_ = true;
@@ -448,6 +458,7 @@ void ReceiverApp::handleStreamRestart() {
     streamWidth_ = w;
     streamHeight_ = h;
     restartDecoder(w, h);
+    renderer_->SetVideoColor(videoColor_, h);   // "unspecified" depends on the height
     if (h > 0) {
         float aspect = static_cast<float>(w) / static_cast<float>(h);
         window_.SetVideoAspectRatio(aspect);
@@ -695,10 +706,11 @@ void ReceiverApp::updateOverlay(int64_t nowUs) {
         in.sync = receiver_->clockEstimate();
         in.mac = receiver_->senderStats();
         wchar_t line[256];
-        swprintf(line, 256, L"%ls%ls %ux%u -> window %dx%d at %d%%\n"
+        const std::wstring colour = WidenUtf8(VideoColorName(videoColor_, streamHeight_));
+        swprintf(line, 256, L"%ls%ls %ux%u, %ls -> window %dx%d at %d%%\n"
                             L"Pointer %ls (F4)  present %ls (F5)",
                  StateName(receiver_->getState()), receiver_->isSecure() ? L" (encrypted)" : L"",
-                 streamWidth_, streamHeight_, window_.GetWidth(), window_.GetHeight(),
+                 streamWidth_, streamHeight_, colour.c_str(), window_.GetWidth(), window_.GetHeight(),
                  MulDiv(100, static_cast<int>(window_.GetDpi()), 96),
                  localPointerWanted_ && renderer_->CanDrawPointer() ? L"drawn here" : L"in the video",
                  renderer_->PresentsImmediately() ? L"at once" : L"on refresh");

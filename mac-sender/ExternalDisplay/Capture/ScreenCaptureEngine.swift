@@ -7,7 +7,8 @@
 //   2. CIContext → CGImage preview (≤ 10 FPS, downscaled; paused while streaming)
 //
 // Key design decisions:
-// - CVPixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally
+// - Captured as full-range YCbCr 4:2:0 (NV12), the encoder's own input format:
+//   no conversion pass before encoding (docs/SMOOTHNESS.md, step 4)
 // - The preview is a GPU→CPU readback: throttled, downscaled, can be switched off
 // - Encoder runs at full capture rate for smooth output
 // - UI statistics are pulled once per second (diagnosticsTimer), never pushed per frame
@@ -384,8 +385,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
             // Capture at the display's point resolution
             let drawsPointer = await MainActor.run { self.receiverDrawsPointer }
-            let config = makeStreamConfiguration(width: display.width, height: display.height,
-                                                 fps: qualityPreset.fps, capturePointer: !drawsPointer)
+            let config = Self.streamConfiguration(width: display.width, height: display.height,
+                                                  fps: qualityPreset.fps, capturePointer: !drawsPointer)
             capturedDisplayID = display.displayID
             captureWidth = display.width
             captureHeight = display.height
@@ -555,18 +556,25 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     }
 
     /// Everything the stream is captured with, in one place
-    private func makeStreamConfiguration(width: Int, height: Int, fps: Int,
-                                         capturePointer: Bool) -> SCStreamConfiguration {
+    static func streamConfiguration(width: Int, height: Int, fps: Int,
+                                    capturePointer: Bool) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
         // Frame rate from the quality preset (60, or 30 for Battery Saver)
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        // BGRA pixel format — standard for display capture
-        config.pixelFormat = kCVPixelFormatType_32BGRA
+        // YCbCr 4:2:0 in full range, BT.709 (step 4): the H.264 encoder's input
+        // format, so it needs no conversion pass — and exactly what the
+        // receiver's shader expects. BGRA made VideoToolbox convert to video
+        // range (16–235), which the receiver showed washed out.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        config.colorSpaceName = CGColorSpace.sRGB
         // Left out when the receiver draws the pointer itself
         config.showsCursor = capturePointer
-        // Bounded queue — if we can't keep up, older frames are dropped
+        // Surfaces ScreenCaptureKit can fill while we hold others (the encoder's,
+        // and the frame kept for keyframe re-encodes). Not a delay: frames are
+        // delivered at once. Fewer surfaces can stall the stream.
         config.queueDepth = 3
         return config
     }
@@ -575,8 +583,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// restarting the stream.
     private func updateStreamConfiguration(what: String) {
         guard let stream else { return }
-        let config = makeStreamConfiguration(width: captureWidth, height: captureHeight,
-                                             fps: qualityPreset.fps, capturePointer: !receiverDrawsPointer)
+        let config = Self.streamConfiguration(width: captureWidth, height: captureHeight,
+                                              fps: qualityPreset.fps, capturePointer: !receiverDrawsPointer)
         guard config.width > 0, config.height > 0 else { return }
         stream.updateConfiguration(config) { error in
             if let error {

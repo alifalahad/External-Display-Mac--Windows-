@@ -62,6 +62,10 @@ changes; move a window.
 **The mouse lands in the wrong place.** Fixed in version 2: clicks are mapped through the
 letterboxed picture. If it still happens, send `receiver.log` with `--verbose`.
 
+**Colours look washed out (black is grey, white is dull).** That was a bug: the Mac sent video
+range (16–235) and the PC showed it as full range. Fixed in smoothness step 4; update both apps.
+The F2 overlay names the colours the stream uses (`full-range BT.709`).
+
 **A line tears through the picture while scrolling.** "Present at once" is on (F5 or
 `--present=immediate`): frames are shown without waiting for the refresh. Press F5 to go back
 to presenting on the refresh (the default).

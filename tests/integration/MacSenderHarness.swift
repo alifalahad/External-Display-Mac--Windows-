@@ -110,8 +110,9 @@ sender.streamWidth = UInt32(width)
 sender.streamHeight = UInt32(height)
 sender.startListening()
 
+// Full-range NV12, as the app captures since docs/SMOOTHNESS.md step 4
 let attrs: [CFString: Any] = [
-    kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+    kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     kCVPixelBufferWidthKey: width, kCVPixelBufferHeightKey: height,
     kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]]
 var pool: CVPixelBufferPool?
@@ -127,17 +128,20 @@ frameTimer.setEventHandler {
     CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &pbOut)
     guard let pb = pbOut else { return }
     CVPixelBufferLockBaseAddress(pb, [])
-    let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
-    let bpr = CVPixelBufferGetBytesPerRow(pb)
+    let luma = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!.assumingMemoryBound(to: UInt8.self)
+    let lumaBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+    let chroma = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!.assumingMemoryBound(to: UInt8.self)
+    let chromaBpr = CVPixelBufferGetBytesPerRowOfPlane(pb, 1)
     let barX = Int(frameIndex * 8) % (width - 64)
     for y in 0..<height {
-        let row = base + y * bpr
-        memset(row, Int32(truncatingIfNeeded: (y + Int(frameIndex)) & 0xFF), width * 4)
-        memset(row + barX * 4, 0xFF, 64 * 4)
+        let row = luma + y * lumaBpr
+        memset(row, Int32(truncatingIfNeeded: (y + Int(frameIndex)) & 0xFF), width)
+        memset(row + barX, 0xFF, 64)
         if y >= 300 && y < 420 {
-            for x in stride(from: 400, to: 880, by: 4) { row[x * 4] = UInt8.random(in: 0...255, using: &rng) }
+            for x in stride(from: 400, to: 880, by: 4) { row[x] = UInt8.random(in: 0...255, using: &rng) }
         }
     }
+    for y in 0..<height / 2 { memset(chroma + y * chromaBpr, 128, width) }   // grey: no colour
     CVPixelBufferUnlockBaseAddress(pb, [])
     let pts = CMTime(value: frameIndex, timescale: 60)
     frameIndex += 1

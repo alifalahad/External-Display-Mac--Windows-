@@ -76,8 +76,9 @@ It renders only when the picture, the overlay or the status card changed.
 
 ## Video path and latency
 
-1. **Capture:** ScreenCaptureKit delivers only changed frames, as IOSurface-backed buffers.
-   `displayTime` is when the frame was on screen.
+1. **Capture:** ScreenCaptureKit delivers only changed frames, as IOSurface-backed buffers in
+   full-range NV12 (BT.709), the encoder's input format. `displayTime` is when the frame was
+   on screen.
 2. **Encode:** VideoToolbox H.264 in hardware, *low-latency rate control*, Constrained High, no
    B-frames. Keyframes only on request, plus one a minute as a safety net
    ([SMOOTHNESS.md](SMOOTHNESS.md), step 2).
@@ -87,7 +88,7 @@ It renders only when the picture, the overlay or the status card changed.
 5. **Decode:** the Media Foundation H.264 decoder on the renderer's D3D11 device (DXVA).
    Pictures stay in GPU memory and are copied GPU→GPU into the texture the shader samples.
    In front of it, the keyframe gate holds frames that follow a missing one until a keyframe
-   arrives.
+   arrives. The shader converts YCbCr to RGB with the range and matrix the stream's SPS states.
 6. **Present:** wait for the swap chain's frame slot (maximum frame latency 1), decode whatever
    arrived meanwhile, draw the newest picture, then present on the next refresh (or at once with
    F5, where the driver allows tearing). The receiver is per-monitor DPI-aware, so the swap chain

@@ -19,6 +19,7 @@
 #include "Clipboard/ClipboardSync.h"
 #include "Decoder/H264Decoder.h"
 #include "Decoder/KeyframeGate.h"
+#include "Decoder/H264Sps.h"
 #include "Input/InputCapture.h"
 #include "Input/Pointer.h"
 #include "Network/StreamReceiver.h"
@@ -119,6 +120,8 @@ private:
     int consecutiveDecodeFailures_ = 0;
     KeyframeGate keyframeGate_;              // docs/SMOOTHNESS.md, step 2
     uint64_t heldReported_ = 0;
+    VideoColor videoColor_;                  // from the stream's SPS (step 4)
+    bool videoColorKnown_ = false;
     bool pictureFresh_ = false;              // in the renderer, not presented yet
     FrameTimeline pictureTimeline_;
     uint64_t picturesOverwritten_ = 0;

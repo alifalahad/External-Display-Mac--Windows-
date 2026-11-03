@@ -27,6 +27,7 @@ add_executable(${PROJECT_NAME} WIN32
     src/Network/StreamReceiver.cpp
     src/Decoder/H264Decoder.cpp
     src/Decoder/KeyframeGate.cpp
+    src/Decoder/H264Sps.cpp
     src/Input/InputCapture.cpp
     src/Input/Pointer.cpp
     src/Input/PointerCursor.cpp
@@ -84,7 +85,7 @@ endif()
 #   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window, keyframe gate
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
 #   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
-#   .\build\DisplayTests.exe           swap chain plan, present mode, DPI awareness
+#   .\build\DisplayTests.exe           swap chain plan, present mode, DPI awareness, stream colours
 #   ctest --test-dir build               all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
@@ -116,6 +117,7 @@ if(EXDP_BUILD_TESTS)
     add_executable(DisplayTests
         tests/DisplayTests.cpp
         src/App/Dpi.cpp
+        src/Decoder/H264Sps.cpp
     )
     target_link_libraries(DisplayTests PRIVATE user32 gdi32)
     foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests DisplayTests)

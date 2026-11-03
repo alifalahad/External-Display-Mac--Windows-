@@ -3,6 +3,7 @@
 import XCTest
 import CoreVideo
 import CoreMedia
+import ScreenCaptureKit
 @testable import ExternalDisplay
 
 final class EncoderTests: XCTestCase {
@@ -104,5 +105,48 @@ final class EncoderTests: XCTestCase {
 
         lock.lock(); defer { lock.unlock() }
         XCTAssertEqual(keyframes, [0, 100], "the first frame and the requested one only")
+    }
+
+    // docs/SMOOTHNESS.md, step 4: capture in the encoder's format, full-range BT.709
+    func testCaptureSettings() {
+        let config = ScreenCaptureEngine.streamConfiguration(width: 1920, height: 1080, fps: 60, capturePointer: false)
+        XCTAssertEqual(config.pixelFormat, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, "NV12, full range")
+        XCTAssertEqual(config.colorMatrix as String, CGDisplayStream.yCbCrMatrix_ITU_R_709_2 as String)
+        XCTAssertEqual(config.colorSpaceName as String, CGColorSpace.sRGB as String)
+        XCTAssertEqual(config.queueDepth, 3)
+        XCTAssertFalse(config.showsCursor)
+        XCTAssertEqual(config.minimumFrameInterval, CMTime(value: 1, timescale: 60))
+    }
+
+    func testStreamSaysFullRangeBT709() throws {
+        var config = EncoderConfig()
+        config.width = 640
+        config.height = 360
+        let encoder = try VideoEncoder(config: config)
+        let done = expectation(description: "frame")
+        var format: CMFormatDescription?
+        encoder.onEncodedFrame = { sample, _, _ in
+            format = CMSampleBufferGetFormatDescription(sample)
+            done.fulfill()
+        }
+        var pool: CVPixelBufferPool?
+        let attrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                                      kCVPixelBufferWidthKey: 640, kCVPixelBufferHeightKey: 360,
+                                      kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any]]
+        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+        var pb: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &pb)
+        encoder.encode(pixelBuffer: pb!, presentationTime: .zero, duration: CMTime(value: 1, timescale: 60),
+                       captureUs: HostClock.nowUs(), captureIsReal: true)
+        wait(for: [done], timeout: 10)
+        encoder.stop()
+
+        // VideoToolbox's own reading of the SPS it wrote (the receiver parses the same fields)
+        let fd = try XCTUnwrap(format)
+        func ext(_ key: CFString) -> Any? { CMFormatDescriptionGetExtension(fd, extensionKey: key) }
+        XCTAssertEqual(ext(kCMFormatDescriptionExtension_FullRangeVideo) as? Bool, true, "0–255, as the receiver's shader expects")
+        XCTAssertEqual(ext(kCVImageBufferYCbCrMatrixKey) as? String, kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
+        XCTAssertEqual(ext(kCVImageBufferColorPrimariesKey) as? String, kCVImageBufferColorPrimaries_ITU_R_709_2 as String)
+        XCTAssertEqual(ext(kCVImageBufferTransferFunctionKey) as? String, kCVImageBufferTransferFunction_ITU_R_709_2 as String)
     }
 }

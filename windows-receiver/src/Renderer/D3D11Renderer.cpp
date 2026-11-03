@@ -852,23 +852,26 @@ void D3D11Renderer::CreateNV12Resources() {
     device_->CreateSamplerState(&samplerDesc, &videoSampler_);
 
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = 16;
+    cbd.ByteWidth = sizeof(VideoConstantsData);
     cbd.Usage     = D3D11_USAGE_DEFAULT;
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     device_->CreateBuffer(&cbd, nullptr, &videoConstants_);
-    SetVideoUVScale(1.0f, 1.0f);
+    videoConstantsData_.uvScale[0] = videoConstantsData_.uvScale[1] = 1.0f;
+    SetVideoColor(VideoColor{}, 0);   // full-range BT.709 until the stream says otherwise
 
-    // BT.709 YUV→RGB pixel shader (FULL range — macOS VideoToolbox default)
+    // YCbCr → RGB. Range and matrix come from the stream's SPS
+    // (VideoColor.h); the Mac app sends full-range BT.709.
     const char* nv12PS = R"(
         Texture2D    yTex  : register(t0);
         Texture2D    uvTex : register(t1);
         SamplerState samp  : register(s0);
 
-        // Part of the texture holding the picture (decoder surfaces are
-        // padded, e.g. 1088 rows for 1080p)
         cbuffer VideoConstants : register(b1) {
-            float2 uvScale;
-            float2 unused;
+            float2 uvScale;            // part of the texture holding the picture (decoder
+                                       // surfaces are padded, e.g. 1088 rows for 1080p)
+            float  yOffset, yScale;    // Y' = (Y - yOffset) * yScale
+            float  cOffset, cScale;    // C' = (C - cOffset) * cScale
+            float  crR, cbG, crG, cbB; // matrix (BT.709 or BT.601)
         };
 
         struct PSInput {
@@ -878,17 +881,12 @@ void D3D11Renderer::CreateNV12Resources() {
 
         float4 main(PSInput input) : SV_Target {
             float2 texCoord = input.uv * uvScale;
-            float y  = yTex.Sample(samp, texCoord).r;
-            float2 uv_val = uvTex.Sample(samp, texCoord).rg;
+            float y = (yTex.Sample(samp, texCoord).r - yOffset) * yScale;
+            float2 c = (uvTex.Sample(samp, texCoord).rg - cOffset) * cScale;   // (Cb, Cr)
 
-            // Full-range BT.709: Y [0,1], CbCr centered at 0.5
-            float Cb = uv_val.r - 0.5;
-            float Cr = uv_val.g - 0.5;
-
-            float R = y + 1.5748 * Cr;
-            float G = y - 0.1873 * Cb - 0.4681 * Cr;
-            float B = y + 1.8556 * Cb;
-
+            float R = y + crR * c.y;
+            float G = y - cbG * c.x - crG * c.y;
+            float B = y + cbB * c.x;
             return float4(saturate(float3(R, G, B)), 1.0);
         }
     )";
@@ -1025,11 +1023,29 @@ void D3D11Renderer::UpdateFrameNV12(const uint8_t* yData, const uint8_t* uvData,
 }
 
 void D3D11Renderer::SetVideoUVScale(float x, float y) {
-    if (!videoConstants_ || (x == uvScaleX_ && y == uvScaleY_)) return;
-    const float data[4] = { x, y, 0.0f, 0.0f };
-    context_->UpdateSubresource(videoConstants_.Get(), 0, nullptr, data, 0, 0);
-    uvScaleX_ = x;
-    uvScaleY_ = y;
+    if (x == videoConstantsData_.uvScale[0] && y == videoConstantsData_.uvScale[1]) return;
+    videoConstantsData_.uvScale[0] = x;
+    videoConstantsData_.uvScale[1] = y;
+    UploadVideoConstants();
+}
+
+void D3D11Renderer::SetVideoColor(const VideoColor& color, uint32_t height) {
+    const VideoColorConstants k = ColorConstantsFor(color, height);
+    VideoConstantsData& d = videoConstantsData_;
+    d.yOffset = k.yOffset;
+    d.yScale = k.yScale;
+    d.cOffset = k.cOffset;
+    d.cScale = k.cScale;
+    d.crR = k.crR;
+    d.cbG = k.cbG;
+    d.crG = k.crG;
+    d.cbB = k.cbB;
+    UploadVideoConstants();
+}
+
+void D3D11Renderer::UploadVideoConstants() {
+    if (!videoConstants_ || deviceLost_) return;
+    context_->UpdateSubresource(videoConstants_.Get(), 0, nullptr, &videoConstantsData_, 0, 0);
 }
 
 bool D3D11Renderer::UpdateFrameTexture(ID3D11Texture2D* source, UINT subresource,

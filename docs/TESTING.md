@@ -4,13 +4,13 @@
 
 | Suite | Runs on | Covers |
 |---|---|---|
-| `mac-sender/Tests/ExternalDisplayTests` (XCTest, 36 tests) | Mac | wire layout and malformed input, CRC, version; crypto vectors shared with Windows, invalid keys, tampering, nonce counters; pairing storage (0600, reload, forget, v1 removal) and approval rules; adaptive quality (hysteresis, presets, clamping); rolling statistics; input mapping (clamping, key codes, live display bounds); hardware encoder (keyframes, SPS, timing prefix room, no periodic keyframes); pointer: payload bytes shared with Windows, bitmaps from real macOS cursors (size, hot spot, orientation, premultiplied), size cap, which moves are reported (echoes, other displays) |
+| `mac-sender/Tests/ExternalDisplayTests` (XCTest, 38 tests) | Mac | wire layout and malformed input, CRC, version; crypto vectors shared with Windows, invalid keys, tampering, nonce counters; pairing storage (0600, reload, forget, v1 removal) and approval rules; adaptive quality (hysteresis, presets, clamping); rolling statistics; input mapping (clamping, key codes, live display bounds); hardware encoder (keyframes, SPS, timing prefix room, no periodic keyframes, full-range BT.709 output); capture settings (NV12, BT.709, queue depth); pointer: payload bytes shared with Windows, bitmaps from real macOS cursors (size, hot spot, orientation, premultiplied), size cap, which moves are reported (echoes, other displays) |
 | `PipelineMetricsTests` (97 checks) | any OS | clock sync, latency stages, percentiles, jitter, rates and drops, keyframe counters, benchmark files, overlay text, payload layout |
 | `AppLogicTests` (106 checks) | any OS | command line, status card texts, Mac selection, mouse mapping through letterbox/pillarbox, UTF-8, logging levels/file/rate limit, replay window, keyframe gate (hold, ask, retry, 300 ms limit, late/duplicate frames, renumbering) |
 | `SecureChannelTests` (64 checks) | Windows | CNG self-test, HKDF (RFC 5869), HMAC (RFC 4231), ECDH/key schedule/AES-GCM against the Mac's vectors, replay and forgery rejection, DPAPI |
 | `PointerTests` (70 checks) | any OS; Windows for the cursor part | pointer payloads (the Mac's bytes), hostile input, resampling, placement through the letterbox, which pointer shows when (F3, F4, Mac or PC moved last), building the Windows cursor |
-| `DisplayTests` (27 checks) | any OS; Windows for the DPI part | swap chains tried per renderer mode (tearing, waitable, fallbacks), when a present may tear, per-monitor DPI awareness, scaled lengths/fonts/frames |
-| `tests/integration/run-loopback.sh` | Mac + MinGW + Wine | the real Mac sender (synthetic 720p60 frames, real VideoToolbox) ↔ the real Windows receiver networking (Windows build under Wine), on test ports: new pairing, paired reconnect, impostor key, wrong code, rejected pairing; encrypted streaming, timing, start codes, clock sync, statistics; pointer drawn by the receiver (real pointer image, a scripted path checked point by point, switched off and on, nothing sent unless asked); keyframes only on request (a frame dropped on purpose must be noticed and repaired by the Mac's keyframe within 300 ms; no periodic keyframes) |
+| `DisplayTests` (55 checks) | any OS; Windows for the DPI part | swap chains tried per renderer mode (tearing, waitable, fallbacks), when a present may tear, per-monitor DPI awareness, scaled lengths/fonts/frames; stream colours: SPS parsing (the Mac encoder's real bytes and constructed variants), YCbCr→RGB per range and matrix |
+| `tests/integration/run-loopback.sh` | Mac + MinGW + Wine | the real Mac sender (synthetic 720p60 frames, real VideoToolbox) ↔ the real Windows receiver networking (Windows build under Wine), on test ports: new pairing, paired reconnect, impostor key, wrong code, rejected pairing; encrypted streaming, timing, start codes, clock sync, statistics; pointer drawn by the receiver (real pointer image, a scripted path checked point by point, switched off and on, nothing sent unless asked); keyframes only on request (a frame dropped on purpose must be noticed and repaired by the Mac's keyframe within 300 ms; no periodic keyframes); colours (the harness feeds full-range NV12 like the app; every keyframe's SPS must say full-range BT.709) |
 
 ```bash
 # Mac
@@ -27,7 +27,7 @@ cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build && ctest --test-dir 
 The portable C++ suites also build on macOS/Linux:
 `c++ -std=c++17 -Isrc tests/AppLogicTests.cpp src/App/{Options,StatusText,Log}.cpp src/Decoder/KeyframeGate.cpp`, and
 `c++ -std=c++17 -Isrc tests/PointerTests.cpp src/Input/Pointer.cpp`, and
-`c++ -std=c++17 -Isrc tests/DisplayTests.cpp`.
+`c++ -std=c++17 -Isrc tests/DisplayTests.cpp src/Decoder/H264Sps.cpp`.
 
 ## What only real hardware can check
 

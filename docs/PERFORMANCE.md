@@ -169,6 +169,19 @@ Same benchmark after the changes below. Compare against the table above. The ben
 now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
 different laptops can be compared.
 
+### Capture in the encoder's format (smoothness step 4)
+
+M2, synthetic 1080p at 60 FPS, the app's encoder settings (2026-11-03):
+
+| Encoder input | Stream says | Encode avg | Encode p95 |
+|---|---|---|---|
+| BGRA (before) | video range, colours unspecified | 7.95 ms | 10.77 ms |
+| `420f` + BT.709 tags (now) | full range, BT.709 | 8.32 ms | 9.27 ms |
+
+The average is unchanged; the slow frames are about 1.5 ms faster. The capture side (one
+conversion instead of two) shows in the benchmark's Capture/Encode stages on real hardware. The
+larger effect of this step is correct colours.
+
 ### Display path (smoothness step 3) — awaiting measurement
 
 Per-monitor DPI awareness and the optional present-at-once mode change the Display stage.

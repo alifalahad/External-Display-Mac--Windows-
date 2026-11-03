@@ -18,6 +18,8 @@
 // the real stream; 12 s in one frame is "lost" on purpose. The gate must
 // notice the gap, ask at once, and the Mac's keyframe must come within
 // 300 ms. No keyframes except the ones asked for.
+// Colours (step 4): the keyframes' SPS must say full-range BT.709, which is
+// what the receiver's shader then uses.
 //
 //   ReceiverClient <host> <seconds> <code-file> <mode>
 // =============================================================================
@@ -25,6 +27,7 @@
 #include "Network/StreamReceiver.h"
 #include "Input/Pointer.h"
 #include "Decoder/KeyframeGate.h"
+#include "Decoder/H264Sps.h"
 #include "Security/PairingManager.h"
 #include "Performance/PipelineMetrics.h"
 #include "Performance/PipelineClock.h"
@@ -57,10 +60,13 @@ int main(int argc, char** argv) {
     KeyframeGate gate;                       // as in ReceiverApp::decodePending
     int64_t firstFrameUs = 0, lostAtUs = 0, recoveryAskedUs = 0, recoveredUs = 0;
     uint64_t heldAfterLoss = 0;
+    VideoColor streamColor;
+    int keyframesWithSps = 0;
     rx.setFrameCallback([&](const uint8_t* d, size_t n, const FrameTimeline& t) {
         std::lock_guard<std::mutex> lock(m);
         if (n < 5 || d[0] != 0 || d[1] != 0 || d[2] != 0 || d[3] != 1) badStartCodes++;
         if (t.keyframe) keyframes++;
+        if (t.keyframe && FindSpsColor(d, n, streamColor)) keyframesWithSps++;
         FrameTimeline copy = t;
         copy.decodeStartUs = copy.decodeEndUs = copy.presentUs = t.completeUs;   // no decoder here
         frames.push_back(copy);
@@ -198,6 +204,8 @@ int main(int argc, char** argv) {
         std::printf("[Client] pointer: no shapes, %zu positions, asked %d time(s)\n", positions.size(), pointerRequests);
     }
 
+    std::printf("[Client] colours: %d of %zu keyframes carry an SPS, it says %s\n",
+                keyframesWithSps, keyframes, keyframesWithSps ? VideoColorName(streamColor, 720) : "-");
     const int64_t recoveryUs = recoveredUs && recoveryAskedUs ? recoveredUs - recoveryAskedUs : -1;
     std::printf("[Client] keyframes: %zu received, %llu asked for; frame lost on purpose: %s, "
                 "keyframe after %.1f ms, %llu frames held meanwhile\n",
@@ -228,6 +236,8 @@ int main(int argc, char** argv) {
     expect(lostAtUs > 0 && recoveryAskedUs > lostAtUs && recoveryAskedUs - lostAtUs < 100'000,
            "the missing frame was noticed and a keyframe asked for at once");
     expect(recoveryUs >= 0 && recoveryUs < 300'000, "the Mac's keyframe arrived within 300 ms");
+    expect(keyframesWithSps == static_cast<int>(keyframes), "every keyframe starts with an SPS");
+    expect(streamColor.fullRange && streamColor.matrix == 1, "the stream says full-range BT.709 (what the shader uses)");
     expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
     expect(sync.valid && sync.smoothedRttMs < 50, "clock sync converged over the encrypted channel");
     expect(mac.valid && mac.encodeFps > 30, "SENDER_STATS received (encrypted control message)");

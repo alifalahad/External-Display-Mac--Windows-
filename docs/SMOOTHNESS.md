@@ -40,7 +40,7 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 | 1 | Pointer drawn on the PC | **done here, to test on the PCs** | the mouse feels instant; moving the pointer no longer sends video |
 | 2 | Keyframes only when needed | **done here, to test on the PCs** | removes the burst once a second; a lost packet costs a short freeze, not smeared blocks |
 | 3 | Display path: DPI-aware, present without waiting | **done here, to test on the PCs** | sharp 1:1 picture on scaled laptops; present at once (F5) up to one refresh sooner |
-| 4 | Capture in the encoder's format | to do | 1–3 ms less, less GPU work on the Mac |
+| 4 | Capture in the encoder's format | **done here, to test on the PCs** | correct colours (the picture was washed out); no conversion pass before encoding |
 | 5 | Packet pacing and loss repair | to do | fewer Wi-Fi spikes; no long wait after a lost packet |
 | 6 | Bitrate that follows the delay | to do | stays smooth when the Wi-Fi gets worse |
 | 7 | 120 Hz | to do | halves every refresh wait |
@@ -242,18 +242,58 @@ frame and the ones after it.
 
 ### Step 4 — Capture in the encoder's format
 
-**Why.** The Mac captures BGRA (`kCVPixelFormatType_32BGRA`), but H.264 needs YUV 4:2:0, so
-every frame is converted before encoding.
+**Why.**
+- The Mac captured BGRA (`kCVPixelFormatType_32BGRA`), but H.264 needs YUV 4:2:0, so every frame
+  was converted before encoding.
+- **Found while checking this:** VideoToolbox converts BGRA to *video range* (16–235) and writes
+  "unspecified" colours into the stream. The receiver's shader assumed *full range* for every
+  stream. So on the PC **black showed as dark grey (6 %) and white as light grey (92 %)**: the
+  whole picture was washed out.
 
-**How.**
-- Capture `420v` (video range) directly. The preview path takes YUV too.
-- Try `queueDepth` 2 instead of 3.
+**How (implemented).**
+- **Mac:** capture `420f` (full-range NV12) with the BT.709 matrix and sRGB (= BT.709)
+  primaries. That is the encoder's own input format, so no conversion pass is needed. The encoder
+  also writes BT.709 into the stream explicitly.
+- **PC:** the receiver reads the colour description from each keyframe's SPS (range and
+  matrix), and the shader converts with the matching constants: full or video range, BT.709 or
+  BT.601. Streams from an older Mac app (video range) also show correct black and white now.
+  The F2 overlay names the colours, for example `1920x1080, full-range BT.709`, and
+  `receiver.log` says `Video colours: ...`.
+- `queueDepth` stays at 3. ScreenCaptureKit's documentation says fewer frames "may stall the
+  display stream". It is a pool of surfaces, not a delay, and the app holds one surface for
+  keyframe re-encodes. Lowering it (the earlier plan) could only cause stalls.
+- Later, for quality rather than speed: capture runs at the display's size in points, so on a
+  Retina-style virtual display text is captured at 1×. Capturing at pixel size would be sharper
+  and cost more bitrate.
 
-**Check.** The Capture and Encode stages, and the Mac CPU/GPU, before and after.
+**Check.**
+- Measured on this M2 (synthetic 1080p frames at 60 FPS, the app's encoder settings):
 
-(Not about speed, but related: capture runs at the display's size in points. On a Retina-style
-virtual display, text is therefore captured at 1×. Capturing at pixel size would be sharper and
-cost more bitrate. That is a quality option for later.)
+  | Encoder input | Stream says | Encode avg | Encode p95 |
+  |---|---|---|---|
+  | BGRA (before) | video range, colours unspecified | 7.95 ms | 10.77 ms |
+  | `420f` + BT.709 tags (now) | full range, BT.709 | 8.32 ms | 9.27 ms |
+
+  The average encode time is unchanged and the slow frames are about 1.5 ms faster. The
+  capture-side saving cannot be measured here (this shell has no Screen Recording permission).
+  The benchmark's Capture and Encode stages on your setup will show it.
+- Automated, all passing (2026-11-03):
+  - Mac: 38 XCTests. New: the capture settings (`420f`, BT.709, sRGB, queue depth), and
+    VideoToolbox's own reading of the stream it wrote (full range, BT.709 primaries, transfer
+    and matrix).
+  - Windows: 392 checks on x64 and x86. `DisplayTests` (55) parses the Mac encoder's real SPS
+    bytes from both formats, plus constructed SPS variants (no VUI, aspect ratio, scaling
+    lists, picture-order types, cropping, Baseline, escape bytes). It also checks the shader's
+    arithmetic: black and white for each range, pure red, and the old washed-out case.
+  - Loopback, 64- and 32-bit: the harness now feeds full-range NV12, like the app. Every keyframe
+    carries an SPS that says full-range BT.709.
+
+#### Checklist for step 4 (on each laptop and the Mac)
+1. Update **both** apps (the Mac app changes how it captures).
+2. Open a page with pure black and pure white on the Mac's virtual display. On the PC, black is
+   black and white is white, not grey. Compare with the Mac's own screen.
+3. F2: the first line shows `full-range BT.709`.
+4. `--bench=60`: compare the Capture and Encode stages with the earlier runs.
 
 ### Step 5 — Packet pacing and loss repair
 

@@ -157,6 +157,12 @@ final class VideoEncoder {
         setProperty(kVTCompressionPropertyKey_AllowTemporalCompression,
                      value: kCFBooleanTrue as Any)
 
+        // Colours: BT.709, written into the stream (the receiver reads them
+        // from the SPS). Full range comes with the captured pixel format.
+        setProperty(kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+        setProperty(kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
+        setProperty(kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+
         // ── Check if hardware encoder was selected ──────────────────────────
         var usingHardware: CFBoolean?
         let hwStatus = withUnsafeMutablePointer(to: &usingHardware) {
@@ -211,7 +217,8 @@ final class VideoEncoder {
     // ── Encode a Frame ──────────────────────────────────────────────────────
 
     /// Feed a CVPixelBuffer to the encoder. Called from the capture queue.
-    /// The pixelBuffer stays GPU-resident — VT handles BGRA→NV12 internally.
+    /// The pixelBuffer stays GPU-resident; captured as NV12, it needs no
+    /// conversion (BGRA would be converted by VideoToolbox first).
     /// `captureUs` is when the frame was on screen (HostClock); `captureIsReal`
     /// is false when an old frame is re-encoded for a keyframe.
     func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime, duration: CMTime,

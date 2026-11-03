@@ -17,6 +17,7 @@
 #include <string>
 
 #include "Renderer/RendererTypes.h"
+#include "Renderer/VideoColor.h"
 
 /// Centered message shown instead of (or over) the video: connecting,
 /// pairing, waiting for the picture, errors
@@ -98,6 +99,10 @@ public:
     bool UpdateFrameTexture(ID3D11Texture2D* source, UINT subresource,
                             uint32_t frameWidth, uint32_t frameHeight);
 
+    // How the stream's YCbCr maps to RGB (from its SPS; docs/SMOOTHNESS.md,
+    // step 4). Until set: full-range BT.709.
+    void SetVideoColor(const VideoColor& color, uint32_t height);
+
     // Device for the hardware decoder, or nullptr when it cannot decode into
     // textures this renderer can sample (no video support / no NV12 views)
     ID3D11Device* GetVideoDevice() const { return supportsHardwareVideo_ ? device_.Get() : nullptr; }
@@ -172,13 +177,22 @@ private:
     void CreateNV12Resources();
     void EnsureNV12Textures(uint32_t width, uint32_t height);
     void SetVideoUVScale(float x, float y);
+    void UploadVideoConstants();
 
     // Frame currently drawn: the software textures' views or the hardware
     // texture's views, whichever was updated last
     ComPtr<ID3D11ShaderResourceView> frameYSRV_;
     ComPtr<ID3D11ShaderResourceView> frameUVSRV_;
-    ComPtr<ID3D11Buffer>             videoConstants_;   // uvScale: crop decoder padding
-    float uvScaleX_ = 0, uvScaleY_ = 0;
+    ComPtr<ID3D11Buffer>             videoConstants_;
+    // cbuffer VideoConstants in the NV12 shader (48 bytes)
+    struct VideoConstantsData {
+        float uvScale[2];                 // crop the decoder's padding
+        float yOffset, yScale;            // VideoColorConstants
+        float cOffset, cScale, crR, cbG;
+        float crG, cbB, pad[2];
+    };
+    static_assert(sizeof(VideoConstantsData) == 48, "matches the shader's cbuffer");
+    VideoConstantsData videoConstantsData_{};
 
     // Hardware decode target (NV12, same size as the decoder's surfaces)
     ComPtr<ID3D11Texture2D>          hwTexture_;

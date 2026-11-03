@@ -148,7 +148,9 @@ Prefix fields (u32 frame number, u32 flags, then u64 µs on the Mac clock):
 | encode end | encoder output |
 | send | packetization started |
 
-Keyframes start with SPS and PPS. They come at the start of a stream, after a KEYFRAME_REQ, and
+Keyframes start with SPS and PPS. The SPS's VUI states the colours: full-range BT.709 from the
+Mac app (since smoothness step 4). The receiver reads range and matrix from it, so a
+video-range stream also shows correctly. They come at the start of a stream, after a KEYFRAME_REQ, and
 once a minute. Frame numbers are consecutive, so the receiver notices a missing frame and asks for
 a keyframe.
 
