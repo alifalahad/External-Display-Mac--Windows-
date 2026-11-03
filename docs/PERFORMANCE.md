@@ -169,6 +169,13 @@ Same benchmark after the changes below. Compare against the table above. The ben
 now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
 different laptops can be compared.
 
+### Display path (smoothness step 3) — awaiting measurement
+
+Per-monitor DPI awareness and the optional present-at-once mode change the Display stage.
+Compare `--bench=60` with `--bench=60 --present=immediate` on each laptop; the summary records
+window size, scale and present mode. DXGI's frame statistics are tied to refreshes, so with
+tearing the Display stage may not show the whole gain. PresentMon shows the real present mode.
+
 ### Keyframes only on request (smoothness step 2)
 
 Loopback, 2026-11-03 (real VideoToolbox encoder, 720p60, 64- and 32-bit receiver):

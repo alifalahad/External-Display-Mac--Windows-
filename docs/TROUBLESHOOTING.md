@@ -62,6 +62,15 @@ changes; move a window.
 **The mouse lands in the wrong place.** Fixed in version 2: clicks are mapped through the
 letterboxed picture. If it still happens, send `receiver.log` with `--verbose`.
 
+**A line tears through the picture while scrolling.** "Present at once" is on (F5 or
+`--present=immediate`): frames are shown without waiting for the refresh. Press F5 to go back
+to presenting on the refresh (the default).
+
+**Text on the status card or overlay is tiny or huge.** The receiver follows Windows' display
+scale (Settings → System → Display → Scale). `receiver.log` shows what it found
+(`DPI awareness: ..., screen at 150 %`). If it says `not DPI-aware`, Windows refused. Send the
+log.
+
 **The picture freezes for a moment, then continues.** After a lost packet the PC keeps the
 last good picture until the Mac's keyframe arrives, usually within a few hundredths of a second
 ([SMOOTHNESS.md](SMOOTHNESS.md), step 2). If it happens often, the Wi-Fi is losing packets:

@@ -3,9 +3,14 @@
 // =============================================================================
 
 #include "App/Window.h"
+#include "App/Dpi.h"
 #include "App/Log.h"
 #include "Input/InputCapture.h"
 #include <stdexcept>
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0   // Windows 8.1+, missing from older headers
+#endif
 
 Window::Window(const wchar_t* title, bool fullscreen)
     : fullscreen_(fullscreen)
@@ -18,6 +23,7 @@ Window::Window(const wchar_t* title, bool fullscreen)
         CreateWindowedWindow(title);
     }
 
+    dpi_ = DpiForWindow(hwnd_);
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
 }
@@ -54,12 +60,13 @@ void Window::CreateFullscreenWindow(const wchar_t* title) {
     width_  = mi.rcMonitor.right  - mi.rcMonitor.left;
     height_ = mi.rcMonitor.bottom - mi.rcMonitor.top;
 
-    // Save a reasonable windowed rect for toggle
+    // Save a reasonable windowed rect for toggle (1280×720 at 100 %, scaled)
+    const UINT dpi = DpiForWindow(nullptr);
     savedWindowRect_ = {
-        mi.rcMonitor.left + 100,
-        mi.rcMonitor.top + 100,
-        mi.rcMonitor.left + 100 + 1280,
-        mi.rcMonitor.top + 100 + 720
+        mi.rcMonitor.left + ScaleForDpi(100, dpi),
+        mi.rcMonitor.top + ScaleForDpi(100, dpi),
+        mi.rcMonitor.left + ScaleForDpi(100 + 1280, dpi),
+        mi.rcMonitor.top + ScaleForDpi(100 + 720, dpi)
     };
 
     // WS_POPUP = borderless, no title bar
@@ -84,8 +91,10 @@ void Window::CreateFullscreenWindow(const wchar_t* title) {
 }
 
 void Window::CreateWindowedWindow(const wchar_t* title) {
-    width_  = 1280;
-    height_ = 720;
+    // 1280×720 at 100 %, as large on a scaled screen
+    const UINT dpi = DpiForWindow(nullptr);
+    width_  = ScaleForDpi(1280, dpi);
+    height_ = ScaleForDpi(720, dpi);
 
     RECT rc = { 0, 0, width_, height_ };
     AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0);
@@ -196,6 +205,21 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return TRUE;
 
+    // The window moved to a monitor with another scale, or the scale changed:
+    // windowed, take the size Windows suggests; full screen keeps the monitor
+    case WM_DPICHANGED:
+        if (self) {
+            self->dpi_ = HIWORD(wp);
+            if (!self->fullscreen_) {
+                const RECT* suggested = reinterpret_cast<const RECT*>(lp);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left, suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            LOGF_INFO("Main", "Screen scale now %d %%", ScaleForDpi(100, self->dpi_));
+        }
+        return 0;
+
     case WM_SIZE:
         if (self && wp != SIZE_MINIMIZED) {
             int newWidth  = LOWORD(lp);
@@ -296,6 +320,10 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == VK_F4 && self) {
             self->pointerToggle_ = true;
+            return 0;
+        }
+        if (wp == VK_F5 && self) {
+            self->presentToggle_ = true;
             return 0;
         }
         // Forward to input capture

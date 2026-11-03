@@ -39,7 +39,7 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 | 0 | Measure the current build on the PCs | waiting for a Windows run | the "before" numbers for every step |
 | 1 | Pointer drawn on the PC | **done here, to test on the PCs** | the mouse feels instant; moving the pointer no longer sends video |
 | 2 | Keyframes only when needed | **done here, to test on the PCs** | removes the burst once a second; a lost packet costs a short freeze, not smeared blocks |
-| 3 | Display path: DPI-aware, present without waiting | to do | up to one refresh less; sharper picture |
+| 3 | Display path: DPI-aware, present without waiting | **done here, to test on the PCs** | sharp 1:1 picture on scaled laptops; present at once (F5) up to one refresh sooner |
 | 4 | Capture in the encoder's format | to do | 1–3 ms less, less GPU work on the Mac |
 | 5 | Packet pacing and loss repair | to do | fewer Wi-Fi spikes; no long wait after a lost packet |
 | 6 | Bitrate that follows the delay | to do | stays smooth when the Wi-Fi gets worse |
@@ -182,22 +182,63 @@ frame and the ones after it.
 ### Step 3 — Display path
 
 **Why.**
-- **DPI awareness.** The receiver does not declare itself DPI-aware. On a laptop at 125–150 %
-  scaling, Windows renders its window at a lower resolution and stretches it. That makes the
-  picture blurry, makes the compositor scale every frame, and rules out "independent flip" (the
-  GPU sending our frames straight to the screen).
-- **Waiting for vblank.** `Present(1, 0)` waits for the next refresh: half a refresh on average,
-  up to a full one.
+- **DPI awareness.** The receiver did not declare itself DPI-aware. On a laptop at 125–150 %
+  scaling, Windows rendered its window at a lower resolution and stretched it. On a 1920×1080
+  panel at 150 % the video was drawn at 1280×720, then enlarged again, so the picture was
+  blurry. The compositor also had to scale every frame, which rules out "independent flip"
+  (frames going from the GPU straight to the screen, without the compositor's extra frame).
+- **Waiting for the refresh.** `Present(1, 0)` waits for the next refresh: half a refresh on
+  average, up to a full one.
 
-**How.**
-- Declare per-monitor DPI awareness (manifest or `SetProcessDpiAwarenessContext`). Map mouse
-  coordinates with real pixels.
-- Offer presenting without waiting: `DXGI_PRESENT_ALLOW_TEARING` on the flip-discard swap chain,
-  in borderless full screen. It can tear during fast scrolling, so make it a switch and measure
-  both.
+**How (implemented).**
+- **Per-monitor DPI awareness** (v2 on Windows 10 1703+, with fallbacks for older versions),
+  turned on before any window exists.
+  - The swap chain now has the panel's real pixels, so a 1920×1080 stream shows 1:1 on a
+    1920×1080 panel.
+  - The status card and the F2 overlay are laid out at 100 % and drawn at the screen's scale.
+    Their text is sharp, because DirectWrite text is vector.
+  - The pairing dialog scales its layout and font to the screen.
+  - The F11 window opens at 1280×720 × scale.
+  - Moving the window to a screen with another scale (or changing the scale) is followed.
+  - `receiver.log` says `DPI awareness: per-monitor v2, screen at 150 %`.
+- **Present at once, as an option** (`--present=immediate` or **F5** while running; off by
+  default).
+  - Where Windows and the driver support it (DXGI 1.5, Windows 10 1607+), the swap chain is
+    created with "allow tearing". With the option on, frames are presented without waiting for
+    the refresh.
+  - That is up to one refresh sooner, but the picture can tear (a visible line) during fast
+    scrolling, which is why it is off by default.
+  - Without driver support, F5 logs that and nothing changes.
+  - The order the swap chains are tried in is now a tested plan (`SwapChainPlan`). A refused
+    tearing chain falls back to the waitable chain first, before the plainer ones.
+- **F2 overlay:** a second line reads `window 1920x1080 at 150%`, and then
+  `Pointer drawn here (F4)  present on refresh (F5)`. Benchmark summaries record the window
+  size, scale and present mode, so runs can be compared.
 
-**Check.** The Display stage in the benchmark, and how sharp text looks at 125 % or 150 %
-scaling.
+**Check.**
+- Automated, all passing (2026-11-03):
+  - Windows: 364 checks on x64 and x86. New `DisplayTests` (27): the swap chain plan for every
+    renderer mode, when a present may tear, per-monitor DPI awareness on Windows (Wine
+    reports `per-monitor v2`), scaled lengths, fonts and window frames. Option parsing for
+    `--present`.
+  - The full receiver builds with the tearing and DPI APIs (MinGW, 64- and 32-bit).
+- **Not testable here:** how the picture looks and how much latency it saves. Wine cannot run
+  Direct3D on this Mac, so this needs the laptops. Note: DXGI's frame statistics are tied to
+  refreshes, so with tearing the benchmark's Display stage may not show the whole gain.
+  PresentMon (free, github.com/GameTechDev/PresentMon) shows the real present mode
+  (`Hardware: Independent Flip` vs `Composed: Flip`).
+
+#### Checklist for step 3 (on each laptop)
+1. Check the scale: Settings → System → Display → Scale (often 125 % or 150 % on laptops).
+2. Start the receiver. Text on the Mac's screen should look as sharp as on the Mac itself; a
+   1920×1080 stream on a 1920×1080 panel is now 1:1. The F2 overlay says `at 150%` (or
+   whatever the scale is).
+3. The status card, the F2 text and the pairing dialog are a normal size: not tiny, not blurry.
+4. F11 into a window, drag it to another monitor with a different scale (if there is one): it
+   resizes and stays sharp.
+5. Benchmark `--bench=60` (on refresh), then `--bench=60 --present=immediate`. Compare the
+   Display and Total stages with each other and with the step 0/2 runs. Scroll a web page with
+   F5 on and off: does the tearing bother you?
 
 ### Step 4 — Capture in the encoder's format
 

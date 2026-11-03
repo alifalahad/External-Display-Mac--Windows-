@@ -11,6 +11,7 @@
 //     --console                              show a console window with the log
 //     --test-pattern                         no network: animated test pattern
 //     --cursor=local|video                   pointer drawn here (default) or in the video
+//     --present=vsync|immediate              present on the next refresh (default) or at once
 // =============================================================================
 
 #include "App/Log.h"
@@ -28,6 +29,7 @@ struct Options {
     bool          showConsole = false;
     bool          testPattern = false;
     bool          localCursor = true;           // docs/SMOOTHNESS.md, step 1
+    bool          presentImmediately = false;   // step 3: may tear, up to a refresh sooner
     std::vector<std::string> warnings;          // unknown / malformed options
 };
 

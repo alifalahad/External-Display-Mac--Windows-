@@ -70,6 +70,13 @@ public:
     // F4 pressed: pointer drawn here ↔ pointer in the video
     bool TakePointerToggle()     { bool t = pointerToggle_; pointerToggle_ = false; return t; }
 
+    // ── Display path (docs/SMOOTHNESS.md, step 3) ──────────────────────────────
+    // DPI of the window's monitor (96 = 100 %): the receiver is per-monitor
+    // DPI-aware, so sizes are real pixels and the UI scales itself
+    UINT GetDpi() const          { return dpi_; }
+    // F5 pressed: present on the next refresh ↔ at once
+    bool TakePresentToggle()     { bool t = presentToggle_; presentToggle_ = false; return t; }
+
 private:
     void RegisterWindowClass();
     void CreateFullscreenWindow(const wchar_t* title);
@@ -93,6 +100,9 @@ private:
     bool mouseMoved_      = false;
     int  mouseX_ = -1, mouseY_ = -1;
     bool pointerToggle_   = false;
+
+    UINT dpi_             = 96;
+    bool presentToggle_   = false;
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;

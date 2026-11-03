@@ -89,7 +89,9 @@ It renders only when the picture, the overlay or the status card changed.
    In front of it, the keyframe gate holds frames that follow a missing one until a keyframe
    arrives.
 6. **Present:** wait for the swap chain's frame slot (maximum frame latency 1), decode whatever
-   arrived meanwhile, draw the newest picture, then present with VSync.
+   arrived meanwhile, draw the newest picture, then present on the next refresh (or at once with
+   F5, where the driver allows tearing). The receiver is per-monitor DPI-aware, so the swap chain
+   has the screen's real pixels.
 
 Every frame carries timestamps through all of these steps, and the receiver syncs its clock with
 the Mac's. That is how the overlay and the benchmark measure each stage

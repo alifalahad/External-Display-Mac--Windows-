@@ -23,6 +23,8 @@ Options ParseOptions(const std::string& commandLine) {
         else if (arg == "--test-pattern")        o.testPattern = true;
         else if (arg == "--cursor=local")        o.localCursor = true;
         else if (arg == "--cursor=video")        o.localCursor = false;
+        else if (arg == "--present=vsync")       o.presentImmediately = false;
+        else if (arg == "--present=immediate")   o.presentImmediately = true;
         else if (arg.rfind("--log=", 0) == 0) {
             if (!Log::ParseLevel(arg.substr(6), o.logLevel)) o.warnings.push_back("Unknown log level: " + arg);
         } else if (arg.rfind("--bench=", 0) == 0) {

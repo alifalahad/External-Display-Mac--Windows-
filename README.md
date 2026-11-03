@@ -56,7 +56,8 @@ The receiver finds the Mac on its own. If several Macs answer, press the number 
 From then on they connect without asking.
 
 Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diagnostics ·
-**F3** mouse & keyboard to the Mac · **F4** pointer drawn on the PC / in the video.
+**F3** mouse & keyboard to the Mac · **F4** pointer drawn on the PC / in the video ·
+**F5** present at once / on the refresh.
 
 ## Documentation
 

@@ -47,6 +47,10 @@ static void TestOptions() {
     CHECK(!ParseOptions("--cursor=video").localCursor);
     CHECK(ParseOptions("--cursor=video --cursor=local").localCursor);
     CHECK(ParseOptions("--cursor=both").warnings.size() == 1);
+    // Present on the refresh unless asked (docs/SMOOTHNESS.md, step 3)
+    CHECK(!ParseOptions("").presentImmediately);
+    CHECK(ParseOptions("--present=immediate").presentImmediately);
+    CHECK(!ParseOptions("--present=immediate --present=vsync").presentImmediately);
 
     o = ParseOptions("--bench=abc --log=loud --frobnicate 10.0.0.1 10.0.0.2");
     CHECK(o.benchSeconds == 0);

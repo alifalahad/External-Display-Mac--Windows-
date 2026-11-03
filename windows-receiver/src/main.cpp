@@ -4,16 +4,18 @@
 //   ExternalDisplayReceiver.exe              find the Mac on the network
 //   ExternalDisplayReceiver.exe 192.168.1.5  connect to that Mac directly
 //   Options: see App/Options.h (--gpu, --renderer, --bench, --log, --verbose,
-//            --console, --test-pattern)
+//            --console, --test-pattern, --cursor, --present)
 //
 // The window is the whole UI: a status card until the picture arrives
 // (connecting, pairing, errors), then the Mac's display. Everything is also
 // logged to receiver.log next to the .exe.
 //
-// Controls: Esc quit · F11 full screen · F2 diagnostics · F3 mouse & keyboard
+// Controls: Esc quit · F11 full screen · F2 diagnostics · F3 mouse & keyboard ·
+//           F4 pointer drawn here / in the video · F5 present on refresh / at once
 // =============================================================================
 
 #include "App/CrashHandler.h"
+#include "App/Dpi.h"
 #include "App/Log.h"
 #include "App/Options.h"
 #include "App/ReceiverApp.h"
@@ -77,6 +79,8 @@ void ShowFatalError(const std::string& message) {
 } // namespace
 
 int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR lpCmdLine, _In_ int) {
+    // Before any window exists (docs/SMOOTHNESS.md, step 3)
+    const char* dpiMode = EnablePerMonitorDpi();
     Options options = ParseOptions(lpCmdLine ? lpCmdLine : "");
     if (options.showConsole) OpenConsole();
     InstallCrashHandler();
@@ -88,6 +92,8 @@ int WINAPI WinMain(_In_ HINSTANCE, _In_opt_ HINSTANCE, _In_ LPSTR lpCmdLine, _In
                      << (sizeof(void*) == 8 ? "64-bit" : "32-bit") << " build, log level "
                      << Log::LevelName(options.logLevel) << ")";
     for (const auto& warning : options.warnings) LOG_WARN("Main") << warning;
+    LOG_INFO("Main") << "DPI awareness: " << dpiMode << ", screen at "
+                     << ScaleForDpi(100, DpiForWindow(nullptr)) << " %";
 
     int exitCode = 0;
     try {

@@ -13,6 +13,7 @@ endif()
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
     src/App/Window.cpp
+    src/App/Dpi.cpp
     src/App/CrashHandler.cpp
     src/App/Log.cpp
     src/App/Options.cpp
@@ -83,6 +84,7 @@ endif()
 #   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window, keyframe gate
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
 #   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
+#   .\build\DisplayTests.exe           swap chain plan, present mode, DPI awareness
 #   ctest --test-dir build               all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
@@ -111,7 +113,12 @@ if(EXDP_BUILD_TESTS)
         src/Input/PointerCursor.cpp
     )
     target_link_libraries(PointerTests PRIVATE user32 gdi32)
-    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests)
+    add_executable(DisplayTests
+        tests/DisplayTests.cpp
+        src/App/Dpi.cpp
+    )
+    target_link_libraries(DisplayTests PRIVATE user32 gdi32)
+    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests DisplayTests)
         target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(${test} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
         if(MSVC)

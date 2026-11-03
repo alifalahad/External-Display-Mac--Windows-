@@ -13,6 +13,7 @@
 #include <d3d10.h>     // ID3D10Multithread (required by Media Foundation on a shared device)
 #include <dxgi1_2.h>
 #include <dxgi1_3.h>
+#include <dxgi1_5.h>
 #include <dxgi1_6.h>
 #include <algorithm>
 #include <stdexcept>
@@ -195,8 +196,15 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
     hr = adapter->GetParent(IID_PPV_ARGS(&factory));
     ThrowIfFailed(hr, "Get IDXGIFactory2");
 
-    // 3. Create swap chain
-    CreateSwapChain(factory.Get(), hwnd, width, height);
+    // 3. Create swap chain. Tearing (present without waiting for the refresh)
+    //    needs DXGI 1.5 and driver support.
+    ComPtr<IDXGIFactory5> factory5;
+    BOOL tearing = FALSE;
+    if (FAILED(factory.As(&factory5)) ||
+        FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing)))) {
+        tearing = FALSE;
+    }
+    CreateSwapChain(factory.Get(), hwnd, width, height, tearing == TRUE);
 
     // By default DXGI queues up to 3 frames: measured as ~3 refreshes (45-50 ms)
     // between Present() and scan-out. One frame in flight is enough.
@@ -217,21 +225,18 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
     factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
 }
 
-void D3D11Renderer::CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height) {
-    // Newest first. FLIP_DISCARD needs Windows 10, FLIP_SEQUENTIAL Windows 8;
-    // the waitable object (Phase 17: render only when the frame goes straight
-    // out) needs a flip model and Windows 8.1. Compatible mode skips it.
-    struct Attempt { DXGI_SWAP_EFFECT effect; UINT flags; const char* name; };
-    const Attempt attempts[] = {
-        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, "flip-discard, waitable" },
-        { DXGI_SWAP_EFFECT_FLIP_DISCARD,    0, "flip-discard" },
-        { DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, 0, "flip-sequential" },
-        { DXGI_SWAP_EFFECT_DISCARD,         0, "blt-discard" },
-    };
-
+void D3D11Renderer::CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height,
+                                    bool tearingSupported) {
+    // Newest first (SwapChainPlan in RendererTypes.h): the waitable object
+    // (Phase 17: render only when the frame goes straight out), tearing
+    // (step 3: present without waiting), then plainer chains
     HRESULT hr = E_FAIL;
-    for (const Attempt& a : attempts) {
-        if (a.flags && mode_ != RendererMode::Full) continue;
+    for (const SwapChainAttempt& a : SwapChainPlan(mode_, tearingSupported)) {
+        const DXGI_SWAP_EFFECT effect = a.effect == SwapEffect::FlipDiscard ? DXGI_SWAP_EFFECT_FLIP_DISCARD
+                                      : a.effect == SwapEffect::FlipSequential ? DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+                                      : DXGI_SWAP_EFFECT_DISCARD;
+        const UINT flags = (a.waitable ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0) |
+                           (a.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
         DXGI_SWAP_CHAIN_DESC1 scd = {};
         scd.Width       = static_cast<UINT>(width);
         scd.Height      = static_cast<UINT>(height);
@@ -239,13 +244,14 @@ void D3D11Renderer::CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width
         scd.SampleDesc  = { 1, 0 };
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         scd.BufferCount = 2;
-        scd.SwapEffect  = a.effect;
+        scd.SwapEffect  = effect;
         scd.AlphaMode   = DXGI_ALPHA_MODE_IGNORE;
-        scd.Flags       = a.flags;
+        scd.Flags       = flags;
 
         hr = factory->CreateSwapChainForHwnd(device_.Get(), hwnd, &scd, nullptr, nullptr, &swapChain_);
         if (SUCCEEDED(hr)) {
-            swapChainFlags_ = a.flags;
+            swapChainFlags_ = flags;
+            tearingAllowed_ = a.tearing;
             LOGF_INFO("Renderer", "Swap chain: %s", a.name);
             return;
         }
@@ -567,8 +573,11 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
         if (SUCCEEDED(hr)) {
             d2dContext_->SetTarget(d2dTarget.Get());
             d2dContext_->BeginDraw();
+            // Laid out at 100 %, drawn at the screen's scale (sharp: text is vector)
+            d2dContext_->SetTransform(D2D1::Matrix3x2F::Scale(uiScale_, uiScale_));
             if (status) DrawStatusCard(*status, showVideo);
             if (wantOverlay) DrawOverlay(*overlayText);
+            d2dContext_->SetTransform(D2D1::Matrix3x2F::Identity());
             d2dContext_->EndDraw();
             d2dContext_->SetTarget(nullptr);
         }
@@ -577,9 +586,17 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
     // ── 5. The Mac's pointer, on top of everything ──────────────────────────
     if (pointer) DrawPointer(*pointer);
 
-    // ── 6. Present (VSync) ──────────────────────────────────────────────────
-    hr = swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
+    // ── 6. Present: on the next refresh, or at once (step 3, may tear) ──────
+    const PresentParams present = ChoosePresent(presentImmediately_, tearingAllowed_);
+    hr = swapChain_->Present(present.syncInterval, present.allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
     CheckDeviceLost(hr, "Present");
+}
+
+bool D3D11Renderer::SetUiScale(float scale) {
+    scale = (std::min)((std::max)(scale, 1.0f), 4.0f);
+    if (scale == uiScale_) return false;
+    uiScale_ = scale;
+    return true;
 }
 
 // =============================================================================
@@ -718,7 +735,8 @@ void D3D11Renderer::DrawStatusCard(const StatusCard& status, bool overVideo) {
     d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.12f, 0.13f, 0.16f, overVideo ? 0.88f : 1.0f), &cardBrush);
     d2dContext_->CreateSolidColorBrush(D2D1::ColorF(0.2f, 0.7f, 1.0f, 1.0f), &accentBrush);
 
-    const float w = static_cast<float>(width_), h = static_cast<float>(height_);
+    // In 100 % units: the transform scales them to the screen
+    const float w = width_ / uiScale_, h = height_ / uiScale_;
     const float cardWidth = (std::min)(640.0f, w - 40.0f);
     const float padding = 28.0f;
 
@@ -762,7 +780,7 @@ void D3D11Renderer::DrawOverlay(const std::wstring& text) {
     const float margin = 12.0f, padding = 10.0f, titleHeight = 24.0f;
     ComPtr<IDWriteTextLayout> layout;
     if (FAILED(dwriteFactory_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()),
-            statsTextFormat_.Get(), static_cast<float>(width_), static_cast<float>(height_), &layout))) {
+            statsTextFormat_.Get(), width_ / uiScale_, height_ / uiScale_, &layout))) {
         return;
     }
     DWRITE_TEXT_METRICS metrics{};

@@ -74,6 +74,7 @@ ReceiverApp::ReceiverApp(Window& window, const Options& options)
                          << RendererModeName(renderer_->GetMode()) << " mode)";
     wakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     localPointerWanted_ = options_.localCursor;
+    presentImmediately_ = options_.presentImmediately;
 }
 
 ReceiverApp::~ReceiverApp() {
@@ -314,6 +315,12 @@ void ReceiverApp::finishFrame(const FrameTimeline& t) {
                 ? "Decoder: hardware (D3D11 video engine)" : "Decoder: software (CPU)");
             bench_.addNote(std::string("Renderer: ") + RendererModeName(renderer_->GetMode()) +
                            (sizeof(void*) == 8 ? ", 64-bit build" : ", 32-bit build"));
+            // Step 3: what the Display stage depends on
+            bench_.addNote("Window: " + std::to_string(window_.GetWidth()) + "x" +
+                           std::to_string(window_.GetHeight()) + (window_.IsFullscreen() ? " full screen" : " windowed") +
+                           " at " + std::to_string(MulDiv(100, static_cast<int>(window_.GetDpi()), 96)) +
+                           "% scale; present " + (renderer_->PresentsImmediately() ? "at once (tearing allowed)"
+                                                                                   : "on the refresh"));
         } else {
             LOGF_ERROR("Bench", "Cannot create %s-*.csv — benchmark disabled", base.c_str());
             options_.benchSeconds = 0;
@@ -374,6 +381,7 @@ void ReceiverApp::run() {
         updateOverlay(nowUs);
         updateStatus(nowUs);
         updatePointer();
+        updateDisplayPath();
         renderIfNeeded(nowUs);
         trackScanout(nowUs);
         tickOncePerSecond(nowUs);
@@ -558,6 +566,24 @@ void ReceiverApp::updateStatus(int64_t nowUs) {
     lastStatusUs_ = nowUs;
 }
 
+void ReceiverApp::updateDisplayPath() {
+    // F5: compare presenting on the next refresh with presenting at once
+    if (window_.TakePresentToggle()) {
+        presentImmediately_ = !presentImmediately_;
+        if (presentImmediately_ && !renderer_->CanPresentImmediately()) {
+            LOG_WARN("Renderer") << "Presenting at once is not available here (needs Windows 10 1607+ and "
+                                    "driver support): presenting on the refresh (F5)";
+        } else {
+            LOG_INFO("Renderer") << "Present " << (presentImmediately_ ? "at once (may tear)" : "on the next refresh")
+                                 << " (F5)";
+        }
+        lastOverlayUs_ = 0;   // the overlay names the mode
+    }
+    renderer_->SetPresentImmediately(presentImmediately_);
+    // Real pixels (per-monitor DPI): the status card and overlay scale themselves
+    if (renderer_->SetUiScale(static_cast<float>(window_.GetDpi()) / 96.0f)) forceRender_ = true;
+}
+
 void ReceiverApp::updatePointer() {
     // F4: compare the pointer drawn here with the pointer in the video
     if (window_.TakePointerToggle()) {
@@ -668,11 +694,14 @@ void ReceiverApp::updateOverlay(int64_t nowUs) {
     if (receiver_) {
         in.sync = receiver_->clockEstimate();
         in.mac = receiver_->senderStats();
-        wchar_t line[160];
-        swprintf(line, 160, L"%ls%ls %ux%u -> window %dx%d | pointer %ls (F4)", StateName(receiver_->getState()),
-                 receiver_->isSecure() ? L" (encrypted)" : L"", streamWidth_, streamHeight_,
-                 window_.GetWidth(), window_.GetHeight(),
-                 localPointerWanted_ && renderer_->CanDrawPointer() ? L"drawn here" : L"in the video");
+        wchar_t line[256];
+        swprintf(line, 256, L"%ls%ls %ux%u -> window %dx%d at %d%%\n"
+                            L"Pointer %ls (F4)  present %ls (F5)",
+                 StateName(receiver_->getState()), receiver_->isSecure() ? L" (encrypted)" : L"",
+                 streamWidth_, streamHeight_, window_.GetWidth(), window_.GetHeight(),
+                 MulDiv(100, static_cast<int>(window_.GetDpi()), 96),
+                 localPointerWanted_ && renderer_->CanDrawPointer() ? L"drawn here" : L"in the video",
+                 renderer_->PresentsImmediately() ? L"at once" : L"on refresh");
         in.connection = line;
     } else {
         in.connection = options_.testPattern ? L"Test pattern (no Mac connection)" : L"Looking for a Mac";

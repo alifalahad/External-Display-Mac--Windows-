@@ -77,6 +77,7 @@ private:
     void updateOverlay(int64_t nowUs);
     void updateStatus(int64_t nowUs);
     void updatePointer();
+    void updateDisplayPath();
     void renderIfNeeded(int64_t& nowUs);
     void trackScanout(int64_t nowUs);
     void tickOncePerSecond(int64_t nowUs);
@@ -166,6 +167,7 @@ private:
     bool pendingPositionValid_ = false;
     PointerModel pointer_;
     bool localPointerWanted_ = true;         // --cursor, F4
+    bool presentImmediately_ = false;        // --present, F5 (docs/SMOOTHNESS.md, step 3)
     HCURSOR macCursor_ = nullptr;            // Windows pointer with the Mac's image
     uint64_t macCursorShapeId_ = 0;
     int macCursorW_ = 0, macCursorH_ = 0;

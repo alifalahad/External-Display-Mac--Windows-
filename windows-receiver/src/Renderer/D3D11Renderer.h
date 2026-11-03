@@ -53,6 +53,15 @@ public:
     void Render(float time, float frameCount, const std::wstring* overlayText = nullptr,
                 const StatusCard* status = nullptr, const PointerSprite* pointer = nullptr);
 
+    // ── Display path (docs/SMOOTHNESS.md, step 3) ──
+    // Status card and overlay size: DPI / 96. Returns true when it changed.
+    bool SetUiScale(float scale);
+    // Present at once instead of on the next refresh (may tear). Only takes
+    // effect when the swap chain allows tearing (CanPresentImmediately).
+    void SetPresentImmediately(bool immediately) { presentImmediately_ = immediately; }
+    bool CanPresentImmediately() const { return tearingAllowed_; }
+    bool PresentsImmediately() const { return presentImmediately_ && tearingAllowed_; }
+
     // Pointer image: BGRA, premultiplied alpha, top row first, drawn 1:1
     void SetPointerImage(const uint8_t* bgra, int width, int height);
     // False when the pointer shader could not be created: then the pointer
@@ -108,7 +117,7 @@ private:
     using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     void CreateDeviceAndSwapChain(HWND hwnd, int width, int height, GpuPreference pref);
-    void CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height);
+    void CreateSwapChain(IDXGIFactory2* factory, HWND hwnd, int width, int height, bool tearingSupported);
     std::string ShaderProfile(const char* stage) const;   // "vs_5_0", "ps_4_0", ...
     void CheckDeviceLost(HRESULT hr, const char* operation);
     void CreateRenderTarget();
@@ -180,6 +189,11 @@ private:
     // Frame latency (Phase 17)
     HANDLE frameLatencyWaitable_ = nullptr;
     UINT   swapChainFlags_ = 0;
+
+    // Display path (step 3)
+    float uiScale_ = 1.0f;
+    bool  tearingAllowed_ = false;      // swap chain created with ALLOW_TEARING
+    bool  presentImmediately_ = false;
 
     // Pointer (docs/SMOOTHNESS.md, step 1)
     void CreatePointerResources();

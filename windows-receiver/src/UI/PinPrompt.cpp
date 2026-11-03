@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "UI/PinPrompt.h"
+#include "App/Dpi.h"
 
 namespace {
 
@@ -97,10 +98,14 @@ bool PromptForPIN(HWND owner, std::string& outPIN,
     HINSTANCE hInst = GetModuleHandleW(nullptr);
     RegisterPromptClass(hInst);
 
-    NONCLIENTMETRICSW ncm = { sizeof(ncm) };
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-    HFONT uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
-    LOGFONTW bigLf = ncm.lfMessageFont;
+    // The receiver is per-monitor DPI-aware: lengths below are at 100 % and
+    // scaled to the owner's screen (docs/SMOOTHNESS.md, step 3)
+    const UINT dpi = DpiForWindow(owner);
+    auto S = [dpi](int v) { return ScaleForDpi(v, dpi); };
+
+    LOGFONTW messageLf = MessageFontForDpi(dpi);
+    HFONT uiFont = CreateFontIndirectW(&messageLf);
+    LOGFONTW bigLf = messageLf;
     bigLf.lfHeight *= 2;
     bigLf.lfWeight = FW_BOLD;
     HFONT pinFont = CreateFontIndirectW(&bigLf);
@@ -108,8 +113,8 @@ bool PromptForPIN(HWND owner, std::string& outPIN,
     // Client area 360×170, centered on the owner's monitor
     const DWORD style   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
     const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
-    RECT rc = { 0, 0, 360, 170 };
-    AdjustWindowRectEx(&rc, style, FALSE, exStyle);
+    RECT rc = { 0, 0, S(360), S(170) };
+    AdjustWindowRectForDpi(rc, style, exStyle, dpi);
     int winW = rc.right - rc.left;
     int winH = rc.bottom - rc.top;
 
@@ -131,15 +136,15 @@ bool PromptForPIN(HWND owner, std::string& outPIN,
 
     CreateChild(L"STATIC",
                 L"Type the 6-digit code shown in the Mac app.\nIt proves no one is in between.",
-                SS_LEFT, 20, 14, 320, 40, dlg, -1, uiFont);
+                SS_LEFT, S(20), S(14), S(320), S(40), dlg, -1, uiFont);
     st.edit = CreateChild(L"EDIT", L"",
                           WS_BORDER | WS_TABSTOP | ES_CENTER | ES_NUMBER,
-                          20, 62, 320, 44, dlg, kIdEdit, pinFont);
+                          S(20), S(62), S(320), S(44), dlg, kIdEdit, pinFont);
     SendMessageW(st.edit, EM_LIMITTEXT, kPinLength, 0);
     CreateChild(L"BUTTON", L"Verify", WS_TABSTOP | BS_DEFPUSHBUTTON,
-                150, 124, 90, 30, dlg, IDOK, uiFont);
+                S(150), S(124), S(90), S(30), dlg, IDOK, uiFont);
     CreateChild(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON,
-                250, 124, 90, 30, dlg, IDCANCEL, uiFont);
+                S(250), S(124), S(90), S(30), dlg, IDCANCEL, uiFont);
 
     SetTimer(dlg, kValidityTimer, 250, nullptr);
     ShowWindow(dlg, SW_SHOW);
