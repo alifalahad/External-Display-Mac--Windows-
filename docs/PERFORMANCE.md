@@ -54,7 +54,9 @@ Clock offset cancels out, so it needs no sync.
 
 - **Windows overlay (F2).** FPS at every stage (capture, encode, receive, decode, shown), whether
   decoding runs on the GPU or CPU, presents per second and render CPU time, bitrate, RTT, jitter,
-  drops, packet loss, keyframes (received / asked for / frames held waiting for one), per-stage
+  drops, packet loss and lost packets rebuilt from parity, the Mac's pacing spread, how long
+  packets waited in queues on the way (`Net wait`, with the verdict the Mac's bitrate follows),
+  keyframes (received / asked for / frames held waiting for one), per-stage
   latency (avg / p95 / max over the last ~2 s), Mac and PC CPU/RAM, and GPU usage.
 - **Windows console.** A two-line summary every 5 s.
 - **Mac window.** Capture FPS and latency, encoder FPS, latency and bitrate (actual / target),
@@ -78,7 +80,7 @@ directory:
 | File | Content |
 |------|---------|
 | `bench-<time>-frames.csv`  | one row per displayed frame: every stage in ms (empty = not measurable) |
-| `bench-<time>-seconds.csv` | one row per second: FPS per stage, bitrate, loss, drops, jitter, RTT, PC CPU/RAM/GPU, Mac CPU/RAM/FPS, keyframes / keyframe requests / frames held in that second |
+| `bench-<time>-seconds.csv` | one row per second: FPS per stage, bitrate, loss, drops, jitter, RTT, PC CPU/RAM/GPU, Mac CPU/RAM/FPS, keyframes / keyframe requests / frames held / packets rebuilt, the queuing delay on the way and its verdict (normal / hold / overuse) in that second |
 | `bench-<time>-summary.txt` | avg / p50 / p95 / p99 / max per stage, averages of the per-second values, RAM start → end |
 
 Percentiles come from fixed-size histograms (0.1 ms bins), so memory stays flat even in
@@ -168,6 +170,45 @@ What it showed:
 Same benchmark after the changes below. Compare against the table above. The benchmark summary
 now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
 different laptops can be compared.
+
+### Bitrate that follows the delay (smoothness step 6)
+
+Loopback, 2026-11-03: the real Mac sender and VideoToolbox encoder against the real Windows
+receiver networking (64- and 32-bit), 720p60, 20 s per run. The Mac starts at 20 Mbps, behind
+an 8 Mbps link with a 200 ms queue (`--simulate-link=8000`):
+
+| | Follows the delay | Loss/RTT tiers (`--adapt=tiers`) |
+|---|---|---|
+| Below the link after | under 1 s (first cut at 0.1 s) | 12.4–12.7 s |
+| Queue on the link, last 10 s, average | 2.4–3.2 ms | 32–77 ms |
+| Frames that arrived | 99.4–99.5 % | 16.6–19.5 % |
+| Packets lost after the first 2 s | 0 | ~8,700–8,900 |
+
+Cost: one 16-byte message every 100 ms from the PC. The video bitrate settles at 5.5–6.5 Mbps on
+the 8 Mbps link (with parity and headers, about 80–90 % of it). It rises slowly until a small
+queue appears, then cuts by 15 %.
+
+On Wi-Fi, compare `--bench=60` with `--bench=60 --adapt=tiers`. The summary's `Net wait` line
+gives the time spent in overuse.
+
+### Loss repair and pacing (smoothness step 5)
+
+Loopback, 2026-11-03: the real Mac sender and VideoToolbox encoder against the real Windows
+receiver networking (64- and 32-bit), 720p60, 20 s per run, 1 % of the packets dropped on
+purpose (`--simulate-loss=1`):
+
+| | Parity + pacing | Neither (as before) |
+|---|---|---|
+| Frames that arrived | 98.7 % | 73.5–74.2 % |
+| Lost packets rebuilt | 329–336 | 0 |
+| Keyframes | 22 | 117 |
+
+Cost:
+- About 3 parity packets per frame at this size (≈10 % more data).
+- Pacing spreads a large frame's datagrams over about 1.05 ms (measured on the Mac, up to about
+  2 ms when it is busy). Frames of up to 8 packets are not paced.
+
+On Wi-Fi, compare `--bench=60` with `--pacing=off` and `--fec=off`.
 
 ### Capture in the encoder's format (smoothness step 4)
 

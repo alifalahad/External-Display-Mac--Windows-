@@ -20,6 +20,7 @@ import CoreMedia
 import Combine
 
 _ = NSApplication.shared   // NSCursor needs AppKit set up
+setvbuf(stdout, nil, _IOLBF, 0)   // lines reach the log at once (also if the run is killed)
 
 let args = CommandLine.arguments
 let duration = Double(args.count > 1 ? args[1] : "20") ?? 20
@@ -29,6 +30,7 @@ let width = 1280, height = 720
 
 let rejectPairings = ProcessInfo.processInfo.environment["EXDP_REJECT"] == "1"
 let sender = StreamSender()
+let governor = BitrateGovernor(preset: .balanced)
 let pairing = PairingManager(directory: pairingDir)
 sender.pairingManager = pairing
 pairing.onDecision = { id, approved in sender.resolvePairing(deviceId: id, approved: approved) }
@@ -46,7 +48,7 @@ pairing.$request.receive(on: DispatchQueue.main).sink { request in
 }.store(in: &cancellables)
 sender.$state.receive(on: DispatchQueue.main).sink { st in
     print("[Harness] state: \(st.displayText)")
-    if case .connected = st { sender.startStreaming() }
+    if case .connected = st { governor.reset(); sender.startStreaming() }
 }.store(in: &cancellables)
 
 var config = EncoderConfig()
@@ -60,6 +62,13 @@ encoder.onEncodedFrame = { sb, key, timing in
     }
 }
 sender.onKeyframeRequest = { encoder.forceKeyframe() }
+
+// Adaptive bitrate exactly as in the app (docs/SMOOTHNESS.md, step 6)
+governor.onBitrateChange = { encoder.updateBitrate($0) }
+governor.encoderOutputBps = { Int(encoder.currentStats().outputBitrateMbps * 1_000_000) }
+governor.sentBps = { Int(sender.statsSnapshot().sendMbps * 1_000_000) }
+sender.onQualityReport = { governor.onQualityReport($0) }
+sender.onRateFeedback = { governor.onRateFeedback($0) }
 
 // Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1)
 var pointerMonitor: PointerMonitor?
@@ -165,9 +174,24 @@ statTimer.setEventHandler {
     p.encoderKbps = UInt32(es.outputBitrateMbps * 1000)
     p.targetKbps = UInt32(es.targetBitrateMbps * 1000)
     p.flags = es.isHardwareAccelerated ? SenderStatsPayload.flagHardwareEncoder : 0
+    p.pacingSpreadUs = UInt32(sender.statsSnapshot().pacingSpreadUs)
     sender.sendSenderStats(p)
 }
 statTimer.resume()
+
+// Every 2 s: frames encoded and sent, state, and whether the network queue answers
+let startedAt = CACurrentMediaTime()
+let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+heartbeat.schedule(deadline: .now() + 2, repeating: 2)
+heartbeat.setEventHandler {
+    let answered = DispatchSemaphore(value: 0)
+    sender.probeNetworkQueue { answered.signal() }
+    let alive = answered.wait(timeout: .now() + 0.5) == .success
+    print(String(format: "[Harness] t=%.0fs encoded %llu sent %llu, %@, network queue %@",
+                 CACurrentMediaTime() - startedAt, encoder.currentStats().encodedFrames,
+                 sender.statsSnapshot().framesSent, sender.state.displayText, alive ? "ok" : "NOT ANSWERING"))
+}
+heartbeat.resume()
 
 DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
     let ns = sender.statsSnapshot()

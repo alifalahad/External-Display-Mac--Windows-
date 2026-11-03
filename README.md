@@ -21,7 +21,11 @@ copy and paste between the two machines.
 - Hardware encoding (VideoToolbox, low-latency mode) and hardware decoding (Media Foundation
   through Direct3D 11). Frames stay on the GPU, with a software fallback.
 - Event-driven rendering with a single queued frame: nothing is drawn when nothing changed.
-- Adaptive bitrate within a quality preset (Battery Saver / Balanced / High).
+- A bitrate that follows the network: it drops as soon as packets start to queue on the way,
+  before any are lost, and rises again when the queue is gone. The quality preset (Battery
+  Saver / Balanced / High) sets how high it goes.
+- Lost packets are rebuilt on the PC from parity packets, so a single lost packet causes no
+  freeze.
 - Mouse, keyboard and clipboard (text) forwarding. Windows draws the Mac's pointer itself, so
   the mouse feels local: no video round trip ([docs/SMOOTHNESS.md](docs/SMOOTHNESS.md)).
 - Automatic discovery (Bonjour/mDNS), automatic reconnection and recovery after sleep.

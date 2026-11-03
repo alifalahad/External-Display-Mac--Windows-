@@ -47,6 +47,7 @@ enum MessageType: UInt8 {
     case keyframeReq    = 0x30   // Win → Mac: request I-frame
     case qualityReport  = 0x50   // Win → Mac: network health report
     case senderStats    = 0x51   // Mac → Win: sender-side performance (1 Hz)
+    case rateFeedback   = 0x52   // Win → Mac: queuing delay and received rate, every 100 ms (step 6)
     case inputEvent     = 0x60   // Win → Mac: mouse/keyboard input
     case clipboardData  = 0x70   // Both: clipboard text sync
     case keyExchange    = 0x80   // Mac → Win: handshake mode + Mac's ephemeral key
@@ -62,6 +63,7 @@ enum MessageType: UInt8 {
     // Data (UDP)
     case videoFrame     = 0x40   // Complete frame in one packet
     case videoFragment  = 0x41   // Fragment of a larger frame
+    case videoParity    = 0x42   // XOR of a group of fragments: rebuilds a lost one
 }
 
 // ── Flags ───────────────────────────────────────────────────────────────────
@@ -319,6 +321,47 @@ struct QualityReportPayload {
 
 // ── Performance Payloads (Phase 16) ─────────────────────────────────────────
 
+/// RATE_FEEDBACK payload (Windows → Mac, 16 bytes, every 100 ms; docs/SMOOTHNESS.md step 6)
+///
+///   queuingDelayUs(4) | receivedKbps(4) | lossPercent100(2) | state(1) |
+///   samples(1) | linkKbps(4)
+///
+/// queuingDelayUs: median over the last 100 ms of (one-way delay − its minimum
+/// over 10 s). receivedKbps and loss: the last 500 ms. samples = frames behind
+/// the delay figure (0: nothing arrived, no information). linkKbps: what
+/// arrived in the last 100 ms if no frame got through without waiting — the
+/// link was full, so this is what it can carry; 0 when the queue emptied.
+struct RateFeedbackPayload {
+    static let size = 16
+
+    enum State: UInt8 {
+        case normal  = 0   // no queue building up: the bitrate may rise
+        case hold    = 1   // in between, or a queue draining
+        case overuse = 2   // a queue is building up: lower the bitrate now
+    }
+
+    var queuingDelayUs: UInt32 = 0
+    var receivedKbps: UInt32 = 0
+    var lossPercent100: UInt16 = 0
+    var state: State = .normal
+    var samples: UInt8 = 0
+    var linkKbps: UInt32 = 0
+
+    static func deserialize(from data: Data) -> RateFeedbackPayload? {
+        guard data.count >= size else { return nil }
+        var p = RateFeedbackPayload()
+        var offset = data.startIndex
+        p.queuingDelayUs = data.readLE(at: &offset)
+        p.receivedKbps = data.readLE(at: &offset)
+        p.lossPercent100 = data.readLE(at: &offset)
+        p.state = State(rawValue: data[offset]) ?? .hold
+        p.samples = data[offset + 1]
+        offset += 2
+        p.linkKbps = data.readLE(at: &offset)
+        return p
+    }
+}
+
 /// Mac-side timestamps of one video frame, all in HostClock microseconds.
 /// Sent as a 40-byte prefix of the frame data when the packets carry
 /// MessageFlags.timing; the receiver strips it before decoding.
@@ -373,12 +416,12 @@ struct SenderStatsPayload {
     var encoderKbps: UInt32 = 0       // measured encoder output, last second
     var targetKbps: UInt32 = 0        // bitrate the encoder is asked for
     var flags: UInt32 = 0
-    var reserved: UInt32 = 0
+    var pacingSpreadUs: UInt32 = 0    // a paced frame, first to last datagram (step 5; 0: not paced)
 
     func serialize() -> Data {
         var data = Data(capacity: Self.size)
         for value in [captureFps100, encodeFps100, cpuPercent100, memoryMB,
-                      encoderKbps, targetKbps, flags, reserved] {
+                      encoderKbps, targetKbps, flags, pacingSpreadUs] {
             data.appendLE(value)
         }
         return data
@@ -444,6 +487,10 @@ struct ReceiverCapsPayload {
     /// The receiver draws the pointer: capture without it, send CURSOR_SHAPE
     /// and CURSOR_POSITION instead
     static let localCursor: UInt32 = 1 << 0
+    /// Send VIDEO_PARITY packets: the receiver rebuilds lost fragments (step 5)
+    static let parity: UInt32 = 1 << 1
+    /// Spread each frame's datagrams over about a millisecond (step 5)
+    static let pacing: UInt32 = 1 << 2
 
     var flags: UInt32 = 0
 
@@ -495,6 +542,36 @@ struct CursorShapePayload: Equatable {
         }
         mix(Data(serialize().dropFirst(8)))
         return hash
+    }
+}
+
+/// VIDEO_PARITY payload (UDP, docs/SMOOTHNESS.md step 5): 16-byte header, then
+/// the XOR of the group's fragments, each zero-padded to the longest member
+///
+///   frameSequence(4) | fragmentTotal(2) | groupIndex(2) | groupCount(2) |
+///   reserved(2) | frameBytes(4)
+///
+/// Group j holds fragments j, j+P, j+2P… (P = groupCount). frameBytes gives the
+/// length of the last fragment if that is the one to rebuild. With 1,340 bytes
+/// of parity a datagram is 1,408 bytes (fragments: 1,400).
+struct ParityHeader {
+    static let size = 16
+
+    var frameSequence: UInt32 = 0
+    var fragmentTotal: UInt16 = 0
+    var groupIndex: UInt16 = 0
+    var groupCount: UInt16 = 0
+    var frameBytes: UInt32 = 0
+
+    func serialize() -> Data {
+        var data = Data(capacity: Self.size)
+        data.appendLE(frameSequence)
+        data.appendLE(fragmentTotal)
+        data.appendLE(groupIndex)
+        data.appendLE(groupCount)
+        data.appendLE(UInt16(0))
+        data.appendLE(frameBytes)
+        return data
     }
 }
 

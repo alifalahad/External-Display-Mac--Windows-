@@ -63,6 +63,14 @@ ExternalDisplayReceiver.exe [mac-ip] [options]
   --cursor=local|video            pointer drawn on this PC (default) or in the video (F4 switches)
   --present=vsync|immediate       present on the next refresh (default) or at once: may tear,
                                   up to one refresh sooner (F5 switches)
+  --fec=on|off                    parity packets: lost packets are rebuilt (default on)
+  --pacing=on|off                 the Mac spreads each frame's packets over ~1 ms (default on)
+  --simulate-loss=PERCENT[:BURST] drop incoming packets on purpose, to test the repair
+                                  (e.g. 1, or 2:4 for 2 % in bursts of 4)
+  --adapt=delay|tiers             the bitrate follows the delay on the way (default) or the
+                                  older loss/RTT tiers, to compare
+  --simulate-link=KBPS[:QUEUEMS]  a narrow link with a queue in front of the receiver, to test
+                                  --adapt (e.g. 8000: 8 Mbps with a 200 ms queue)
 ```
 
 Files next to the exe:
@@ -80,11 +88,11 @@ Files next to the exe:
 See [TESTING.md](TESTING.md).
 
 ```bash
-# Mac (38 tests)
+# Mac (54 tests)
 cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
 ```
 ```bat
-:: Windows (5 suites, 392 checks)
+:: Windows (6 suites, 509 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build

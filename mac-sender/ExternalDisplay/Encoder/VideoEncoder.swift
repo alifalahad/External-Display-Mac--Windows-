@@ -45,6 +45,11 @@ final class VideoEncoder {
     private let controlLock = NSLock()
     private var forceNextKeyframe = false
     private var sessionNeedsReset = false
+    // Set from any thread, applied on the encoding thread before the next frame:
+    // VTSessionSetProperty can wait for an encode in progress, and the bitrate
+    // changes up to 10 times a second from the network queue (step 6)
+    private var pendingBitrateBps: Int?
+    private var pendingFps: Int?
 
     /// Bitrate currently in effect (adaptive quality may change it at runtime)
     private var currentBitrateBps: Int   // guarded by statsLock after init
@@ -197,13 +202,18 @@ final class VideoEncoder {
         statsLock.lock()
         currentBitrateBps = newBps
         statsLock.unlock()
-        applyBitrate(newBps)
-        Log.info(.encoder, "Bitrate updated: \(newBps / 1_000_000) Mbps")
+        controlLock.lock()
+        pendingBitrateBps = newBps
+        controlLock.unlock()
+        // Up to 10 changes per second under congestion (step 6)
+        Log.every(1, key: "bitrate-updated", .info, .encoder, "Bitrate updated: \(newBps / 1000) kbps")
     }
 
     /// Quality preset changed the frame rate (helps VT allocate bits)
     func updateFrameRate(_ fps: Int) {
-        setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
+        controlLock.lock()
+        pendingFps = fps
+        controlLock.unlock()
     }
 
     private func applyBitrate(_ bps: Int) {
@@ -228,11 +238,18 @@ final class VideoEncoder {
         sessionNeedsReset = false
         var forceKeyframe = forceNextKeyframe
         forceNextKeyframe = false
+        let newBitrate = pendingBitrateBps
+        let newFps = pendingFps
+        pendingBitrateBps = nil
+        pendingFps = nil
         controlLock.unlock()
 
         if needsReset {
-            recreateSession()
+            recreateSession()        // takes the current bitrate itself
             forceKeyframe = true
+        } else {
+            if let newBitrate { applyBitrate(newBitrate) }
+            if let newFps { setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, value: newFps as CFNumber) }
         }
         guard let session = session else { return }
 

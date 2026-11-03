@@ -79,6 +79,8 @@ private:
     void updateStatus(int64_t nowUs);
     void updatePointer();
     void updateDisplayPath();
+    /// RECEIVER_CAPS: pointer drawn here, parity, pacing
+    uint32_t wantedCaps() const;
     void renderIfNeeded(int64_t& nowUs);
     void trackScanout(int64_t nowUs);
     void tickOncePerSecond(int64_t nowUs);

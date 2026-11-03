@@ -131,6 +131,10 @@ struct NetworkCounters {
     double   jitterMs = 0;
     uint64_t keyframesReceived = 0;  // docs/SMOOTHNESS.md, step 2
     uint64_t keyframeRequests = 0;   // KEYFRAME_REQ sent
+    uint64_t fragmentsRebuilt = 0;   // step 5: lost packets rebuilt from parity
+    uint64_t framesRebuilt = 0;
+    uint32_t queuingDelayUs = 0;     // step 6: latest RATE_FEEDBACK figure
+    uint8_t  rateState = 0;          // 0 normal, 1 hold, 2 overuse
 };
 
 struct MetricsSnapshot {
@@ -155,6 +159,15 @@ struct MetricsSnapshot {
     uint64_t keyframesLastInterval = 0;
     uint64_t keyframeRequestsLastInterval = 0;
     uint64_t framesHeldLastInterval = 0;
+
+    // Lost packets rebuilt from parity (step 5), since stream start
+    uint64_t fragmentsRebuilt = 0;
+    uint64_t framesRebuilt = 0;
+    uint64_t fragmentsRebuiltLastInterval = 0;
+
+    // Queuing delay on the way (step 6): the latest figure and verdict
+    double queuingDelayMs = 0;
+    uint8_t rateState = 0;           // 0 normal, 1 hold, 2 overuse
 };
 
 class PipelineMetrics {
@@ -187,6 +200,7 @@ private:
     uint64_t        lastRenders_ = 0, lastDecoded_ = 0, lastPresented_ = 0, lastHeld_ = 0;
     uint64_t        firstExpected_ = 0, firstReceived_ = 0;
     uint64_t        firstKeyframes_ = 0, firstKeyframeRequests_ = 0;
+    uint64_t        firstFragmentsRebuilt_ = 0, firstFramesRebuilt_ = 0;
     bool            haveFirst_ = false;
 
     MetricsSnapshot rates_{};
@@ -204,6 +218,7 @@ struct SenderSample {
     double encoderMbps = 0;
     double targetMbps = 0;
     bool   hardwareEncoder = false;
+    double pacingSpreadUs = 0;       // step 5: 0 = frames not paced
 };
 
 /// This process on the PC (SystemMonitor, once per second)
@@ -257,7 +272,9 @@ private:
     };
     Agg presentedFps_, receivedFps_, renderedFps_, bitrate_, loss_, drop_, jitter_, rtt_;
     Agg pcCpu_, pcRam_, gpu3d_, gpuDecode_, macCpu_, macRam_, macCaptureFps_, macEncodeFps_;
-    uint64_t keyframes_ = 0, keyframeRequests_ = 0, framesHeld_ = 0;
+    uint64_t keyframes_ = 0, keyframeRequests_ = 0, framesHeld_ = 0, fragmentsRebuilt_ = 0;
+    Agg queuingDelay_;
+    uint64_t overuseSeconds_ = 0;
     double clockErrorMs_ = 0;
     std::vector<std::string> notes_;
     uint64_t lostFrames_ = 0, droppedFrames_ = 0;

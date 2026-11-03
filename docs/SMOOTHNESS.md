@@ -41,8 +41,8 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 | 2 | Keyframes only when needed | **done here, to test on the PCs** | removes the burst once a second; a lost packet costs a short freeze, not smeared blocks |
 | 3 | Display path: DPI-aware, present without waiting | **done here, to test on the PCs** | sharp 1:1 picture on scaled laptops; present at once (F5) up to one refresh sooner |
 | 4 | Capture in the encoder's format | **done here, to test on the PCs** | correct colours (the picture was washed out); no conversion pass before encoding |
-| 5 | Packet pacing and loss repair | to do | fewer Wi-Fi spikes; no long wait after a lost packet |
-| 6 | Bitrate that follows the delay | to do | stays smooth when the Wi-Fi gets worse |
+| 5 | Packet pacing and loss repair | **done here, to test on the PCs** | a lost packet is rebuilt on the PC (at 1 % loss 98.7 % of frames arrive, was 74 %); packets paced over ~1 ms |
+| 6 | Bitrate that follows the delay | **done here, to test on the PCs** | the bitrate goes down as soon as a queue builds, before packets are lost (8 Mbps test link: below it within 1 s, 99.5 % of frames arrive, was 17–20 %) |
 | 7 | 120 Hz | to do | halves every refresh wait |
 | 8 | Network setup | checklist (no code) | removes regular spikes the code cannot fix |
 
@@ -297,32 +297,169 @@ frame and the ones after it.
 
 ### Step 5 — Packet pacing and loss repair
 
-**Why.** A frame's packets leave in one burst, and on Wi-Fi a burst can overflow queues. A lost
-packet ruins the frame until a keyframe arrives (at least one round trip, plus a big frame).
+**Why.**
+- A frame's packets left in one burst, and on Wi-Fi a burst can overflow queues.
+- One lost packet ruined its whole frame. The PC also asked for a keyframe at once for every
+  lost packet: a large frame, one round trip later, and a short freeze (step 2).
 
-**How.**
-- Spread each frame's packets over 1–2 ms.
-- Add parity packets (XOR or Reed–Solomon) so the PC can rebuild one or two lost packets per
-  frame.
-- Ask for a keyframe only when the repair fails (step 2's gate already does the asking).
-- Option: VideoToolbox long-term reference frames (`kVTCompressionPropertyKey_EnableLTR`, macOS
-  12+). The PC acknowledges frames; after a loss the Mac refers back to an acknowledged frame
-  (`ForceLTRRefresh`) instead of sending a full keyframe.
+**How (implemented).**
+- **Parity packets** (Mac, `FrameParity.swift`):
+  - The Mac adds about one parity packet per 10 fragments (at least one per frame; ≈10 % more
+    data). Parity *j* of *P* is the XOR of fragments *j*, *j+P*, *j+2P*…
+  - The PC rebuilds any group that lost exactly one fragment (`FrameAssembler`). Because the
+    groups interleave, a burst of up to *P* consecutive lost packets is also rebuilt; a
+    keyframe of 112 fragments survives a burst of 12.
+- **Keyframes only when repair fails:** with parity active, a gap in the packet numbers no
+  longer triggers a keyframe request. The keyframe gate (step 2) asks only when a frame is
+  really missing.
+- **Pacing** (Mac, `PacketPacer`): a frame's datagrams leave in bursts of 8, at most 250 µs
+  apart, and a whole frame within about 1 ms. Frames of 8 packets or fewer leave at once. The
+  Mac measures the real spread (about 1.05 ms for large frames, up to about 2 ms when the Mac is
+  busy) and reports it in SENDER_STATS; the F2 overlay shows `paced 1.0 ms`.
+- **Negotiated per connection** (`RECEIVER_CAPS` bits 1 and 2): `--fec=off` and `--pacing=off`
+  on the PC switch them off, to compare on your own Wi-Fi.
+- **`--simulate-loss=PERCENT[:BURST]`** on the PC drops incoming packets on purpose, to test
+  repair on a good network. For example `--simulate-loss=1` or `--simulate-loss=2:4` (2 % in
+  bursts of 4).
+- **F2 overlay:** `Loss 1.03% packets, 329 rebuilt (300 frames saved)`. The benchmark files get
+  a `packets_rebuilt` column and a `Repair` summary line, and the summary records whether
+  parity, pacing and simulated loss were on.
+- Later, if needed: Reed–Solomon instead of XOR (several losses per group), or VideoToolbox
+  long-term reference frames (`kVTCompressionPropertyKey_EnableLTR`, macOS 12+), which refer
+  back to an acknowledged frame instead of sending a keyframe.
 
-**Check.** A loopback test that drops 1–5 % of packets on purpose: frames are rebuilt and none
-are lost. Then the benchmark's Network p95 and frame drops on Wi-Fi.
+**Check.**
+- Loopback, 2026-11-03, real Mac sender and VideoToolbox encoder against the real Windows
+  receiver networking (64- and 32-bit), 720p60, 1 % of the packets dropped on purpose:
+
+  | | With parity and pacing | Without (as before) |
+  |---|---|---|
+  | Frames that arrived | **98.7 %** | 73.5–74.2 % |
+  | Lost packets rebuilt | ~330 of ~340 | 0 |
+  | Keyframes in 20 s | 22 | 117 |
+
+  Without loss: about 3 parity packets per frame, nothing lost, and the Mac's pacing spread is
+  about 1.05 ms.
+- Automated, all passing:
+  - Mac: 43 XCTests. New `LossRepairTests` check the parity bytes against vectors computed
+    independently in Python, rebuilding every single lost fragment, the parity header layout and
+    the pacing schedule.
+  - Windows: 462 checks on x64 and x86. New `NetworkTests` (65) cover the same parity vectors
+    and assembly in any order with duplicates. They also cover repair: every single loss, bursts
+    up to the group count, the short last fragment, parity before data, and one-fragment frames.
+    Two losses in one group must count as lost. Hostile headers are refused, late frames
+    ignored, numbering restarts handled, and the loss simulator's rate and bursts checked.
+
+#### Checklist for step 5 (on each laptop)
+1. F2: the `Mac` line shows `paced ~1 ms`, and `Loss` shows packets rebuilt when Wi-Fi loses some.
+2. Walk away from the router: fewer freezes than before, and the `rebuilt` count goes up.
+3. On a good network, test the repair yourself: `--simulate-loss=1`, then
+   `--simulate-loss=1 --fec=off`. Compare how often it freezes and the `Keyframe` count.
+4. `--bench=60`, then `--bench=60 --pacing=off`: compare Network p95/p99 and the drops.
 
 ### Step 6 — Bitrate that follows the delay
 
-**Why.** Adaptive quality reacts to loss above 3 %, RTT above 50 ms, drops or a growing queue. By
-then the picture already stutters. Wi-Fi shows rising delay before it loses packets.
+**Why.**
+- The old adaptive quality (loss/RTT tiers) waited for loss above 3 %, RTT above 50 ms, drops or
+  a growing queue on the PC. It needed two bad 1-second reports per step, and a step was at most
+  5 Mbps. By then the picture already stuttered.
+- Wi-Fi shows rising delay before it loses packets: its queues fill first.
 
-**How.** Use the per-frame network delay that is already measured. Lower the bitrate within about
-100 ms when the delay keeps rising, and raise it slowly when the delay is stable (as WebRTC's
-congestion control does).
+**How (implemented).**
+- **The PC measures the queuing delay** (`DelayMonitor`):
+  - For each frame's first packet: its arrival time (PC clock) minus the Mac's send time in the
+    header. The clocks differ by a constant, so the minimum of the last 10 s is subtracted. What
+    remains is the time spent waiting in queues on the way.
+  - Every 100 ms it sends a new message, RATE_FEEDBACK, with:
+    - the median of the last 100 ms (a single spike does not count);
+    - what arrived in the last 500 ms, and the loss;
+    - a verdict: *overuse* (above 15 ms and not falling), *normal* (below 5 ms), or *hold*
+      (in between, or a queue still draining after a cut);
+    - the **link's capacity**: what arrived in the last 100 ms, but only if every frame in that
+      time waited at least 5 ms. The queue never emptied, so the link was full, and what it
+      carried is what it can carry.
+  - It counts packets, not complete frames: on an overloaded link most frames lose a packet, and
+    the signal must not go blind exactly then.
+- **The Mac follows it** (`DelayRateController`):
+  - Overuse on a full link: 85 % of the link's capacity (its video share: parity and headers
+    travel too), at most every 0.3 s, so the queue can drain.
+  - Overuse whose queue emptied again within 100 ms (a keyframe's burst): no cut, the link had
+    room. Heavy loss (above 10 %) still lowers the bitrate, at most once a second.
+  - Normal: +8 % per second; +25 % per second while far below (under 70 % of) the capacity last
+    found, so a cut that went too deep recovers in seconds. It rises only while the encoder uses
+    the bitrate it has: a static screen cannot test the link.
+  - Under congestion it may go down to a quarter of the preset's minimum: a picture that keeps up
+    is smoother than a sharp one that lags. The preset sets the maximum.
+  - The encoder takes a new bitrate before its next frame.
+- **Compatible both ways:** an older Mac ignores RATE_FEEDBACK. With an older PC no RATE_FEEDBACK
+  arrives, and the Mac keeps the loss/RTT tiers (`BitrateGovernor`). `--adapt=tiers` on the PC
+  brings the tiers back, to compare.
+- **`--simulate-link=KBPS[:QUEUEMS]`** on the PC puts a narrow link with a queue (200 ms by
+  default) in front of the receiver, to test on a good network. Packets wait in it until they
+  leave the link, and a full queue drops them, as a router would. This replaces Network Link
+  Conditioner from the plan: that needs Xcode's Additional Tools and throttles all of the Mac's
+  network traffic.
+- **F2 overlay:** `Net wait 2.1 ms queued on the way (normal)`, and the `Mac` line shows the
+  encoder's bitrate and target (`enc 5.9/6.8 Mbps`). The Mac's log shows every cut:
+  `Bitrate down to 5980 kbps (overuse, queue 21 ms, …, link full at 7960 kbps)`. The benchmark's
+  seconds file gets `queuing_delay_ms` and `rate_state` columns, and its summary a `Net wait`
+  line (average, maximum, seconds in overuse).
 
-**Check.** Limit the network with Network Link Conditioner (Xcode Additional Tools). The bitrate
-drops quickly and the picture stays smooth (no frozen frames).
+**Check.**
+- Loopback, 2026-11-03: the real Mac sender and VideoToolbox encoder against the real Windows
+  receiver networking (64- and 32-bit), 720p60, 20 s per run. The Mac starts at 20 Mbps
+  (Balanced), with an 8 Mbps link and a 200 ms queue in front of the receiver
+  (`--simulate-link=8000`):
+
+  | | Follows the delay (now) | Loss/RTT tiers (before) |
+  |---|---|---|
+  | First cut | after 0.1 s: 20 → 6.8 Mbps | after 4 s: 20 → 15 Mbps |
+  | Below the 8 Mbps link | within 1 s | after 12.4–12.7 s |
+  | Bitrate after that | 5.5–6.5 Mbps | 8 Mbps (the tiers cannot go below the preset's minimum) |
+  | Queue on the link, last 10 s, average | 2.4–3.2 ms | 32–77 ms |
+  | Frames that arrived | **99.4–99.5 %** | 16.6–19.5 % |
+  | Packets lost | 50–67, all in the first 2 s | 10,600–10,900 |
+
+- What the numbers mean:
+  - The first cut comes about 0.1 s after the stream starts, straight to 6.8 Mbps (85 % of
+    the 8 Mbps the full link carried). After that the bitrate moves between about 5.5 and
+    6.5 Mbps: it rises slowly until a small queue appears, then cuts.
+  - The first second still has a long queue. When the first report arrives, about 170 ms of
+    data are already queued: the PC sees only the delay of packets that have arrived. After the
+    cut, the queue drains at 15 % of the link's rate. WebRTC behaves the same way. This only
+    matters when the start bitrate is far above the link.
+  - The comparison is not quite fair to the old tiers: the simulated link delays only the
+    video, not the TCP round trip, so the tiers see the loss but not the RTT rise. Even with
+    perfect signals they need at least 6 s from 20 to 8 Mbps (two 1-second reports per step of
+    at most 5 Mbps).
+  - A stall on the PC looks like a queue on the way. This happens when the receive thread does
+    not read for tens of milliseconds. In one 64-bit run on the busy test Mac, 3 of 9 cuts read
+    the link 15–30 % too low, and the bitrate ended at 3.9 Mbps. The receive thread now runs at
+    high priority to make such stalls rare. Whether that helps can only be seen on the PCs.
+  - A keyframe that keeps the link busy for more than 100 ms counts as a full link, and the Mac
+    cuts once (the 4.8 Mbps dip after the frame the test drops on purpose).
+- Automated, all passing:
+  - Mac: 54 XCTests. New `RateControlTests` (11) cover the cut to 85 % of what a full link
+    carried, only its video share, no cut for a queue that emptied again, the floor, slow and fast
+    rises only while the encoder uses its bitrate, heavy loss, limits and the switch from the
+    tiers. The RATE_FEEDBACK layout is shared with Windows.
+  - Windows: 509 checks on x64 and x86. New in `NetworkTests` (now 106): the delay monitor and
+    the link simulator. The delay monitor checks cover the queuing delay whatever the clock offset,
+    the verdicts, a draining queue, a keyframe's burst, the capacity only while the link was full,
+    spikes, a lasting route change, the rate and the loss. The link simulator checks cover its
+    rate, queue, tail drop, and packets held in order.
+  - The loopback's `narrow` run must go below the link within 3 s, keep the queue under 40 ms on
+    average, and deliver at least 90 % of the frames.
+
+#### Checklist for step 6 (on each laptop)
+1. F2: `Net wait` stays at a few milliseconds (`normal`) on good Wi-Fi.
+2. Walk away from the router, or start a large download on the same network. `Net wait` says
+   `overuse` briefly, the target in the `Mac` line goes down within a second, and the picture
+   gets softer instead of stuttering.
+3. On a good network: `--simulate-link=8000`, then `--simulate-link=8000 --adapt=tiers`.
+   Compare how long the picture lags and freezes at the start, and `Net wait`.
+4. `--bench=60` on your Wi-Fi: keep the summary's `Net wait` line (time in overuse) and compare
+   with `--adapt=tiers`.
 
 ### Step 7 — 120 Hz
 

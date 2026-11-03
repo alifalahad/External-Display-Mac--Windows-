@@ -50,6 +50,7 @@ enum class MessageType : uint8_t {
     KeyframeReq   = 0x30,
     QualityReport = 0x50,
     SenderStats   = 0x51,   // Mac → Win: sender performance, once per second
+    RateFeedback  = 0x52,   // Win → Mac: queuing delay and received rate, every 100 ms (step 6)
     InputEvent    = 0x60,
     ClipboardData = 0x70,
     KeyExchange   = 0x80,   // Mac → Win: handshake mode + Mac's ephemeral key
@@ -65,6 +66,7 @@ enum class MessageType : uint8_t {
     // Data (UDP)
     VideoFrame    = 0x40,
     VideoFragment = 0x41,
+    VideoParity   = 0x42,   // XOR of a group of fragments: rebuilds a lost one (step 5)
 };
 
 // ── Flags ───────────────────────────────────────────────────────────────────
@@ -99,6 +101,20 @@ struct FragmentHeader {
     uint16_t fragmentTotal = 0;   // Total fragments
 };
 static_assert(sizeof(FragmentHeader) == 8, "Fragment header must be 8 bytes");
+
+// ── Parity Header (16 bytes, inside VIDEO_PARITY payload; SMOOTHNESS.md step 5) ──
+// Then the XOR of fragments groupIndex, groupIndex + groupCount, … each
+// zero-padded to the longest. frameBytes gives the last fragment's length.
+
+struct ParityHeader {
+    uint32_t frameSequence = 0;
+    uint16_t fragmentTotal = 0;
+    uint16_t groupIndex = 0;
+    uint16_t groupCount = 0;
+    uint16_t reserved = 0;
+    uint32_t frameBytes = 0;
+};
+static_assert(sizeof(ParityHeader) == 16, "Parity header must be 16 bytes");
 
 // ── HELLO payload (162 bytes) ───────────────────────────────────────────────
 
@@ -155,10 +171,24 @@ struct SenderStatsPayload {
     uint32_t encoderKbps = 0;        // measured encoder output, last second
     uint32_t targetKbps = 0;
     uint32_t flags = 0;              // SENDER_HW_ENCODER
-    uint32_t reserved = 0;
+    uint32_t pacingSpreadUs = 0;     // a paced frame, first to last datagram (step 5; 0: not paced)
 };
 static_assert(sizeof(SenderStatsPayload) == 32, "SenderStatsPayload must be 32 bytes");
 constexpr uint32_t SENDER_HW_ENCODER = 1 << 0;
+
+// ── RATE_FEEDBACK payload (16 bytes, Windows → Mac, every 100 ms) ───────────
+// docs/SMOOTHNESS.md, step 6 (Network/DelayMonitor.h)
+
+struct RateFeedbackPayload {
+    uint32_t queuingDelayUs = 0;     // median over 100 ms of (one-way delay − its 10 s minimum)
+    uint32_t receivedKbps = 0;       // everything that arrived (fragments, parity), last 500 ms
+    uint16_t lossPercent100 = 0;     // packets, last 500 ms
+    uint8_t  state = 0;              // 0 normal (may rise), 1 hold, 2 overuse (lower now)
+    uint8_t  samples = 0;            // frames behind the figure (0: no information)
+    uint32_t linkKbps = 0;           // the last 100 ms if no frame got through without waiting
+                                     // (the link was full: its capacity), else 0
+};
+static_assert(sizeof(RateFeedbackPayload) == 16, "RateFeedbackPayload must be 16 bytes");
 
 // ── INPUT_EVENT payload (24 bytes, Windows → Mac) ─────────────────────────────
 
@@ -248,6 +278,8 @@ struct ReceiverCapsPayload {
 };
 static_assert(sizeof(ReceiverCapsPayload) == 8, "ReceiverCapsPayload must be 8 bytes");
 constexpr uint32_t CAP_LOCAL_CURSOR = 1 << 0;   // we draw the pointer: capture without it
+constexpr uint32_t CAP_PARITY       = 1 << 1;   // send VIDEO_PARITY: we rebuild lost fragments (step 5)
+constexpr uint32_t CAP_PACING       = 1 << 2;   // spread each frame's datagrams over ~1 ms (step 5)
 
 /// CURSOR_SHAPE (Mac → Windows): this header, then width × height × 4 bytes
 /// BGRA, premultiplied alpha, top row first

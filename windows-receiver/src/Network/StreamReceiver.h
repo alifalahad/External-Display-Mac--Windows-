@@ -26,6 +26,9 @@
 #pragma once
 
 #include "Protocol.h"
+#include "DelayMonitor.h"
+#include "FrameAssembler.h"
+#include "NetworkSimulator.h"
 #include "../Security/PairingManager.h"
 #include "../Security/SecureChannel.h"
 #include "../Performance/ClockSync.h"
@@ -143,6 +146,11 @@ public:
         uint64_t fragmentsReceived = 0;
         uint64_t keyframeRequests = 0;   // every KEYFRAME_REQ sent
         uint64_t keyframesReceived = 0;  // complete keyframes
+        uint64_t parityPackets = 0;      // docs/SMOOTHNESS.md, step 5
+        uint64_t fragmentsRebuilt = 0;   // lost fragments rebuilt from parity
+        uint64_t framesRebuilt = 0;      // frames that needed it
+        uint32_t queuingDelayUs = 0;     // step 6: the latest RATE_FEEDBACK figure
+        RateState rateState = RateState::Normal;
         uint64_t framesExpected = 0;   // from Mac frame numbers (gaps = whole frames lost)
         double   jitterMs = 0;         // RFC 3550 interarrival jitter
     };
@@ -177,6 +185,17 @@ public:
     /// What we tell the Mac once the session is encrypted (RECEIVER_CAPS,
     /// exdp::CAP_*). A change during a session is sent at once. Any thread.
     void setReceiverCaps(uint32_t flags);
+
+    /// Drop incoming video packets on purpose (--simulate-loss: tests loss
+    /// repair on a good network). Call before connect().
+    void simulateLoss(double percent, int burst) { m_lossSimulator.configure(percent, burst); }
+    /// A narrow link in front of the receiver (--simulate-link): tests the
+    /// bitrate that follows the delay. Call before connect().
+    void simulateLink(double kbps, double bufferMs) { m_linkSimulator.configure(kbps, bufferMs); }
+
+    /// Report the queuing delay to the Mac every 100 ms (RATE_FEEDBACK,
+    /// docs/SMOOTHNESS.md step 6). Off: the Mac keeps its loss/RTT tiers.
+    void enableRateFeedback(bool on) { m_rateFeedback.store(on); }
 
     /// CURSOR_SHAPE / CURSOR_POSITION payloads (decrypted), network thread
     using PointerCallback = std::function<void(const uint8_t* data, size_t len)>;
@@ -231,10 +250,18 @@ private:
     void handleStopStream();
 
     /// Handle video data (rxUs = arrival time of this packet, PipelineClock)
+    /// One datagram as it arrives (or leaves the simulated link): authenticate,
+    /// count, measure the delay, then hand the video on
+    void handleDatagram(const uint8_t* data, size_t n, int64_t rxUs, std::vector<uint8_t>& plaintext);
     void handleVideoFrame(const exdp::ProtocolHeader& header,
                           const uint8_t* data, size_t dataLen, int64_t rxUs);
     void handleVideoFragment(const exdp::ProtocolHeader& header,
                              const uint8_t* data, size_t dataLen, int64_t rxUs);
+    void handleVideoParity(const exdp::ProtocolHeader& header,
+                           const uint8_t* data, size_t dataLen, int64_t rxUs);
+    /// After the assembler took a packet: deliver, count, recover
+    void afterAssembly(bool complete, AssembledFrame& frame, size_t framesLost,
+                       uint64_t parityPackets, uint64_t fragmentsRebuilt, uint64_t framesRebuilt, int64_t rxUs);
     void deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe, bool hasTiming,
                       int64_t firstPacketUs, int64_t completeUs);
 
@@ -311,7 +338,6 @@ private:
     static constexpr int      MAX_BACKOFF_MS      = 8000;
     static constexpr int      REDISCOVER_AFTER    = 3;       // failed connects
     static constexpr uint32_t MAX_CONTROL_PAYLOAD = 4 * 1024 * 1024;
-    static constexpr uint16_t MAX_FRAGMENTS       = 8192;    // ~11 MB frame
     static constexpr int      KEYFRAME_REQUEST_INTERVAL_MS = 500;
 
     // ── UDP loss detection (UDP thread only) ────────────────────────────────
@@ -321,22 +347,23 @@ private:
     uint32_t m_expectedUdpSequence = 0;
     std::chrono::steady_clock::time_point m_lastLossKeyframeRequest{};
 
-    // ── Fragment Reassembly ─────────────────────────────────────────────────
-
-    struct PendingFrame {
-        uint16_t totalFragments = 0;
-        uint16_t receivedCount = 0;
-        bool isKeyframe = false;
-        bool hasTiming = false;
-        int64_t firstPacketUs = 0;
-        std::map<uint16_t, std::vector<uint8_t>> fragments;
-    };
+    // ── Fragment reassembly and repair (docs/SMOOTHNESS.md, step 5) ─────────
 
     std::mutex m_fragmentMutex;
-    std::map<uint32_t, PendingFrame> m_pendingFrames;
+    FrameAssembler m_assembler;                    // m_fragmentMutex
+    std::atomic<bool> m_assemblerReset{false};     // START_STREAM: numbering restarts
+    // Parity packets arrive in this stream: a lost packet is usually rebuilt,
+    // so the keyframe is asked for only when a frame really goes missing
+    // (KeyframeGate), not on every gap in the packet numbers
+    std::atomic<bool> m_parityActive{false};
+    LossSimulator m_lossSimulator;                 // UDP thread (configured before connect)
+    LinkSimulator m_linkSimulator;                 // UDP thread (configured before connect)
 
-    /// Drop incomplete frames that can no longer complete
-    void cleanupOldFrames(uint32_t currentFrameSeq);
+    // ── Bitrate that follows the delay (step 6; UDP thread) ─────────────────
+    DelayMonitor m_delayMonitor;
+    std::atomic<bool> m_delayReset{false};         // START_STREAM: the Mac's timestamps restart
+    std::atomic<bool> m_rateFeedback{true};
+    void sendRateFeedback();
 
     // ── Stats ───────────────────────────────────────────────────────────────
 

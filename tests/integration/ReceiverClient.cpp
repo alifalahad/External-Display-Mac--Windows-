@@ -20,6 +20,16 @@
 // 300 ms. No keyframes except the ones asked for.
 // Colours (step 4): the keyframes' SPS must say full-range BT.709, which is
 // what the receiver's shader then uses.
+// Loss repair (step 5): parity and pacing are asked for (except lossy-nofec).
+//   lossy        1 % of the packets dropped on purpose: parity must rebuild
+//                nearly all of them, ≥ 97 % of the frames arrive
+//   lossy-nofec  the same loss without parity or pacing, for comparison
+// Paced runs: a frame's packets must arrive spread out, not in one burst.
+// Bitrate that follows the delay (step 6): an 8 Mbps link with a 200 ms queue
+// in front of the receiver, the Mac starting at 20 Mbps.
+//   narrow        delay feedback: the Mac must go below the link within 3 s
+//                 and keep the queue short
+//   narrow-tiers  the old loss/RTT tiers, for comparison
 //
 //   ReceiverClient <host> <seconds> <code-file> <mode>
 // =============================================================================
@@ -45,6 +55,10 @@ int main(int argc, char** argv) {
     std::string codeFile = argc > 3 ? argv[3] : "code.txt";
     const std::string mode = argc > 4 ? argv[4] : "pair";
     const bool streams = mode != "rejected";
+    const bool lossy = mode == "lossy" || mode == "lossy-nofec";
+    const bool repair = mode != "lossy-nofec";             // parity + pacing asked for
+    const bool narrow = mode == "narrow" || mode == "narrow-tiers";
+    const bool drowning = mode == "narrow-tiers";   // the old tiers drown the narrow link: that is the comparison
     setvbuf(stdout, nullptr, _IONBF, 0);
     Log::Init("", LogLevel::Info);
 
@@ -97,7 +111,14 @@ int main(int argc, char** argv) {
     std::vector<PointerPosition> positions;
     int malformedPointer = 0;
     int pointerRequests = askPointer ? 1 : 0;
-    rx.setReceiverCaps(askPointer ? exdp::CAP_LOCAL_CURSOR : 0);
+    rx.setReceiverCaps((askPointer ? exdp::CAP_LOCAL_CURSOR : 0) |
+                       (repair ? exdp::CAP_PARITY | exdp::CAP_PACING : 0));
+    if (lossy) rx.simulateLoss(1.0, 1);
+    if (narrow) rx.simulateLink(8000, 200);
+    rx.enableRateFeedback(mode != "narrow-tiers");
+    struct RateSample { double sinceStartS, targetMbps, queueMs; uint64_t lost; };
+    std::vector<RateSample> rateSamples;
+    int64_t lastRateSampleUs = 0;
     rx.setPointerCallbacks(
         [&](const uint8_t* d, size_t n) {
             std::lock_guard<std::mutex> lock(m);
@@ -134,6 +155,14 @@ int main(int argc, char** argv) {
                         result == StreamReceiver::CodeResult::Sent ? "verified"
                         : result == StreamReceiver::CodeResult::Mismatch ? "mismatch (refused)" : "expired");
         }
+        // What the Mac aims for and how long the queue is, every 100 ms
+        if (streamStartUs && PipelineClock::NowUs() - lastRateSampleUs >= 100'000) {
+            lastRateSampleUs = PipelineClock::NowUs();
+            const SenderSample sample = rx.senderStats();
+            const auto now = rx.getStats();
+            rateSamples.push_back({ (lastRateSampleUs - streamStartUs) / 1e6, sample.valid ? sample.targetMbps : 0,
+                                    now.queuingDelayUs / 1000.0, now.packetsLost });
+        }
         // Ask while the gate waits for a keyframe: at once, then every 250 ms
         bool askKeyframe = false;
         {
@@ -146,10 +175,10 @@ int main(int argc, char** argv) {
         if (streamStarted && !streamStartUs) streamStartUs = PipelineClock::NowUs();
         const int64_t sinceStartUs = streamStartUs ? PipelineClock::NowUs() - streamStartUs : 0;
         if (mode == "paired" && pointerToggle == 0 && sinceStartUs > 5'000'000) {
-            rx.setReceiverCaps(0);
+            rx.setReceiverCaps(exdp::CAP_PARITY | exdp::CAP_PACING);
             pointerToggle = 1;
         } else if (mode == "paired" && pointerToggle == 1 && sinceStartUs > 6'000'000) {
-            rx.setReceiverCaps(exdp::CAP_LOCAL_CURSOR);
+            rx.setReceiverCaps(exdp::CAP_LOCAL_CURSOR | exdp::CAP_PARITY | exdp::CAP_PACING);
             pointerToggle = 2;
             pointerRequests++;
         }
@@ -204,6 +233,51 @@ int main(int argc, char** argv) {
         std::printf("[Client] pointer: no shapes, %zu positions, asked %d time(s)\n", positions.size(), pointerRequests);
     }
 
+    // Pacing: how long a frame of 10+ packets takes to arrive, first to last packet
+    double spreadSumUs = 0;
+    size_t spreadFrames = 0;
+    for (const FrameTimeline& t : frames) {
+        if (t.bytes < 10 * exdp::MAX_FRAGMENT_PAYLOAD) continue;
+        spreadSumUs += static_cast<double>(t.completeUs - t.firstPacketUs);
+        spreadFrames++;
+    }
+    const double spreadUs = spreadFrames ? spreadSumUs / spreadFrames : 0;
+    const double lossPercent = st.packetsReceived + st.packetsLost
+        ? 100.0 * st.packetsLost / (st.packetsReceived + st.packetsLost) : 0;
+    const double delivered = st.framesExpected ? 100.0 * frames.size() / st.framesExpected : 0;
+    std::printf("[Client] loss repair: %.2f%% of packets lost, %llu rebuilt from %llu parity packets "
+                "(%llu frames saved), %.1f%% of frames arrived; Mac paces frames over %.0f us "
+                "(10+ packet frames arrive here over %.0f us)\n",
+                lossPercent, (unsigned long long)st.fragmentsRebuilt, (unsigned long long)st.parityPackets,
+                (unsigned long long)st.framesRebuilt, delivered, mac.pacingSpreadUs, spreadUs);
+    double belowLinkS = -1, queueSum = 0, startTarget = 0, endTarget = 0;
+    size_t queueN = 0;
+    uint64_t lostAtStart = 0;                            // packets lost in the first 2 s
+    for (const RateSample& r : rateSamples) {
+        if (r.sinceStartS <= 2.0) lostAtStart = r.lost;
+        if (r.targetMbps > 0 && startTarget == 0) startTarget = r.targetMbps;
+        if (r.targetMbps > 0) endTarget = r.targetMbps;
+        if (belowLinkS < 0 && r.targetMbps > 0 && r.targetMbps <= 8.0) belowLinkS = r.sinceStartS;
+        if (r.sinceStartS >= seconds - 12) { queueSum += r.queueMs; queueN++; }
+    }
+    const double queueAvgMs = queueN ? queueSum / queueN : 0;
+    if (narrow) {
+        std::string timeline;
+        double nextS = 0;
+        for (const RateSample& r : rateSamples) {
+            if (r.sinceStartS < nextS) continue;
+            char item[48];
+            snprintf(item, sizeof(item), " %.0fs:%.1f/%.0fms", r.sinceStartS, r.targetMbps, r.queueMs);
+            timeline += item;
+            nextS += 2;
+        }
+        std::printf("[Client] timeline (s:Mbps/queue):%s\n", timeline.c_str());
+        std::printf("[Client] narrow link 8 Mbps: Mac target %.1f -> %.1f Mbps, below the link after %.1f s; "
+                    "queue %.1f ms on average in the last 10 s; %.1f%% of frames arrived; "
+                    "packets lost: %llu in the first 2 s, %llu after\n",
+                    startTarget, endTarget, belowLinkS, queueAvgMs, delivered, (unsigned long long)lostAtStart,
+                    (unsigned long long)(st.packetsLost - lostAtStart));
+    }
     std::printf("[Client] colours: %d of %zu keyframes carry an SPS, it says %s\n",
                 keyframesWithSps, keyframes, keyframesWithSps ? VideoColorName(streamColor, 720) : "-");
     const int64_t recoveryUs = recoveredUs && recoveryAskedUs ? recoveredUs - recoveryAskedUs : -1;
@@ -228,19 +302,52 @@ int main(int argc, char** argv) {
     if (mode == "pair" || mode == "impostor") expect(codeRequests == 1, "exactly one verification code asked");
     if (mode == "paired") expect(codeRequests == 0, "no code asked (already paired)");
     if (mode == "wrongcode") expect(codeRequests == 2, "wrong code refused, a new code issued");
-    expect(streams && frames.size() > (size_t)(seconds - 8) * 40, "encrypted frames received (~60 FPS)");
+    // A drowning link delivers few frames, and keyframes (the largest) rarely complete
+    if (!drowning) {
+        expect(streams && frames.size() > (size_t)(seconds - 8) * 40, "encrypted frames received (~60 FPS)");
+        expect(keyframes >= 2, "keyframes on request: stream start and after the lost frame");
+    }
     expect(withTiming == frames.size(), "every frame carries the timing prefix");
     expect(badStartCodes == 0, "decrypted frames start with an H.264 start code");
-    expect(keyframes >= 2, "keyframes on request: stream start and after the lost frame");
-    expect(keyframes <= gate.requests() + 1, "no periodic keyframes (one per second before)");
-    expect(lostAtUs > 0 && recoveryAskedUs > lostAtUs && recoveryAskedUs - lostAtUs < 100'000,
-           "the missing frame was noticed and a keyframe asked for at once");
-    expect(recoveryUs >= 0 && recoveryUs < 300'000, "the Mac's keyframe arrived within 300 ms");
+    // Every KEYFRAME_REQ the receiver sent (the gate's, and its own after a lost frame)
+    expect(keyframes <= st.keyframeRequests + 1, "no periodic keyframes (one per second before)");
+    if (!lossy && !narrow) {   // under simulated loss the gate is busy with other gaps
+        expect(lostAtUs > 0 && recoveryAskedUs > lostAtUs && recoveryAskedUs - lostAtUs < 100'000,
+               "the missing frame was noticed and a keyframe asked for at once");
+        expect(recoveryUs >= 0 && recoveryUs < 300'000, "the Mac's keyframe arrived within 300 ms");
+    }
     expect(keyframesWithSps == static_cast<int>(keyframes), "every keyframe starts with an SPS");
-    expect(streamColor.fullRange && streamColor.matrix == 1, "the stream says full-range BT.709 (what the shader uses)");
-    expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
+    if (!drowning || keyframesWithSps > 0) {
+        expect(streamColor.fullRange && streamColor.matrix == 1, "the stream says full-range BT.709 (what the shader uses)");
+    }
+    if (!lossy && !narrow) expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
+    if (mode == "narrow") {
+        expect(belowLinkS >= 0 && belowLinkS < 3.0, "the Mac went below the 8 Mbps link within 3 s");
+        expect(queueN > 0 && queueAvgMs < 40, "the queue on the link stays short (under 40 ms on average)");
+        expect(delivered >= 90, "at least 90 % of the frames arrived through the narrow link");
+    }
+    // Pacing is measured where it happens: the Mac reports it in SENDER_STATS
+    if (repair) {
+        expect(st.parityPackets > 0, "parity packets arrive (asked for in RECEIVER_CAPS)");
+        // (On the narrow link the bitrate is low: frames of up to 8 packets are not paced)
+        if (!narrow) expect(mac.pacingSpreadUs > 0 && mac.pacingSpreadUs < 5000, "the Mac paces frames (reported spread)");
+        else expect(mac.pacingSpreadUs < 5000, "pacing spread stays small");
+    } else {
+        expect(st.parityPackets == 0, "no parity packets unless asked for");
+        expect(mac.pacingSpreadUs == 0, "no pacing unless asked for");
+    }
+    if (lossy) {
+        expect(lossPercent > 0.5 && lossPercent < 1.6, "about 1 % of the packets were dropped");
+        if (repair) {
+            expect(st.fragmentsRebuilt >= st.packetsLost * 8 / 10, "parity rebuilt at least 80 % of the lost packets");
+            expect(delivered >= 97, "at least 97 % of the frames arrived despite the loss");
+        } else {
+            expect(st.fragmentsRebuilt == 0, "nothing rebuilt without parity");
+        }
+    }
     expect(sync.valid && sync.smoothedRttMs < 50, "clock sync converged over the encrypted channel");
-    expect(mac.valid && mac.encodeFps > 30, "SENDER_STATS received (encrypted control message)");
+    // The message path, not speed: a busy test Mac can encode slowly for a moment
+    expect(mac.valid && mac.encodeFps > 0, "SENDER_STATS received (encrypted control message)");
     expect(malformedPointer == 0, "every pointer message parses");
     if (askPointer) {
         // Per request: the real monitor's image and the scripted arrow

@@ -183,6 +183,8 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
         firstReceived_ = net.framesReceived;
         firstKeyframes_ = net.keyframesReceived;
         firstKeyframeRequests_ = net.keyframeRequests;
+        firstFragmentsRebuilt_ = net.fragmentsRebuilt;
+        firstFramesRebuilt_ = net.framesRebuilt;
     }
 
     if (haveTick_ && !restarted && nowUs > lastTickUs_) {
@@ -210,6 +212,7 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
         rates_.keyframesLastInterval = delta(net.keyframesReceived, lastNet_.keyframesReceived);
         rates_.keyframeRequestsLastInterval = delta(net.keyframeRequests, lastNet_.keyframeRequests);
         rates_.framesHeldLastInterval = delta(held_, lastHeld_);
+        rates_.fragmentsRebuiltLastInterval = delta(net.fragmentsRebuilt, lastNet_.fragmentsRebuilt);
     }
 
     rates_.jitterMs = net.jitterMs;
@@ -221,6 +224,11 @@ void PipelineMetrics::tick(int64_t nowUs, const NetworkCounters& net) {
     rates_.keyframeRequests = net.keyframeRequests >= firstKeyframeRequests_
                             ? net.keyframeRequests - firstKeyframeRequests_ : 0;
     rates_.framesHeld = held_;
+    rates_.fragmentsRebuilt = net.fragmentsRebuilt >= firstFragmentsRebuilt_
+                            ? net.fragmentsRebuilt - firstFragmentsRebuilt_ : 0;
+    rates_.framesRebuilt = net.framesRebuilt >= firstFramesRebuilt_ ? net.framesRebuilt - firstFramesRebuilt_ : 0;
+    rates_.queuingDelayMs = net.queuingDelayUs / 1000.0;
+    rates_.rateState = net.rateState;
 
     haveTick_ = true;
     lastTickUs_ = nowUs;
@@ -264,7 +272,8 @@ bool BenchmarkRecorder::start(const std::string& basePath, int durationSeconds, 
                 "packet_loss_pct,frame_drop_pct,jitter_ms,rtt_ms,clock_error_ms,"
                 "pc_cpu_pct,pc_ram_mb,pc_private_mb,gpu_3d_pct,gpu_decode_pct,"
                 "mac_capture_fps,mac_encode_fps,mac_cpu_pct,mac_ram_mb,mac_encoder_mbps,mac_target_mbps,"
-                "total_avg_ms,total_p95_ms,keyframes,keyframe_requests,frames_held\n";
+                "total_avg_ms,total_p95_ms,keyframes,keyframe_requests,frames_held,packets_rebuilt,"
+                "queuing_delay_ms,rate_state\n";
     startUs_ = nowUs;
     durationUs_ = static_cast<int64_t>(durationSeconds) * 1'000'000;
     active_ = true;
@@ -312,7 +321,9 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
              << opt(mac.valid, mac.encoderMbps) << ',' << opt(mac.valid, mac.targetMbps) << ','
              << opt(total.samples > 0, total.avgMs) << ',' << opt(total.samples > 0, total.p95Ms) << ','
              << m.keyframesLastInterval << ',' << m.keyframeRequestsLastInterval << ','
-             << m.framesHeldLastInterval << '\n';
+             << m.framesHeldLastInterval << ',' << m.fragmentsRebuiltLastInterval << ','
+             << opt(true, m.queuingDelayMs) << ','
+             << (m.rateState == 2 ? "overuse" : m.rateState == 1 ? "hold" : "normal") << '\n';
 
     presentedFps_.add(m.presentedFps);
     receivedFps_.add(m.receivedFps);
@@ -338,6 +349,9 @@ void BenchmarkRecorder::recordSecond(int64_t nowUs, const MetricsSnapshot& m, co
     keyframes_ += m.keyframesLastInterval;
     keyframeRequests_ += m.keyframeRequestsLastInterval;
     framesHeld_ += m.framesHeldLastInterval;
+    fragmentsRebuilt_ += m.fragmentsRebuiltLastInterval;
+    queuingDelay_.add(m.queuingDelayMs);
+    if (m.rateState == 2) overuseSeconds_++;
 }
 
 std::string BenchmarkRecorder::finish(int64_t nowUs) {
@@ -384,6 +398,13 @@ std::string BenchmarkRecorder::finish(int64_t nowUs) {
     snprintf(line, sizeof(line), "Keyframes  %llu (%.1f per minute)   asked for %llu   frames held waiting for one %llu\n",
              static_cast<unsigned long long>(keyframes_), minutes > 0 ? keyframes_ / minutes : 0.0,
              static_cast<unsigned long long>(keyframeRequests_), static_cast<unsigned long long>(framesHeld_));
+    o << line;
+    snprintf(line, sizeof(line), "Repair     %llu lost packets rebuilt from parity\n",
+             static_cast<unsigned long long>(fragmentsRebuilt_));
+    o << line;
+    snprintf(line, sizeof(line), "Net wait   %.1f ms queued on the way avg (%.1f max); overuse in %llu of %llu seconds\n",
+             queuingDelay_.avg(), queuingDelay_.max, static_cast<unsigned long long>(overuseSeconds_),
+             static_cast<unsigned long long>(queuingDelay_.n));
     o << line;
     if (pcCpu_.n) {
         snprintf(line, sizeof(line), "PC         CPU %.1f%% avg (%.1f%% max, all cores)   RAM %.0f -> %.0f MB (peak %.0f)\n",
@@ -463,7 +484,10 @@ std::wstring FormatDiagnostics(const OverlayInputs& in) {
     Appendf(out, L"Dropped  %.2f%%  (net lost %llu, PC skipped %llu)\n",
             m.frameDropPercent, static_cast<unsigned long long>(m.framesLostInNetwork),
             static_cast<unsigned long long>(m.framesDroppedHere));
-    Appendf(out, L"Loss     %.2f%% packets\n", m.packetLossPercent);
+    Appendf(out, L"Loss     %.2f%% packets, %llu rebuilt (%llu frames saved)\n", m.packetLossPercent,
+            static_cast<unsigned long long>(m.fragmentsRebuilt), static_cast<unsigned long long>(m.framesRebuilt));
+    Appendf(out, L"Net wait %.1f ms queued on the way (%ls)\n", m.queuingDelayMs,
+            m.rateState == 2 ? L"overuse: Mac lowers the bitrate" : m.rateState == 1 ? L"hold" : L"normal");
     Appendf(out, L"Keyframe %llu  (asked %llu)  held %llu frames\n",
             static_cast<unsigned long long>(m.keyframes), static_cast<unsigned long long>(m.keyframeRequests),
             static_cast<unsigned long long>(m.framesHeld));
@@ -482,9 +506,10 @@ std::wstring FormatDiagnostics(const OverlayInputs& in) {
     if (in.sync.valid) Appendf(out, L"  clock sync +/-%.1f ms\n", in.sync.errorBoundMs);
 
     if (in.mac.valid) {
-        Appendf(out, L"Mac  CPU %.1f%%  RAM %.0f MB  enc %.1f/%.0f Mbps %ls\n",
-                in.mac.cpuPercent, in.mac.memoryMB, in.mac.encoderMbps, in.mac.targetMbps,
-                in.mac.hardwareEncoder ? L"HW" : L"SW");
+        Appendf(out, L"Mac  CPU %.1f%%  RAM %.0f MB  enc %.1f/%.1f Mbps %ls", in.mac.cpuPercent,
+                in.mac.memoryMB, in.mac.encoderMbps, in.mac.targetMbps, in.mac.hardwareEncoder ? L"HW" : L"SW");
+        if (in.mac.pacingSpreadUs > 0) Appendf(out, L"  paced %.1f ms", in.mac.pacingSpreadUs / 1000.0);
+        out += L"\n";
     }
     if (in.pc.valid) {
         Appendf(out, L"PC   CPU %.1f%%  RAM %.0f MB", in.pc.cpuPercent, in.pc.workingSetMB);

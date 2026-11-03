@@ -50,6 +50,8 @@ enum SenderState: Equatable {
 struct NetworkStats {
     var bytesSent: UInt64 = 0
     var packetsSent: UInt64 = 0
+    var parityPacketsSent: UInt64 = 0        // included in packetsSent (step 5)
+    var pacingSpreadUs: Double = 0           // a paced frame, first to last datagram (0: not paced)
     var framesSent: UInt64 = 0
     var sendMbps: Double = 0                 // last second
     var sendLatency = LatencySummary()       // encoder output → packetization start
@@ -128,6 +130,9 @@ final class StreamSender: ObservableObject {
     /// flags, after authentication). Invoked on the network queue.
     var onReceiverCaps: ((UInt32) -> Void)?
 
+    /// Queuing delay and received rate, every 100 ms (step 6). Network queue.
+    var onRateFeedback: ((RateFeedbackPayload) -> Void)?
+
     /// Pairing manager for secure authentication
     var pairingManager: PairingManager?
 
@@ -150,6 +155,12 @@ final class StreamSender: ObservableObject {
     private var session: SecureSession?
     private var isAuthenticated: Bool { session != nil }
     private var peerName = "Receiver"
+
+    // ── Loss repair and pacing (docs/SMOOTHNESS.md, step 5; networkQueue) ──
+    /// Asked for by the receiver in RECEIVER_CAPS, per connection
+    private var sendParity = false
+    private var pacePackets = false
+    private let pacer = PacketPacer()
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -486,13 +497,18 @@ final class StreamSender: ObservableObject {
             onKeyframeRequest?()
         case .qualityReport:
             handleQualityReport(payload)
+        case .rateFeedback:
+            if let feedback = RateFeedbackPayload.deserialize(from: payload) { onRateFeedback?(feedback) }
         case .inputEvent:
             handleInputEvent(payload)
         case .clipboardData:
             handleClipboardData(payload)
         case .receiverCaps:
             if let caps = ReceiverCapsPayload.deserialize(from: payload) {
-                Log.info(.net, "Receiver capabilities: 0x\(String(caps.flags, radix: 16))")
+                sendParity = caps.flags & ReceiverCapsPayload.parity != 0
+                pacePackets = caps.flags & ReceiverCapsPayload.pacing != 0
+                Log.info(.net, "Receiver capabilities: 0x\(String(caps.flags, radix: 16)) — parity "
+                         + (sendParity ? "on" : "off") + ", pacing " + (pacePackets ? "on" : "off"))
                 onReceiverCaps?(caps.flags)
             }
         case .keyReveal:
@@ -674,6 +690,8 @@ final class StreamSender: ObservableObject {
     private func resetAuthentication() {
         handshake = nil
         session = nil
+        sendParity = false   // the next receiver says what it wants
+        pacePackets = false
         pairingManager?.cancelRequest()
     }
 
@@ -859,18 +877,17 @@ final class StreamSender: ObservableObject {
         var flags = MessageFlags.timing
         if isKeyframe { flags.insert(.keyframe) }
 
-        var packets = 0
-        var bytes = 0
+        // Datagrams are built (numbered, encrypted) here in order, then sent
+        // at once or paced
+        var datagrams: [Data] = []
+        var parityPackets = 0
 
-        if frame.count <= ProtocolConstants.maxFragmentPayload {
+        if frame.count <= ProtocolConstants.maxFragmentPayload && !sendParity {
             // ── Single packet ───────────────────────────────────────────
-            let packet = encryptedPacket(type: .videoFrame, flags: flags, timestamp: timestamp,
-                                         payload: frame, session: session)
-            udp.send(content: packet, completion: .contentProcessed { _ in })
-            packets = 1
-            bytes = packet.count
+            datagrams.append(encryptedPacket(type: .videoFrame, flags: flags, timestamp: timestamp,
+                                             payload: frame, session: session))
         } else {
-            // ── Fragmented ──────────────────────────────────────────────
+            // ── Fragmented (also one fragment of one: parity refers to fragments)
             let maxDataPerFragment = ProtocolConstants.maxFragmentPayload
             let fragmentCount = (frame.count + maxDataPerFragment - 1) / maxDataPerFragment
 
@@ -886,18 +903,43 @@ final class StreamSender: ObservableObject {
                 var payload = Data(capacity: 8 + end - offset)
                 payload.append(fragHeader.serialize())
                 payload.append(frame[offset..<end])
-                let packet = encryptedPacket(type: .videoFragment, flags: flags, timestamp: timestamp,
-                                             payload: payload, session: session)
-                udp.send(content: packet, completion: .contentProcessed { _ in })
-                packets += 1
-                bytes += packet.count
+                datagrams.append(encryptedPacket(type: .videoFragment, flags: flags, timestamp: timestamp,
+                                                 payload: payload, session: session))
+            }
+
+            // ── Parity after the data: rebuilds a lost fragment per group ──
+            if sendParity {
+                let groups = FrameParity.groupCount(fragments: fragmentCount)
+                for group in 0..<groups {
+                    var header = ParityHeader()
+                    header.frameSequence = frameSeq
+                    header.fragmentTotal = UInt16(fragmentCount)
+                    header.groupIndex = UInt16(group)
+                    header.groupCount = UInt16(groups)
+                    header.frameBytes = UInt32(frame.count)
+                    var payload = header.serialize()
+                    payload.append(FrameParity.parity(of: frame, fragmentSize: maxDataPerFragment,
+                                                      group: group, groups: groups))
+                    datagrams.append(encryptedPacket(type: .videoParity, flags: flags, timestamp: timestamp,
+                                                     payload: payload, session: session))
+                }
+                parityPackets = groups
             }
         }
+
+        if pacePackets && datagrams.count > PacingPlan.burst {
+            pacer.send(datagrams, over: udp)
+        } else {
+            for packet in datagrams { udp.send(content: packet, completion: .contentProcessed { _ in }) }
+        }
+        let packets = datagrams.count
+        let bytes = datagrams.reduce(0) { $0 + $1.count }
 
         let sendLatencyMs = prefix.sendUs >= timing.encodeEndUs
             ? Double(prefix.sendUs - timing.encodeEndUs) / 1000 : 0
         countersLock.lock()
         counters.packetsSent += UInt64(packets)
+        counters.parityPacketsSent += UInt64(parityPackets)
         counters.bytesSent += UInt64(bytes)
         counters.framesSent += 1
         sendRate.record(at: CACurrentMediaTime(), bytes: bytes)
@@ -932,6 +974,7 @@ final class StreamSender: ObservableObject {
         var snapshot = counters
         snapshot.sendMbps = sendRate.megabitsPerSecond(now: CACurrentMediaTime())
         snapshot.sendLatency = sendLatencies.summary()
+        snapshot.pacingSpreadUs = pacer.averageSpreadUs()
         return snapshot
     }
 
@@ -949,6 +992,11 @@ final class StreamSender: ObservableObject {
             guard let self = self, self.isAuthenticated, self.udpConnection != nil else { return }
             self.sendControlMessage(type: .senderStats, payload: stats.serialize())
         }
+    }
+
+    /// Diagnostics: runs `probe` on the network queue (tests: is it responsive?)
+    func probeNetworkQueue(_ probe: @escaping () -> Void) {
+        networkQueue.async(execute: probe)
     }
 
     // ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────

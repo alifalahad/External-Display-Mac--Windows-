@@ -141,8 +141,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     private let statsTracker = CaptureStatsTracker()
 
-    /// Adaptive quality controller — adjusts bitrate based on receiver feedback
-    private var qualityController: AdaptiveQualityController?
+    /// Adaptive bitrate: the receiver's delay feedback, or loss/RTT tiers for
+    /// older receivers (docs/SMOOTHNESS.md, step 6)
+    private var bitrateGovernor: BitrateGovernor?
 
     /// Input injector — forwards mouse/keyboard from Windows to Mac
     private var inputInjector: InputInjector?
@@ -196,22 +197,18 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             sender.streamFPS = UInt32(preset.fps)
             sender.streamBitrate = UInt32(preset.startBitrateBps)
 
-            // Set up adaptive quality controller (within the preset's bounds)
-            let controller = AdaptiveQualityController(preset: preset)
-            controller.onBitrateChange = { [weak enc] newBps in
+            // Adaptive bitrate (within the preset's bounds): reports from the receiver → governor
+            let governor = BitrateGovernor(preset: preset)
+            governor.onBitrateChange = { [weak enc] newBps in
                 enc?.updateBitrate(newBps)
             }
-            qualityController = controller
-
-            // Wire up quality reports from receiver → controller
-            sender.onQualityReport = { [weak controller] report in
-                controller?.processReport(
-                    packetLossPercent100: report.packetLossPercent,
-                    rttMs: report.rttMs,
-                    framesDropped: report.framesDropped,
-                    queueDepth: report.queueDepth
-                )
+            governor.encoderOutputBps = { [weak enc] in
+                Int((enc?.currentStats().outputBitrateMbps ?? 0) * 1_000_000)
             }
+            governor.sentBps = { [weak self] in Int((self?.sender.statsSnapshot().sendMbps ?? 0) * 1_000_000) }
+            bitrateGovernor = governor
+            sender.onQualityReport = { [weak governor] report in governor?.onQualityReport(report) }
+            sender.onRateFeedback = { [weak governor] feedback in governor?.onRateFeedback(feedback) }
 
             // Set up input injector
             let injector = InputInjector()
@@ -281,7 +278,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             self?.lastPixelBuffer = nil
             self?.lastEncodedPTS = .invalid
         }
-        qualityController = nil
+        bitrateGovernor = nil
+        sender.onRateFeedback = nil
         inputInjector = nil
         clipboardSync?.stop()
         clipboardSync = nil
@@ -499,7 +497,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             .sink { [weak self] newState in
                 switch newState {
                 case .connected:
-                    // Peer connected — begin streaming
+                    // Peer connected — begin streaming, from the preset's start bitrate
+                    self?.bitrateGovernor?.reset()
                     self?.sender.startStreaming()
                 case .streaming:
                     break
@@ -549,7 +548,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     private func applyQualityPreset() {
         let preset = qualityPreset
         Log.info(.quality, "Quality preset: \(preset.rawValue) (\(preset.summary))")
-        qualityController?.apply(preset)
+        bitrateGovernor?.apply(preset)
         encoder?.updateFrameRate(preset.fps)
         sender.streamFPS = UInt32(preset.fps)
         updateStreamConfiguration(what: "the frame rate")
@@ -686,6 +685,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         payload.encoderKbps = UInt32(max(encStats.outputBitrateMbps, 0) * 1000)
         payload.targetKbps = UInt32(max(encStats.targetBitrateMbps, 0) * 1000)
         payload.flags = encStats.isHardwareAccelerated ? SenderStatsPayload.flagHardwareEncoder : 0
+        payload.pacingSpreadUs = UInt32(max(networkStats.pacingSpreadUs, 0))
         sender.sendSenderStats(payload)
     }
 

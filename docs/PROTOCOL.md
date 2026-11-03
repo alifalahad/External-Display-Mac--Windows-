@@ -43,14 +43,16 @@ Integers are **little-endian**, except the two security fields marked *big-endia
 | 0x20 / 0x21 | PING / PONG | both | PONG: the PING's timestamp (u64), so the PC can sync clocks | after auth |
 | 0x30 | KEYFRAME_REQ | PC → Mac | — (the Mac makes keyframes only when asked, plus one a minute) | yes |
 | 0x50 | QUALITY_REPORT | PC → Mac | loss ×100, RTT ms, frames dropped, queue depth, latency µs (u32 each) | yes |
-| 0x51 | SENDER_STATS | Mac → PC | capture FPS ×100, encode FPS ×100, CPU % ×100, RAM MB, encoder kbps, target kbps, flags, reserved | yes |
+| 0x51 | SENDER_STATS | Mac → PC | capture FPS ×100, encode FPS ×100, CPU % ×100, RAM MB, encoder kbps, target kbps, flags, pacing spread µs (0: not paced) | yes |
+| 0x52 | RATE_FEEDBACK | PC → Mac | 16 bytes every 100 ms while streaming: how long packets wait on the way (below) | yes |
 | 0x60 | INPUT_EVENT | PC → Mac | 24 bytes: type, button, key code, modifiers, x, y, scroll x, scroll y (x, y are 0…1 across the video) | yes |
 | 0x70 | CLIPBOARD | both | UTF-8 text (≤ 1 MB) | yes |
-| 0x90 | RECEIVER_CAPS | PC → Mac | 8 bytes: flags u32 (bit 0: the PC draws the pointer), reserved u32. Sent after PAIR_ACCEPT and whenever it changes (F4) | yes |
+| 0x90 | RECEIVER_CAPS | PC → Mac | 8 bytes: flags u32 (bit 0: the PC draws the pointer; bit 1: send VIDEO_PARITY; bit 2: pace datagrams), reserved u32. Sent after PAIR_ACCEPT and whenever it changes (F4) | yes |
 | 0x91 | CURSOR_SHAPE | Mac → PC | pointer image, when it changes (below) | yes |
 | 0x92 | CURSOR_POSITION | Mac → PC | 12 bytes: x, y (f32, 0…1 across the video), flags u32 (bit 0: visible) | yes |
 | 0x40 | VIDEO_FRAME | Mac → PC (UDP) | one encrypted datagram: the whole frame | yes |
 | 0x41 | VIDEO_FRAGMENT | Mac → PC (UDP) | encrypted: fragment header (frame no. u32, index u16, total u16) + data | yes |
+| 0x42 | VIDEO_PARITY | Mac → PC (UDP) | encrypted: parity header (below) + XOR of a group of fragments. Only when asked for (RECEIVER_CAPS bit 1) | yes |
 | 0xFF | DISCONNECT | both | — | after auth |
 
 Before authentication the Mac accepts only HELLO, KEY_REVEAL, PAIR_CONFIRM, PING, PONG and
@@ -74,6 +76,52 @@ already in flight.
 | 0 | 1 | mode: 0 = new pairing, 1 = paired |
 | 1 | 7 | reserved |
 | 8 | 65 | Mac's ephemeral P-256 public key, X9.63 uncompressed (`04 | X | Y`) |
+
+### Loss repair (VIDEO_PARITY)
+
+With parity asked for, every frame is sent as fragments (one fragment of one for small frames),
+then *P* parity datagrams (*P* = ⌈fragments / 10⌉, 1–32). Parity *j* is the XOR of fragments *j*,
+*j+P*, *j+2P*…, each zero-padded to the longest. The receiver rebuilds a group that lost exactly
+one fragment.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | frame number |
+| 4 | 2 | fragments in the frame |
+| 6 | 2 | group index *j* |
+| 8 | 2 | group count *P* |
+| 10 | 2 | reserved |
+| 12 | 4 | frame bytes (gives the last fragment's length) |
+| 16 | ≤ 1,340 | XOR of the group's fragments |
+
+A parity datagram is up to 1,408 bytes (fragments up to 1,400), still well below the 1,472 bytes
+of a 1,500-byte MTU. With pacing asked for (bit 2), the Mac sends a frame's datagrams in bursts of
+8, at most 250 µs apart, and within about 1 ms.
+
+### Bitrate that follows the delay (RATE_FEEDBACK)
+
+The PC measures each frame's one-way delay: the arrival of its first packet (PC clock) minus the
+header timestamp (Mac clock, µs since the stream started). The two clocks differ by a constant, so
+only changes count. The **queuing delay** is the one-way delay minus its minimum over the last
+10 s: the time packets spent waiting in a queue on the way.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | queuing delay, µs: the median of the last 100 ms |
+| 4 | 4 | kbps that arrived in the last 500 ms (fragments and parity) |
+| 8 | 2 | packets lost in the last 500 ms, % ×100 |
+| 10 | 1 | state: 0 normal (under 5 ms: the bitrate may rise) · 1 hold · 2 overuse (over 15 ms and not falling: lower it now) |
+| 11 | 1 | frames behind the median (0: nothing arrived, no information) |
+| 12 | 4 | link kbps: what arrived in the last 100 ms if no frame in that time got through without waiting 5 ms or more. The link was full, so this is what it can carry. 0 when the queue emptied |
+
+What arrived over 500 ms is the link's capacity only when the link was full. Otherwise it is just
+what the encoder produced. So the Mac cuts only on overuse with a link figure. A queue that
+empties again within 100 ms (a keyframe's burst) is no reason to lower the bitrate.
+
+The PC sends it without asking first: an older Mac ignores the type. From the first RATE_FEEDBACK
+of a connection, the Mac sets the bitrate from it instead of from the loss/RTT tiers of
+QUALITY_REPORT ([SMOOTHNESS.md](SMOOTHNESS.md), step 6). `--adapt=tiers` on the PC stops sending
+it.
 
 ### Pointer drawn by the PC (CURSOR_SHAPE, CURSOR_POSITION)
 

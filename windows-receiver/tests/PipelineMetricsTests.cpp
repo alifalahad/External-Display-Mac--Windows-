@@ -312,6 +312,9 @@ static void TestBenchmarkRecorder() {
     m.keyframesLastInterval = 1;
     m.keyframeRequestsLastInterval = 1;
     m.framesHeldLastInterval = 2;
+    m.fragmentsRebuiltLastInterval = 3;       // step 5
+    m.queuingDelayMs = 12.5;                  // step 6
+    m.rateState = 2;
     SystemSample sys;
     sys.valid = true;
     sys.cpuPercent = 3;
@@ -328,13 +331,17 @@ static void TestBenchmarkRecorder() {
     CHECK(summary.find("Frames displayed: 120") != std::string::npos);
     CHECK(summary.find("Keyframes  2 (60.0 per minute)   asked for 2   frames held waiting for one 4")
           != std::string::npos);
+    CHECK(summary.find("Repair     6 lost packets rebuilt from parity") != std::string::npos);
+    CHECK(summary.find("Net wait   12.5 ms queued on the way avg (12.5 max); overuse in 2 of 2 seconds") != std::string::npos);
     {
         std::ifstream sec(base + "-seconds.csv");
         std::string header, row;
         std::getline(sec, header);
         std::getline(sec, row);
-        CHECK(header.find(",keyframes,keyframe_requests,frames_held") != std::string::npos);
-        CHECK(row.size() > 6 && row.compare(row.size() - 6, 6, ",1,1,2") == 0);
+        CHECK(header.find(",keyframes,keyframe_requests,frames_held,packets_rebuilt,queuing_delay_ms,rate_state")
+              != std::string::npos);
+        const std::string tail = ",1,1,2,3,12.50,overuse";
+        CHECK(row.size() > tail.size() && row.compare(row.size() - tail.size(), tail.size(), tail) == 0);
     }
     std::ifstream written(base + "-summary.txt");
     std::stringstream ss;
@@ -364,6 +371,8 @@ static void TestOverlayText() {
     in.metrics.framesHeld = 5;
     std::wstring text = FormatDiagnostics(in);
     CHECK(text.find(L"Keyframe 3  (asked 2)  held 5 frames") != std::wstring::npos);
+    in.metrics.queuingDelayMs = 3.2;
+    CHECK(FormatDiagnostics(in).find(L"Net wait 3.2 ms queued on the way (normal)") != std::wstring::npos);
     CHECK(text.find(L"capture 59.9") != std::wstring::npos);
     CHECK(text.find(L"RTT 3.2 ms") != std::wstring::npos);
     CHECK(text.find(L"27.5") != std::wstring::npos);

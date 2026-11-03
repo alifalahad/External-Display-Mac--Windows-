@@ -480,6 +480,9 @@ bool StreamReceiver::udpBind() {
 }
 
 void StreamReceiver::udpReceiveLoop() {
+    // Packets are timed when read: a late read adds latency and looks like a
+    // queue on the way (step 6), so this thread goes first. It mostly waits.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     try {
         std::vector<uint8_t> buffer(65536);
         std::vector<uint8_t> plaintext;
@@ -499,47 +502,39 @@ void StreamReceiver::udpReceiveLoop() {
             m_prevPacketsLost = m_stats.packetsLost;
         }
 
+        m_linkSimulator.reset();
+        std::vector<uint8_t> leftLink;
         while (m_running.load()) {
-            sockaddr_in from{};
-            int fromLen = sizeof(from);
-            int n = recvfrom(s, (char*)buffer.data(), (int)buffer.size(), 0,
-                             (sockaddr*)&from, &fromLen);
-            const int64_t rxUs = PipelineClock::NowUs();
+            // --simulate-link: wait for the next datagram only until the next held
+            // packet leaves the simulated link (then the select timer's precision;
+            // the packet keeps its exact exit time as its arrival time)
+            bool readable = true;
+            if (m_linkSimulator.nextExitUs() != INT64_MAX) {
+                const int64_t dueUs = m_linkSimulator.nextExitUs() - PipelineClock::NowUs();
+                readable = WaitReadable(s, static_cast<int>(std::clamp<int64_t>((dueUs + 999) / 1000, 0, 100))) != 0;
+            }
+            if (readable) {
+                sockaddr_in from{};
+                int fromLen = sizeof(from);
+                int n = recvfrom(s, (char*)buffer.data(), (int)buffer.size(), 0,
+                                 (sockaddr*)&from, &fromLen);
+                const int64_t rxUs = PipelineClock::NowUs();
 
-            if (n == SOCKET_ERROR) {
-                int err = WSAGetLastError();
-                if (err != WSAETIMEDOUT && err != WSAECONNRESET) break;  // socket closed
-            } else if (n >= exdp::HEADER_SIZE) {
-                exdp::ProtocolHeader header;
-                auto session = std::atomic_load(&m_session);
-                if (!exdp::parseHeader(buffer.data(), n, header)) {
-                    // not ours
-                } else if (!session || !(header.flags & exdp::FLAG_ENCRYPTED) ||
-                           header.version != exdp::PROTOCOL_VERSION) {
-                    LOG_EVERY_MS(5000, LogLevel::Warning, "Net") << "Dropping unauthenticated UDP packet";
-                } else if (!session->openVideo(buffer.data(), (size_t)n, exdp::HEADER_SIZE, plaintext)) {
-                    // Forged, corrupted or replayed: never reaches the decoder
-                    LOG_EVERY_MS(5000, LogLevel::Warning, "Net")
-                        << "Video packet failed authentication or was replayed ("
-                        << session->videoRejected() << " so far)";
-                } else {
-                    {
-                        std::lock_guard<std::mutex> lock(m_statsMutex);
-                        m_stats.bytesReceived += n;
-                        m_stats.packetsReceived++;
-                    }
-                    trackUdpSequence(header.sequence);
-
-                    auto type = static_cast<exdp::MessageType>(header.type);
-                    const uint8_t* payload = plaintext.data();
-                    size_t payloadLen = plaintext.size();
-
-                    if (type == exdp::MessageType::VideoFrame) {
-                        handleVideoFrame(header, payload, payloadLen, rxUs);
-                    } else if (type == exdp::MessageType::VideoFragment) {
-                        handleVideoFragment(header, payload, payloadLen, rxUs);
-                    }
+                if (n == SOCKET_ERROR) {
+                    int err = WSAGetLastError();
+                    if (err != WSAETIMEDOUT && err != WSAECONNRESET) break;  // socket closed
+                } else if (n >= exdp::HEADER_SIZE && m_lossSimulator.drop()) {
+                    // --simulate-loss: as if the network had lost it
+                } else if (n >= exdp::HEADER_SIZE && m_linkSimulator.active()) {
+                    // --simulate-link: into the narrow link's queue (dropped if it is full)
+                    m_linkSimulator.hold(rxUs, buffer.data(), static_cast<size_t>(n));
+                } else if (n >= exdp::HEADER_SIZE) {
+                    handleDatagram(buffer.data(), static_cast<size_t>(n), rxUs, plaintext);
                 }
+            }
+            int64_t exitUs = 0;
+            while (m_linkSimulator.release(PipelineClock::NowUs(), leftLink, exitUs)) {
+                handleDatagram(leftLink.data(), leftLink.size(), exitUs, plaintext);
             }
 
             // Periodic quality report and clock sync (also while the screen is static)
@@ -550,6 +545,7 @@ void StreamReceiver::udpReceiveLoop() {
                     sendQualityReport();
                     m_lastQualityReport = now;
                 }
+                sendRateFeedback();
                 if (m_pingBurst.exchange(false)) {
                     m_fastPingsLeft = CLOCK_PING_BURST;
                     m_nextPing = now;
@@ -567,6 +563,44 @@ void StreamReceiver::udpReceiveLoop() {
     }
 
     LOG_DEBUG("Net") << "UDP receive loop exiting";
+}
+
+void StreamReceiver::handleDatagram(const uint8_t* data, size_t n, int64_t rxUs, std::vector<uint8_t>& plaintext) {
+    exdp::ProtocolHeader header;
+    auto session = std::atomic_load(&m_session);
+    if (!exdp::parseHeader(data, n, header)) {
+        // not ours
+    } else if (!session || !(header.flags & exdp::FLAG_ENCRYPTED) ||
+               header.version != exdp::PROTOCOL_VERSION) {
+        LOG_EVERY_MS(5000, LogLevel::Warning, "Net") << "Dropping unauthenticated UDP packet";
+    } else if (!session->openVideo(data, n, exdp::HEADER_SIZE, plaintext)) {
+        // Forged, corrupted or replayed: never reaches the decoder
+        LOG_EVERY_MS(5000, LogLevel::Warning, "Net")
+            << "Video packet failed authentication or was replayed ("
+            << session->videoRejected() << " so far)";
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(m_statsMutex);
+            m_stats.bytesReceived += n;
+            m_stats.packetsReceived++;
+        }
+        trackUdpSequence(header.sequence);
+        // Step 6: every video packet carries its frame's Mac send time
+        if (m_delayReset.exchange(false)) m_delayMonitor.reset();
+        m_delayMonitor.onPacket(header.timestamp, rxUs, n);
+
+        auto type = static_cast<exdp::MessageType>(header.type);
+        const uint8_t* payload = plaintext.data();
+        size_t payloadLen = plaintext.size();
+
+        if (type == exdp::MessageType::VideoFrame) {
+            handleVideoFrame(header, payload, payloadLen, rxUs);
+        } else if (type == exdp::MessageType::VideoFragment) {
+            handleVideoFragment(header, payload, payloadLen, rxUs);
+        } else if (type == exdp::MessageType::VideoParity) {
+            handleVideoParity(header, payload, payloadLen, rxUs);
+        }
+    }
 }
 
 void StreamReceiver::trackUdpSequence(uint32_t sequence) {
@@ -587,8 +621,10 @@ void StreamReceiver::trackUdpSequence(uint32_t sequence) {
             m_stats.packetsLost += (uint64_t)gap;
         }
         m_expectedUdpSequence = sequence + 1;
-        // Later P-frames reference the lost data — refresh with a keyframe
-        requestKeyframeAfterLoss();
+        // Later P-frames reference the lost data — refresh with a keyframe.
+        // With parity the lost packet is usually rebuilt: the KeyframeGate
+        // asks only if a frame really goes missing.
+        if (!m_parityActive.load()) requestKeyframeAfterLoss();
     } else if (gap < 0 && gap > -1000) {
         // Late / reordered packet — already counted as lost, nothing to do
     } else {
@@ -603,6 +639,34 @@ void StreamReceiver::requestKeyframeAfterLoss() {
         std::chrono::milliseconds(KEYFRAME_REQUEST_INTERVAL_MS)) return;
     m_lastLossKeyframeRequest = now;
     requestKeyframe();
+}
+
+void StreamReceiver::sendRateFeedback() {
+    // UDP thread, every 100 ms while streaming (DelayMonitor.h)
+    uint64_t received, lost;
+    {
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        received = m_stats.packetsReceived;
+        lost = m_stats.packetsLost;
+    }
+    RateReport r;
+    if (!m_delayMonitor.report(PipelineClock::NowUs(), received, lost, r)) return;
+    {
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        if (r.samples) {
+            m_stats.queuingDelayUs = r.queuingDelayUs;
+            m_stats.rateState = r.state;
+        }
+    }
+    if (!m_rateFeedback.load() || !isSecure()) return;
+    exdp::RateFeedbackPayload p;
+    p.queuingDelayUs = r.queuingDelayUs;
+    p.receivedKbps = r.receivedKbps;
+    p.lossPercent100 = r.lossPercent100;
+    p.state = static_cast<uint8_t>(r.state);
+    p.samples = r.samples;
+    p.linkKbps = r.linkKbps;
+    tcpSendMessage(exdp::MessageType::RateFeedback, &p, sizeof(p));
 }
 
 void StreamReceiver::requestKeyframe() {
@@ -631,6 +695,9 @@ void StreamReceiver::handleStartStream(const std::vector<uint8_t>& payload) {
 
     m_udpSequenceReset.store(true);
     m_frameSeqReset.store(true);     // the Mac restarts its frame numbering
+    m_assemblerReset.store(true);
+    m_parityActive.store(false);     // until this stream's first parity packet
+    m_delayReset.store(true);        // the Mac's packet timestamps restart at 0
     m_pingBurst.store(true);         // a few quick pings so latency is known within ~1 s
     m_reconnectAttempts = 0;  // fully recovered — reset backoff
     m_state.store(State::Streaming);
@@ -659,69 +726,75 @@ void StreamReceiver::handleVideoFrame(const exdp::ProtocolHeader& header,
 void StreamReceiver::handleVideoFragment(const exdp::ProtocolHeader& header,
                                           const uint8_t* data, size_t dataLen, int64_t rxUs) {
     if (dataLen < sizeof(exdp::FragmentHeader)) return;
-
     exdp::FragmentHeader fragHeader;
     memcpy(&fragHeader, data, sizeof(fragHeader));
 
-    // Reject nonsensical fragment headers instead of building huge frames
-    if (fragHeader.fragmentTotal == 0 || fragHeader.fragmentTotal > MAX_FRAGMENTS ||
-        fragHeader.fragmentIndex >= fragHeader.fragmentTotal) {
-        return;
-    }
-
-    const uint8_t* fragData = data + sizeof(exdp::FragmentHeader);
-    size_t fragDataLen = dataLen - sizeof(exdp::FragmentHeader);
-    bool isKeyframe = (header.flags & exdp::FLAG_KEYFRAME) != 0;
-
-    std::vector<uint8_t> fullFrame;
-    bool complete = false;
-    bool keyframe = false;
-    bool hasTiming = false;
-    int64_t firstPacketUs = rxUs;
+    const FrameAssembler::PacketInfo info{ (header.flags & exdp::FLAG_KEYFRAME) != 0,
+                                           (header.flags & exdp::FLAG_TIMING) != 0, rxUs };
+    AssembledFrame frame;
+    bool complete;
+    size_t lost;
+    uint64_t parity, rebuiltFragments, rebuiltFrames;
     {
         std::lock_guard<std::mutex> lock(m_fragmentMutex);
-
-        auto& frame = m_pendingFrames[fragHeader.frameSequence];
-        if (frame.totalFragments == 0) {
-            frame.totalFragments = fragHeader.fragmentTotal;
-            frame.isKeyframe = isKeyframe;
-            frame.hasTiming = (header.flags & exdp::FLAG_TIMING) != 0;
-            frame.firstPacketUs = rxUs;
-        } else if (frame.totalFragments != fragHeader.fragmentTotal) {
-            return;  // inconsistent with earlier fragments
-        }
-
-        bool inserted = frame.fragments.emplace(
-            fragHeader.fragmentIndex,
-            std::vector<uint8_t>(fragData, fragData + fragDataLen)).second;
-        if (!inserted) return;  // duplicate datagram
-        frame.receivedCount++;
-
-        {
-            std::lock_guard<std::mutex> slock(m_statsMutex);
-            m_stats.fragmentsReceived++;
-        }
-
-        if (frame.receivedCount == frame.totalFragments) {
-            // Every index 0..total-1 is present (indices are unique and < total)
-            size_t totalSize = 0;
-            for (auto& [idx, bytes] : frame.fragments) totalSize += bytes.size();
-            fullFrame.reserve(totalSize);
-            for (auto& [idx, bytes] : frame.fragments) {
-                fullFrame.insert(fullFrame.end(), bytes.begin(), bytes.end());
-            }
-            keyframe = frame.isKeyframe;
-            hasTiming = frame.hasTiming;
-            firstPacketUs = frame.firstPacketUs;
-            complete = true;
-            m_pendingFrames.erase(fragHeader.frameSequence);
-        }
-
-        cleanupOldFrames(fragHeader.frameSequence);
+        if (m_assemblerReset.exchange(false)) m_assembler.reset();
+        // The assembler rejects nonsensical headers instead of building huge frames
+        complete = m_assembler.addFragment(fragHeader.frameSequence, fragHeader.fragmentIndex,
+                                           fragHeader.fragmentTotal, data + sizeof(fragHeader),
+                                           dataLen - sizeof(fragHeader), info, frame);
+        lost = m_assembler.dropOld();
+        parity = m_assembler.parityPackets();
+        rebuiltFragments = m_assembler.fragmentsRebuilt();
+        rebuiltFrames = m_assembler.framesRebuilt();
     }
+    {
+        std::lock_guard<std::mutex> slock(m_statsMutex);
+        m_stats.fragmentsReceived++;
+    }
+    afterAssembly(complete, frame, lost, parity, rebuiltFragments, rebuiltFrames, rxUs);
+}
 
-    // Deliver outside the fragment lock
-    if (complete) deliverFrame(fullFrame, keyframe, hasTiming, firstPacketUs, rxUs);
+void StreamReceiver::handleVideoParity(const exdp::ProtocolHeader& header,
+                                       const uint8_t* data, size_t dataLen, int64_t rxUs) {
+    if (dataLen < sizeof(exdp::ParityHeader)) return;
+    exdp::ParityHeader parityHeader;
+    memcpy(&parityHeader, data, sizeof(parityHeader));
+    m_parityActive.store(true);
+
+    const FrameAssembler::PacketInfo info{ (header.flags & exdp::FLAG_KEYFRAME) != 0,
+                                           (header.flags & exdp::FLAG_TIMING) != 0, rxUs };
+    AssembledFrame frame;
+    bool complete;
+    size_t lost;
+    uint64_t parity, rebuiltFragments, rebuiltFrames;
+    {
+        std::lock_guard<std::mutex> lock(m_fragmentMutex);
+        if (m_assemblerReset.exchange(false)) m_assembler.reset();
+        complete = m_assembler.addParity(parityHeader.frameSequence, parityHeader.fragmentTotal,
+                                         parityHeader.groupIndex, parityHeader.groupCount,
+                                         parityHeader.frameBytes, data + sizeof(parityHeader),
+                                         dataLen - sizeof(parityHeader), info, frame);
+        lost = m_assembler.dropOld();
+        parity = m_assembler.parityPackets();
+        rebuiltFragments = m_assembler.fragmentsRebuilt();
+        rebuiltFrames = m_assembler.framesRebuilt();
+    }
+    afterAssembly(complete, frame, lost, parity, rebuiltFragments, rebuiltFrames, rxUs);
+}
+
+void StreamReceiver::afterAssembly(bool complete, AssembledFrame& frame, size_t framesLost,
+                                   uint64_t parityPackets, uint64_t fragmentsRebuilt,
+                                   uint64_t framesRebuilt, int64_t rxUs) {
+    {
+        std::lock_guard<std::mutex> lock(m_statsMutex);
+        m_stats.framesDropped += framesLost;
+        m_stats.parityPackets = parityPackets;
+        m_stats.fragmentsRebuilt = fragmentsRebuilt;
+        m_stats.framesRebuilt = framesRebuilt;
+    }
+    // Late safety net: the KeyframeGate has usually asked already
+    if (framesLost) requestKeyframeAfterLoss();
+    if (complete) deliverFrame(frame.data, frame.keyframe, frame.hasTiming, frame.firstPacketUs, rxUs);
 }
 
 void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool isKeyframe,
@@ -785,27 +858,6 @@ void StreamReceiver::deliverFrame(const std::vector<uint8_t>& frameData, bool is
     }
 }
 
-void StreamReceiver::cleanupOldFrames(uint32_t currentFrameSeq) {
-    // Called with m_fragmentMutex held.
-    bool dropped = false;
-    for (auto it = m_pendingFrames.begin(); it != m_pendingFrames.end(); ) {
-        int32_t age = (int32_t)(currentFrameSeq - it->first);
-        if (age > 10) {
-            // Too old and still missing fragments — it will never complete
-            it = m_pendingFrames.erase(it);
-            dropped = true;
-            std::lock_guard<std::mutex> lock(m_statsMutex);
-            m_stats.framesDropped++;
-        } else if (age < -1000) {
-            // Left over from before the sender restarted its frame numbering
-            it = m_pendingFrames.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    if (dropped) requestKeyframeAfterLoss();
-}
-
 // ── Quality Reporting ───────────────────────────────────────────────────────
 
 void StreamReceiver::sendQualityReport() {
@@ -823,7 +875,7 @@ void StreamReceiver::sendQualityReport() {
     uint32_t queueDepth = 0;
     {
         std::lock_guard<std::mutex> lock(m_fragmentMutex);
-        queueDepth = (uint32_t)m_pendingFrames.size();
+        queueDepth = (uint32_t)m_assembler.incomplete();
     }
 
     ClockSync::Estimate sync = m_clockSync.estimate();
@@ -873,6 +925,7 @@ void StreamReceiver::handleSenderStats(const std::vector<uint8_t>& payload) {
     s.encoderMbps = p.encoderKbps / 1000.0;
     s.targetMbps = p.targetKbps / 1000.0;
     s.hardwareEncoder = (p.flags & exdp::SENDER_HW_ENCODER) != 0;
+    s.pacingSpreadUs = p.pacingSpreadUs;
 
     std::lock_guard<std::mutex> lock(m_senderMutex);
     m_senderSample = s;

@@ -16,7 +16,8 @@ StreamSender            packetize · AES-GCM · UDP ────────▶ 
 InputInjector     ◀── input events ───────────────────── InputCapture     window messages → normalized 0…1
 ClipboardSync     ◀── clipboard text ─────────────────▶  ClipboardSync    clipboard listener window
 PairingManager    keys at rest (0600 file)               PairingManager   keys at rest (DPAPI)
-AdaptiveQuality   bitrate within the QualityPreset ◀──── quality reports (loss, RTT, latency)
+BitrateGovernor   bitrate follows the delay ◀─────────── DelayMonitor     queuing delay (RATE_FEEDBACK, 100 ms)
+                  (loss/RTT tiers for older PCs) ◀────── quality reports (loss, RTT, latency)
                                                          H264Decoder      Media Foundation, D3D11 (DXVA)
                                                                 │ NV12 texture (GPU → GPU copy)
                                                          D3D11Renderer    NV12→RGB shader, letterbox,
@@ -32,8 +33,8 @@ AdaptiveQuality   bitrate within the QualityPreset ◀──── quality repor
 |---|---|
 | `Capture/` | `ScreenCaptureEngine`: capture, encoder wiring, preview, quality presets, recovery, diagnostics tick |
 | `Display/` | `VirtualDisplayManager`: creates and removes the virtual monitor |
-| `Encoder/` | `VideoEncoder` (VideoToolbox), `H264Converter`, `AdaptiveQuality`, `QualityPreset`, `EncoderConfig` |
-| `Network/` | `Protocol` (wire format), `StreamSender` (listener, handshake, encryption, video packets) |
+| `Encoder/` | `VideoEncoder` (VideoToolbox), `H264Converter`, `DelayRateController` and `BitrateGovernor` (bitrate from the PC's delay reports), `AdaptiveQuality` (loss/RTT tiers), `QualityPreset`, `EncoderConfig` |
+| `Network/` | `Protocol` (wire format), `StreamSender` (listener, handshake, encryption, video packets), `FrameParity` (parity packets, pacing) |
 | `Security/` | `SecureChannel` (key agreement, AES-GCM), `PairingManager` (pairings, approval) |
 | `Input/`, `Clipboard/` | Injecting Windows input with CGEvent; pasteboard sync |
 | `Performance/` | Clock, rolling statistics, process CPU and memory |
@@ -44,7 +45,7 @@ AdaptiveQuality   bitrate within the QualityPreset ◀──── quality repor
 | Folder | Responsibility |
 |---|---|
 | `App/` | `ReceiverApp` (main loop, phases), `MacFinder`, `Options`, `StatusText`, `Window`, `Log`, `CrashHandler` |
-| `Network/` | `Protocol.h`, `StreamReceiver` (TCP/UDP, handshake, decryption, reassembly, clock sync) |
+| `Network/` | `Protocol.h`, `StreamReceiver` (TCP/UDP, handshake, decryption, clock sync), `FrameAssembler` (reassembly, parity repair), `DelayMonitor` (queuing delay on the way), `NetworkSimulator` (test loss and narrow links) |
 | `Security/` | `Crypto` (CNG wrappers, DPAPI), `SecureChannel` (key schedule, session ciphers), `ReplayWindow`, `PairingManager` |
 | `Decoder/` | `H264Decoder` (Media Foundation; D3D11 hardware or software) |
 | `Renderer/` | `D3D11Renderer` (swap chain, NV12 shader, status card, overlay, frame statistics) |
@@ -62,7 +63,7 @@ matters more than a complete history.
 | Mac | VideoToolbox callback | AVCC → Annex B | encoder's own (real-time mode) |
 | Mac | `networkQueue` (serial) | packetize, encrypt, send; control messages; handshake | sends immediately, no app queue |
 | Mac | main | SwiftUI, 1 Hz diagnostics, clipboard poll | — |
-| Windows | UDP thread | receive, authenticate, de-duplicate, reassemble | incomplete frames dropped 10 frames later |
+| Windows | UDP thread | receive, authenticate, de-duplicate, reassemble; measure the queuing delay, send RATE_FEEDBACK every 100 ms | incomplete frames dropped 10 frames later |
 | Windows | network thread | TCP control, handshake, reconnection | — |
 | Windows | UI thread | messages, decode, render, metrics | input queue 4 frames (trimmed to the newest keyframe); newest decoded picture wins; 1 frame in the swap chain |
 | Windows | SystemMonitor thread | CPU / RAM / GPU counters, 1 Hz | — |
@@ -81,10 +82,13 @@ It renders only when the picture, the overlay or the status card changed.
    on screen.
 2. **Encode:** VideoToolbox H.264 in hardware, *low-latency rate control*, Constrained High, no
    B-frames. Keyframes only on request, plus one a minute as a safety net
-   ([SMOOTHNESS.md](SMOOTHNESS.md), step 2).
+   ([SMOOTHNESS.md](SMOOTHNESS.md), step 2). The bitrate follows the PC's reports of how long
+   packets wait on the way (step 6).
 3. **Send:** Annex B plus a 40-byte timing prefix. The frame is cut into fragments of up to
-   1,340 bytes, and each datagram is encrypted with AES-256-GCM.
-4. **Receive:** authenticate, check for replays, reassemble, then queue for decoding.
+   1,340 bytes, plus about one parity packet per 10 fragments. Each datagram is encrypted with
+   AES-256-GCM. A frame's datagrams leave paced, in bursts of 8 over about 1 ms.
+4. **Receive:** authenticate, check for replays, reassemble, rebuilding a lost fragment from
+   parity (`FrameAssembler`), then queue for decoding.
 5. **Decode:** the Media Foundation H.264 decoder on the renderer's D3D11 device (DXVA).
    Pictures stay in GPU memory and are copied GPU→GPU into the texture the shader samples.
    In front of it, the keyframe gate holds frames that follow a missing one until a keyframe

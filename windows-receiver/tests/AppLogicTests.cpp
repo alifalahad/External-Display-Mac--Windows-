@@ -51,6 +51,24 @@ static void TestOptions() {
     CHECK(!ParseOptions("").presentImmediately);
     CHECK(ParseOptions("--present=immediate").presentImmediately);
     CHECK(!ParseOptions("--present=immediate --present=vsync").presentImmediately);
+    // Loss repair (step 5): on unless switched off; simulated loss for tests
+    o = ParseOptions("");
+    CHECK(o.parity && o.pacing && o.simulatedLossPercent == 0);
+    o = ParseOptions("--fec=off --pacing=off --simulate-loss=2");
+    CHECK(!o.parity && !o.pacing && o.simulatedLossPercent == 2 && o.simulatedLossBurst == 1);
+    o = ParseOptions("--simulate-loss=1.5:4");
+    CHECK(o.simulatedLossPercent == 1.5 && o.simulatedLossBurst == 4 && o.warnings.empty());
+    o = ParseOptions("--simulate-loss=80 --simulate-loss=2:99");
+    CHECK(o.simulatedLossPercent == 0 && o.warnings.size() == 2);
+    // Bitrate that follows the delay (step 6)
+    o = ParseOptions("");
+    CHECK(o.adaptToDelay && o.simulatedLinkKbps == 0);
+    o = ParseOptions("--adapt=tiers --simulate-link=8000");
+    CHECK(!o.adaptToDelay && o.simulatedLinkKbps == 8000 && o.simulatedLinkQueueMs == 200);
+    o = ParseOptions("--simulate-link=5000:50");
+    CHECK(o.simulatedLinkKbps == 5000 && o.simulatedLinkQueueMs == 50 && o.warnings.empty());
+    o = ParseOptions("--simulate-link=10 --simulate-link=8000:5");
+    CHECK(o.simulatedLinkKbps == 0 && o.warnings.size() == 2);
 
     o = ParseOptions("--bench=abc --log=loud --frobnicate 10.0.0.1 10.0.0.2");
     CHECK(o.benchSeconds == 0);

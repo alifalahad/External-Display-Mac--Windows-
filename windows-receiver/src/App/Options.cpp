@@ -25,8 +25,38 @@ Options ParseOptions(const std::string& commandLine) {
         else if (arg == "--cursor=video")        o.localCursor = false;
         else if (arg == "--present=vsync")       o.presentImmediately = false;
         else if (arg == "--present=immediate")   o.presentImmediately = true;
+        else if (arg == "--fec=on")              o.parity = true;
+        else if (arg == "--fec=off")             o.parity = false;
+        else if (arg == "--pacing=on")           o.pacing = true;
+        else if (arg == "--pacing=off")          o.pacing = false;
+        else if (arg == "--adapt=delay")         o.adaptToDelay = true;
+        else if (arg == "--adapt=tiers")         o.adaptToDelay = false;
         else if (arg.rfind("--log=", 0) == 0) {
             if (!Log::ParseLevel(arg.substr(6), o.logLevel)) o.warnings.push_back("Unknown log level: " + arg);
+        } else if (arg.rfind("--simulate-loss=", 0) == 0) {
+            // PERCENT or PERCENT:BURST, e.g. 2 or 2:4
+            const std::string value = arg.substr(16);
+            const size_t colon = value.find(':');
+            o.simulatedLossPercent = std::atof(value.substr(0, colon).c_str());
+            o.simulatedLossBurst = colon == std::string::npos ? 1 : std::atoi(value.c_str() + colon + 1);
+            if (o.simulatedLossPercent <= 0 || o.simulatedLossPercent > 50 ||
+                o.simulatedLossBurst < 1 || o.simulatedLossBurst > 32) {
+                o.simulatedLossPercent = 0;
+                o.simulatedLossBurst = 1;
+                o.warnings.push_back("--simulate-loss needs PERCENT (0-50) and optionally :BURST (1-32), e.g. 2 or 2:4");
+            }
+        } else if (arg.rfind("--simulate-link=", 0) == 0) {
+            // KBPS or KBPS:QUEUEMS, e.g. 8000 or 8000:100
+            const std::string value = arg.substr(16);
+            const size_t colon = value.find(':');
+            o.simulatedLinkKbps = std::atof(value.substr(0, colon).c_str());
+            o.simulatedLinkQueueMs = colon == std::string::npos ? 200 : std::atof(value.c_str() + colon + 1);
+            if (o.simulatedLinkKbps < 500 || o.simulatedLinkKbps > 1'000'000 ||
+                o.simulatedLinkQueueMs < 10 || o.simulatedLinkQueueMs > 2000) {
+                o.simulatedLinkKbps = 0;
+                o.simulatedLinkQueueMs = 200;
+                o.warnings.push_back("--simulate-link needs KBPS (500-1000000) and optionally :QUEUEMS (10-2000), e.g. 8000");
+            }
         } else if (arg.rfind("--bench=", 0) == 0) {
             o.benchSeconds = std::atoi(arg.c_str() + 8);
             if (o.benchSeconds <= 0) {

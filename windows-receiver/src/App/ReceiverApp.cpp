@@ -10,6 +10,8 @@
 #include "Performance/PipelineClock.h"
 #include "UI/PinPrompt.h"
 
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 
 namespace {
@@ -153,7 +155,18 @@ void ReceiverApp::connectTo(const std::string& address, const std::string& servi
 
     // Pointer drawn here (docs/SMOOTHNESS.md, step 1): only the newest shape
     // and position wait for the UI thread
-    receiver_->setReceiverCaps(localPointerWanted_ && renderer_->CanDrawPointer() ? exdp::CAP_LOCAL_CURSOR : 0);
+    receiver_->setReceiverCaps(wantedCaps());
+    receiver_->enableRateFeedback(options_.adaptToDelay);
+    if (options_.simulatedLinkKbps > 0) {
+        LOGF_WARN("Net", "Simulating a %.0f kbps link with a %.0f ms queue (--simulate-link)",
+                  options_.simulatedLinkKbps, options_.simulatedLinkQueueMs);
+        receiver_->simulateLink(options_.simulatedLinkKbps, options_.simulatedLinkQueueMs);
+    }
+    if (options_.simulatedLossPercent > 0) {
+        LOGF_WARN("Net", "Simulating %.1f%% packet loss in bursts of %d (--simulate-loss)",
+                  options_.simulatedLossPercent, options_.simulatedLossBurst);
+        receiver_->simulateLoss(options_.simulatedLossPercent, options_.simulatedLossBurst);
+    }
     receiver_->setPointerCallbacks(
         [this](const uint8_t* data, size_t len) {
             auto shape = std::make_unique<PointerShape>();
@@ -324,6 +337,20 @@ void ReceiverApp::finishFrame(const FrameTimeline& t) {
                 ? "Decoder: hardware (D3D11 video engine)" : "Decoder: software (CPU)");
             bench_.addNote(std::string("Renderer: ") + RendererModeName(renderer_->GetMode()) +
                            (sizeof(void*) == 8 ? ", 64-bit build" : ", 32-bit build"));
+            // Step 5: what the Network stage and the drops depend on
+            char simulated[128] = "";
+            if (options_.simulatedLossPercent > 0) {
+                snprintf(simulated, sizeof(simulated), ", SIMULATED LOSS %.1f%% (bursts of %d)",
+                         options_.simulatedLossPercent, options_.simulatedLossBurst);
+            }
+            if (options_.simulatedLinkKbps > 0) {
+                const size_t used = strlen(simulated);
+                snprintf(simulated + used, sizeof(simulated) - used, ", SIMULATED LINK %.0f kbps",
+                         options_.simulatedLinkKbps);
+            }
+            bench_.addNote(std::string("Loss repair: parity ") + (options_.parity ? "on" : "off") +
+                           ", pacing " + (options_.pacing ? "on" : "off") + "; bitrate follows " +
+                           (options_.adaptToDelay ? "the delay" : "loss/RTT tiers") + simulated);
             // Step 3: what the Display stage depends on
             bench_.addNote("Window: " + std::to_string(window_.GetWidth()) + "x" +
                            std::to_string(window_.GetHeight()) + (window_.IsFullscreen() ? " full screen" : " windowed") +
@@ -577,6 +604,14 @@ void ReceiverApp::updateStatus(int64_t nowUs) {
     lastStatusUs_ = nowUs;
 }
 
+uint32_t ReceiverApp::wantedCaps() const {
+    uint32_t caps = 0;
+    if (localPointerWanted_ && renderer_->CanDrawPointer()) caps |= exdp::CAP_LOCAL_CURSOR;
+    if (options_.parity) caps |= exdp::CAP_PARITY;     // docs/SMOOTHNESS.md, step 5
+    if (options_.pacing) caps |= exdp::CAP_PACING;
+    return caps;
+}
+
 void ReceiverApp::updateDisplayPath() {
     // F5: compare presenting on the next refresh with presenting at once
     if (window_.TakePresentToggle()) {
@@ -618,7 +653,7 @@ void ReceiverApp::updatePointer() {
 
     // Drawn here only if this renderer can; otherwise the Mac keeps it in the video
     const bool local = localPointerWanted_ && renderer_->CanDrawPointer();
-    if (receiver_) receiver_->setReceiverCaps(local ? exdp::CAP_LOCAL_CURSOR : 0);
+    if (receiver_) receiver_->setReceiverCaps(wantedCaps());
     pointer_.setLocalPointer(local);
     pointer_.setForwarding(input_ && input_->isEnabled());
 
@@ -811,6 +846,10 @@ void ReceiverApp::tickOncePerSecond(int64_t nowUs) {
         net.jitterMs = ns.jitterMs;
         net.keyframesReceived = ns.keyframesReceived;
         net.keyframeRequests = ns.keyframeRequests;
+        net.fragmentsRebuilt = ns.fragmentsRebuilt;
+        net.framesRebuilt = ns.framesRebuilt;
+        net.queuingDelayUs = ns.queuingDelayUs;
+        net.rateState = static_cast<uint8_t>(ns.rateState);
     }
     if (keyframeGate_.framesHeld() > heldReported_) {
         metrics_.onFramesHeld(keyframeGate_.framesHeld() - heldReported_);

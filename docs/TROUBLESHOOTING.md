@@ -75,10 +75,35 @@ scale (Settings → System → Display → Scale). `receiver.log` shows what it 
 (`DPI awareness: ..., screen at 150 %`). If it says `not DPI-aware`, Windows refused. Send the
 log.
 
-**The picture freezes for a moment, then continues.** After a lost packet the PC keeps the
-last good picture until the Mac's keyframe arrives, usually within a few hundredths of a second
-([SMOOTHNESS.md](SMOOTHNESS.md), step 2). If it happens often, the Wi-Fi is losing packets:
-watch the `Loss` and `Keyframe` lines in the F2 overlay, and see step 8 of SMOOTHNESS.md.
+**The picture freezes for a moment, then continues.** A frame went missing, and the PC keeps
+the last good picture until the Mac's keyframe arrives, usually within a few hundredths of a
+second ([SMOOTHNESS.md](SMOOTHNESS.md), step 2). A single lost packet is normally rebuilt from
+parity without any freeze (step 5). Freezes mean several packets of one frame were lost.
+- The F2 `Loss` line shows how many packets were lost and rebuilt. If loss is high, see step 8
+  of SMOOTHNESS.md (Wi-Fi setup).
+- To check that the repair works at all, use `--simulate-loss=1` on a good network: the
+  `rebuilt` count rises and the picture stays smooth.
+- If `paced` is missing from the overlay's `Mac` line, the Mac app is older than step 5.
+
+**The picture gets softer when the Wi-Fi is busy.** That is intended
+([SMOOTHNESS.md](SMOOTHNESS.md), step 6). When packets start to wait in a queue on the way,
+before any are lost, the Mac lowers the bitrate within a few tenths of a second. It raises it
+again once the queue is gone. A softer picture that keeps up is smoother than a sharp one that
+lags.
+- F2: the `Net wait` line shows how long packets waited on the way and the verdict: `normal`,
+  `hold`, or `overuse: Mac lowers the bitrate`. The `Mac` line shows the encoder's bitrate and
+  its target (`enc 5.9/6.8 Mbps`).
+- The Mac's log (menu 🔍 → Show Log) shows every cut and, once a second, the rises:
+  `Bitrate down to 5980 kbps (overuse, queue 21 ms, loss 0 %, received 7900 kbps, link full at
+  7960 kbps)`. `link full at` is what the network carried while it was full.
+- `Net wait` says overuse again and again while the target is already low: the network is too
+  slow or very busy. See step 8 of SMOOTHNESS.md.
+- `--adapt=tiers` brings back the older behaviour (lower only after loss or a long RTT), to
+  compare.
+- To see it work on a good network: `--simulate-link=8000` (an 8 Mbps link with a 200 ms queue).
+  The target goes below 8 Mbps within about 2 s, and `Net wait` stays at a few milliseconds.
+- If the target never changes while `Net wait` says overuse, the Mac app is older than step 6:
+  it ignores the PC's reports and keeps the tiers.
 
 **Two pointers, no pointer, or the pointer looks wrong.** Since step 1 of
 [SMOOTHNESS.md](SMOOTHNESS.md), Windows draws the Mac's pointer. With F3 off you see Windows'

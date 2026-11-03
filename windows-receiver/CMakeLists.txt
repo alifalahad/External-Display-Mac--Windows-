@@ -25,6 +25,8 @@ add_executable(${PROJECT_NAME} WIN32
     src/Performance/PipelineMetrics.cpp
     src/Performance/SystemMonitor.cpp
     src/Network/StreamReceiver.cpp
+    src/Network/FrameAssembler.cpp
+    src/Network/DelayMonitor.cpp
     src/Decoder/H264Decoder.cpp
     src/Decoder/KeyframeGate.cpp
     src/Decoder/H264Sps.cpp
@@ -86,6 +88,7 @@ endif()
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
 #   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
 #   .\build\DisplayTests.exe           swap chain plan, present mode, DPI awareness, stream colours
+#   .\build\NetworkTests.exe           loss repair, delay monitor, network simulators
 #   ctest --test-dir build               all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
@@ -120,7 +123,12 @@ if(EXDP_BUILD_TESTS)
         src/Decoder/H264Sps.cpp
     )
     target_link_libraries(DisplayTests PRIVATE user32 gdi32)
-    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests DisplayTests)
+    add_executable(NetworkTests
+        tests/NetworkTests.cpp
+        src/Network/FrameAssembler.cpp
+        src/Network/DelayMonitor.cpp
+    )
+    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests DisplayTests NetworkTests)
         target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(${test} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
         if(MSVC)
