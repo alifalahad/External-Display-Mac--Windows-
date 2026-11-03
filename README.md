@@ -22,7 +22,8 @@ copy and paste between the two machines.
   through Direct3D 11). Frames stay on the GPU, with a software fallback.
 - Event-driven rendering with a single queued frame: nothing is drawn when nothing changed.
 - Adaptive bitrate within a quality preset (Battery Saver / Balanced / High).
-- Mouse, keyboard and clipboard (text) forwarding.
+- Mouse, keyboard and clipboard (text) forwarding. Windows draws the Mac's pointer itself, so
+  the mouse feels local: no video round trip ([docs/SMOOTHNESS.md](docs/SMOOTHNESS.md)).
 - Automatic discovery (Bonjour/mDNS), automatic reconnection and recovery after sleep.
 - **Security:** pairing with a verification code, and every message encrypted
   (ECDH P-256, AES-256-GCM). Details in [docs/SECURITY.md](docs/SECURITY.md).
@@ -55,7 +56,7 @@ The receiver finds the Mac on its own. If several Macs answer, press the number 
 From then on they connect without asking.
 
 Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diagnostics ·
-**F3** mouse & keyboard to the Mac.
+**F3** mouse & keyboard to the Mac · **F4** pointer drawn on the PC / in the video.
 
 ## Documentation
 
@@ -66,6 +67,7 @@ Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diag
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Wire format, messages, handshake, encryption |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, pairing, encryption, limitations |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | What is measured, benchmarks, results |
+| [docs/SMOOTHNESS.md](docs/SMOOTHNESS.md) | Roadmap to lower latency: the steps, their status, how each is checked |
 | [docs/TESTING.md](docs/TESTING.md) | Unit, integration and stress tests |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes, where the logs are |
 

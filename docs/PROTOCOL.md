@@ -46,6 +46,9 @@ Integers are **little-endian**, except the two security fields marked *big-endia
 | 0x51 | SENDER_STATS | Mac → PC | capture FPS ×100, encode FPS ×100, CPU % ×100, RAM MB, encoder kbps, target kbps, flags, reserved | yes |
 | 0x60 | INPUT_EVENT | PC → Mac | 24 bytes: type, button, key code, modifiers, x, y, scroll x, scroll y (x, y are 0…1 across the video) | yes |
 | 0x70 | CLIPBOARD | both | UTF-8 text (≤ 1 MB) | yes |
+| 0x90 | RECEIVER_CAPS | PC → Mac | 8 bytes: flags u32 (bit 0: the PC draws the pointer), reserved u32. Sent after PAIR_ACCEPT and whenever it changes (F4) | yes |
+| 0x91 | CURSOR_SHAPE | Mac → PC | pointer image, when it changes (below) | yes |
+| 0x92 | CURSOR_POSITION | Mac → PC | 12 bytes: x, y (f32, 0…1 across the video), flags u32 (bit 0: visible) | yes |
 | 0x40 | VIDEO_FRAME | Mac → PC (UDP) | one encrypted datagram: the whole frame | yes |
 | 0x41 | VIDEO_FRAGMENT | Mac → PC (UDP) | encrypted: fragment header (frame no. u32, index u16, total u16) + data | yes |
 | 0xFF | DISCONNECT | both | — | after auth |
@@ -71,6 +74,25 @@ already in flight.
 | 0 | 1 | mode: 0 = new pairing, 1 = paired |
 | 1 | 7 | reserved |
 | 8 | 65 | Mac's ephemeral P-256 public key, X9.63 uncompressed (`04 | X | Y`) |
+
+### Pointer drawn by the PC (CURSOR_SHAPE, CURSOR_POSITION)
+
+Only after the PC set bit 0 in RECEIVER_CAPS. The Mac then captures without the pointer
+([SMOOTHNESS.md](SMOOTHNESS.md), step 1). CURSOR_SHAPE is a 24-byte header plus the bitmap:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | shape ID (FNV-1a of the rest: the same image has the same ID) |
+| 8 | 2 | width, bitmap pixels (1–256) |
+| 10 | 2 | height (1–256) |
+| 12 | 2 | hot spot x, from the left |
+| 14 | 2 | hot spot y, from the top |
+| 16 | 4 | scale (f32): stream pixels per bitmap pixel (the bitmap is drawn at 2×) |
+| 20 | 4 | reserved |
+| 24 | w × h × 4 | BGRA, premultiplied alpha, top row first |
+
+CURSOR_POSITION is sent when the pointer moves on the Mac. Moves the PC's own mouse caused are
+not sent back. Not visible means the pointer is on another Mac display (x = y = 0).
 
 ## Handshake
 
@@ -135,3 +157,5 @@ Keyframes start with SPS and PPS.
 - The receiver shows "the Mac app and this receiver are different versions — update both"
   instead of retrying quickly.
 - Layout changes need a version bump and matching tests on both sides.
+- New message types do not: both sides ignore types they don't know, and a feature that needs
+  new messages is only used once the other side asked for it (RECEIVER_CAPS).

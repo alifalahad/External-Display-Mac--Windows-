@@ -60,6 +60,7 @@ ExternalDisplayReceiver.exe [mac-ip] [options]
   --verbose                       same as --log=debug
   --console                       also show the log in a console window
   --test-pattern                  no network: animated test pattern (GPU check)
+  --cursor=local|video            pointer drawn on this PC (default) or in the video (F4 switches)
 ```
 
 Files next to the exe:
@@ -77,11 +78,11 @@ Files next to the exe:
 See [TESTING.md](TESTING.md).
 
 ```bash
-# Mac (28 tests)
+# Mac (35 tests)
 cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
 ```
 ```bat
-:: Windows (3 suites, 211 checks)
+:: Windows (4 suites, 285 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build

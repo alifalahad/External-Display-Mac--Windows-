@@ -6,15 +6,20 @@
 // of captured (no Screen Recording permission needed). New pairings are
 // approved automatically once Windows confirmed the code (rejected instead
 // when EXDP_REJECT=1); the code is written to a file so the receiver test can
-// "type" it.
+// "type" it. When the receiver asks to draw the pointer (RECEIVER_CAPS), the
+// real PointerMonitor runs for a second, then a scripted pointer path follows
+// that the receiver test checks exactly.
 //
 //   harness <seconds> <code-file> <pairing-dir>
 // =============================================================================
 
 import Foundation
+import AppKit
 import CoreVideo
 import CoreMedia
 import Combine
+
+_ = NSApplication.shared   // NSCursor needs AppKit set up
 
 let args = CommandLine.arguments
 let duration = Double(args.count > 1 ? args[1] : "20") ?? 20
@@ -55,6 +60,52 @@ encoder.onEncodedFrame = { sb, key, timing in
     }
 }
 sender.onKeyframeRequest = { encoder.forceKeyframe() }
+
+// Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1)
+var pointerMonitor: PointerMonitor?
+var pointerScript: DispatchSourceTimer?
+sender.onReceiverCaps = { flags in
+    DispatchQueue.main.async {
+        print("[Harness] RECEIVER_CAPS 0x\(String(flags, radix: 16))")
+        pointerMonitor?.stop()
+        pointerMonitor = nil
+        pointerScript?.cancel()
+        pointerScript = nil
+        guard flags & ReceiverCapsPayload.localCursor != 0 else { return }
+
+        // The real monitor: this Mac's pointer image and position
+        let monitor = PointerMonitor(displayID: CGMainDisplayID(), streamWidth: width, echo: PointerEcho())
+        monitor.onShape = { sender.sendCursorShape($0) }
+        monitor.onPosition = { sender.sendCursorPosition($0) }
+        monitor.start()
+        pointerMonitor = monitor
+
+        // Then a path the receiver can check: the arrow, 100 steps along the
+        // diagonal at 120 Hz, then off to another display
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            guard pointerMonitor === monitor else { return }
+            monitor.stop()
+            pointerMonitor = nil
+            if let arrow = PointerImage.render(.arrow, streamPixelsPerPoint: 1) { sender.sendCursorShape(arrow) }
+            var step = 0
+            let script = DispatchSource.makeTimerSource(queue: .main)
+            script.schedule(deadline: .now(), repeating: .microseconds(8333))
+            script.setEventHandler {
+                if step < 100 {
+                    let t = Float(step) / 99
+                    sender.sendCursorPosition(CursorPositionPayload(x: t, y: t, flags: CursorPositionPayload.visible))
+                } else {
+                    sender.sendCursorPosition(CursorPositionPayload(x: 0, y: 0, flags: 0))
+                    script.cancel()
+                    print("[Harness] pointer: scripted path sent")
+                }
+                step += 1
+            }
+            script.resume()
+            pointerScript = script
+        }
+    }
+}
 sender.streamWidth = UInt32(width)
 sender.streamHeight = UInt32(height)
 sender.startListening()

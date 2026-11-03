@@ -62,11 +62,19 @@ changes; move a window.
 **The mouse lands in the wrong place.** Fixed in version 2: clicks are mapped through the
 letterboxed picture. If it still happens, send `receiver.log` with `--verbose`.
 
+**Two pointers, no pointer, or the pointer looks wrong.** Since step 1 of
+[SMOOTHNESS.md](SMOOTHNESS.md), Windows draws the Mac's pointer. With F3 off you see Windows'
+own arrow *and* the Mac's pointer: that is intended. Press **F4** (or start with
+`--cursor=video`) to put the pointer back into the video. `receiver.log` says which mode the
+Mac was told (`Telling the Mac: pointer drawn here / in the video`).
+
 ## Mac sender
 
 **Mouse and keyboard from the PC do nothing.** Accessibility permission is missing (logged as a
 warning at start). System Settings → Privacy & Security → Accessibility: add the app, then
-**restart it**.
+**restart it**. A rebuilt development copy can lose the permission even though it is still
+listed (each build is signed differently): remove it from the list with −, add it again, and
+restart it.
 
 **"Permission denied" / no displays.** Screen Recording permission: System Settings → Privacy &
 Security → Screen Recording, then click ↺.

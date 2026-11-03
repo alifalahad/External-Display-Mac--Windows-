@@ -124,6 +124,10 @@ final class StreamSender: ObservableObject {
     /// Called when clipboard data is received from the Windows receiver
     var onClipboardData: ((Data) -> Void)?
 
+    /// Called when the receiver announces what it can do (RECEIVER_CAPS
+    /// flags, after authentication). Invoked on the network queue.
+    var onReceiverCaps: ((UInt32) -> Void)?
+
     /// Pairing manager for secure authentication
     var pairingManager: PairingManager?
 
@@ -486,6 +490,11 @@ final class StreamSender: ObservableObject {
             handleInputEvent(payload)
         case .clipboardData:
             handleClipboardData(payload)
+        case .receiverCaps:
+            if let caps = ReceiverCapsPayload.deserialize(from: payload) {
+                Log.info(.net, "Receiver capabilities: 0x\(String(caps.flags, radix: 16))")
+                onReceiverCaps?(caps.flags)
+            }
         case .keyReveal:
             handleKeyReveal(payload)
         case .pairConfirm:
@@ -939,6 +948,25 @@ final class StreamSender: ObservableObject {
         networkQueue.async { [weak self] in
             guard let self = self, self.isAuthenticated, self.udpConnection != nil else { return }
             self.sendControlMessage(type: .senderStats, payload: stats.serialize())
+        }
+    }
+
+    // ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────
+
+    /// Pointer image for a receiver that draws the pointer. Any thread.
+    func sendCursorShape(_ shape: CursorShapePayload) {
+        let payload = shape.serialize()
+        networkQueue.async { [weak self] in
+            guard let self = self, self.isAuthenticated else { return }
+            self.sendControlMessage(type: .cursorShape, payload: payload)
+        }
+    }
+
+    /// Pointer moved on the Mac. Any thread.
+    func sendCursorPosition(_ position: CursorPositionPayload) {
+        networkQueue.async { [weak self] in
+            guard let self = self, self.isAuthenticated else { return }
+            self.sendControlMessage(type: .cursorPosition, payload: position.serialize())
         }
     }
 

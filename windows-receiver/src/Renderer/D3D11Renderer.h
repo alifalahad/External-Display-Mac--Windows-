@@ -26,6 +26,17 @@ struct StatusCard {
     std::wstring footer;     // key hints along the bottom edge
 };
 
+/// The Mac's pointer, drawn over everything (docs/SMOOTHNESS.md, step 1).
+/// Window pixels; the size is the size of the image set with SetPointerImage.
+struct PointerSprite {
+    int x = 0, y = 0, width = 0, height = 0;
+
+    bool operator==(const PointerSprite& o) const {
+        return x == o.x && y == o.y && width == o.width && height == o.height;
+    }
+    bool operator!=(const PointerSprite& o) const { return !(*this == o); }
+};
+
 class D3D11Renderer {
 public:
     /// Throws std::runtime_error naming the step and HRESULT that failed
@@ -37,10 +48,16 @@ public:
     D3D11Renderer& operator=(const D3D11Renderer&) = delete;
 
     // Render one frame: video (or test pattern when there is neither video nor
-    // a status card), optional status card, optional diagnostics text.
-    // Presents with VSync. Call WaitForFrameSlot() first.
+    // a status card), optional status card, optional diagnostics text,
+    // optional pointer on top. Presents with VSync. Call WaitForFrameSlot() first.
     void Render(float time, float frameCount, const std::wstring* overlayText = nullptr,
-                const StatusCard* status = nullptr);
+                const StatusCard* status = nullptr, const PointerSprite* pointer = nullptr);
+
+    // Pointer image: BGRA, premultiplied alpha, top row first, drawn 1:1
+    void SetPointerImage(const uint8_t* bgra, int width, int height);
+    // False when the pointer shader could not be created: then the pointer
+    // must stay in the video
+    bool CanDrawPointer() const { return pointerPixelShader_ != nullptr; }
 
     // Phase 17: block until the swap chain can take a frame without queueing
     // behind older ones (max frame latency 1). Rendering right after this —
@@ -163,6 +180,15 @@ private:
     // Frame latency (Phase 17)
     HANDLE frameLatencyWaitable_ = nullptr;
     UINT   swapChainFlags_ = 0;
+
+    // Pointer (docs/SMOOTHNESS.md, step 1)
+    void CreatePointerResources();
+    void DrawPointer(const PointerSprite& pointer);
+    ComPtr<ID3D11PixelShader>        pointerPixelShader_;
+    ComPtr<ID3D11BlendState>         pointerBlend_;      // premultiplied alpha
+    ComPtr<ID3D11SamplerState>       pointerSampler_;    // point: drawn 1:1
+    ComPtr<ID3D11ShaderResourceView> pointerSRV_;
+    int pointerWidth_ = 0, pointerHeight_ = 0;
 
     // Shader constant buffer layout (must be 16-byte aligned)
     struct alignas(16) ShaderConstants {

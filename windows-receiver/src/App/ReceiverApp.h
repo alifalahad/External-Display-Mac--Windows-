@@ -19,6 +19,7 @@
 #include "Clipboard/ClipboardSync.h"
 #include "Decoder/H264Decoder.h"
 #include "Input/InputCapture.h"
+#include "Input/Pointer.h"
 #include "Network/StreamReceiver.h"
 #include "Performance/PipelineMetrics.h"
 #include "Performance/SystemMonitor.h"
@@ -74,6 +75,7 @@ private:
     void handlePairingPrompt();
     void updateOverlay(int64_t nowUs);
     void updateStatus(int64_t nowUs);
+    void updatePointer();
     void renderIfNeeded(int64_t& nowUs);
     void trackScanout(int64_t nowUs);
     void tickOncePerSecond(int64_t nowUs);
@@ -153,4 +155,19 @@ private:
     int64_t lastStatusUs_ = 0;
     std::string note_;
     bool codeSent_ = false;                  // waiting for the Mac user to click Pair
+
+    // Pointer drawn here (docs/SMOOTHNESS.md, step 1)
+    std::mutex pointerMutex_;                // network thread → UI thread
+    std::unique_ptr<PointerShape> pendingShape_;
+    PointerPosition pendingPosition_;
+    bool pendingPositionValid_ = false;
+    PointerModel pointer_;
+    bool localPointerWanted_ = true;         // --cursor, F4
+    HCURSOR macCursor_ = nullptr;            // Windows pointer with the Mac's image
+    uint64_t macCursorShapeId_ = 0;
+    int macCursorW_ = 0, macCursorH_ = 0;
+    uint64_t spriteShapeId_ = 0;             // image the renderer holds
+    int spriteW_ = 0, spriteH_ = 0;
+    PointerSprite sprite_;
+    bool spriteShown_ = false;
 };

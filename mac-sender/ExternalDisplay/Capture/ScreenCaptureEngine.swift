@@ -80,6 +80,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         pairingManager.onDecision = { [weak self] deviceId, approved in
             self?.sender.resolvePairing(deviceId: deviceId, approved: approved)
         }
+        sender.onReceiverCaps = { [weak self] flags in
+            DispatchQueue.main.async {
+                self?.setReceiverDrawsPointer(flags & ReceiverCapsPayload.localCursor != 0)
+            }
+        }
 
         // ContentView only observes the engine; re-publish nested pairing
         // changes so a request appears the moment a receiver connects.
@@ -144,6 +149,18 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     /// Clipboard sync — bidirectional clipboard between Mac and Windows
     private var clipboardSync: ClipboardSync?
 
+    /// The display being captured (input and pointer positions map to it),
+    /// and the capture size in pixels
+    private var capturedDisplayID: CGDirectDisplayID = 0
+    private var captureWidth = 0
+    private var captureHeight = 0
+
+    // ── Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1) ──
+    /// Main thread. Set by RECEIVER_CAPS for the current connection.
+    private var receiverDrawsPointer = false
+    private var pointerMonitor: PointerMonitor?
+    private let pointerEcho = PointerEcho()
+
     // ── Encoder Control ─────────────────────────────────────────────────────
 
     /// Start the H.264 encoder with the given resolution
@@ -194,6 +211,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             let injector = InputInjector()
             injector.displayWidth = CGFloat(width)
             injector.displayHeight = CGFloat(height)
+            injector.displayID = capturedDisplayID
+            injector.echo = pointerEcho
 
             // If virtual display is active, set the display origin offset
             // so mouse events land on the virtual display, not the main screen
@@ -358,24 +377,13 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 excludingWindows: excludedWindows
             )
 
-            // Configure the stream
-            let config = SCStreamConfiguration()
-
-            // Capture at display's point resolution
-            config.width = display.width
-            config.height = display.height
-
-            // Frame rate from the quality preset (60, or 30 for Battery Saver)
-            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(qualityPreset.fps))
-
-            // BGRA pixel format — standard for display capture
-            config.pixelFormat = kCVPixelFormatType_32BGRA
-
-            // Cursor visibility
-            config.showsCursor = true
-
-            // Bounded queue — if we can't keep up, older frames are dropped
-            config.queueDepth = 3
+            // Capture at the display's point resolution
+            let drawsPointer = await MainActor.run { self.receiverDrawsPointer }
+            let config = makeStreamConfiguration(width: display.width, height: display.height,
+                                                 fps: qualityPreset.fps, capturePointer: !drawsPointer)
+            capturedDisplayID = display.displayID
+            captureWidth = display.width
+            captureHeight = display.height
 
             // Create and configure the stream
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -409,6 +417,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             await MainActor.run {
                 self.startDiagnosticsTimer()
                 self.beginStreamingActivity()
+                // Restarted capture (maybe another display): the monitor follows it
+                if self.receiverDrawsPointer { self.startPointerMonitor() }
             }
 
             // After an auto-restart the receiver may still be streaming —
@@ -447,6 +457,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         sender.stop()
         stopEncoder()
         senderCancellable = nil
+        DispatchQueue.main.async { [weak self] in self?.setReceiverDrawsPointer(false) }
         diagnosticsTimer?.cancel()
         diagnosticsTimer = nil
         endStreamingActivity()
@@ -480,9 +491,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         senderCancellable = sender.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newState in
-                if case .connected = newState {
+                switch newState {
+                case .connected:
                     // Peer connected — begin streaming
                     self?.sender.startStreaming()
+                case .streaming:
+                    break
+                default:
+                    // No receiver: the next one may not draw the pointer
+                    self?.setReceiverDrawsPointer(false)
                 }
                 self?.updatePreviewGate(streaming: newState.isStreaming)
             }
@@ -529,21 +546,69 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         qualityController?.apply(preset)
         encoder?.updateFrameRate(preset.fps)
         sender.streamFPS = UInt32(preset.fps)
+        updateStreamConfiguration(what: "the frame rate")
+    }
 
-        guard let stream else { return }
+    /// Everything the stream is captured with, in one place
+    private func makeStreamConfiguration(width: Int, height: Int, fps: Int,
+                                         capturePointer: Bool) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-        config.width = Int(stats.resolution.width)
-        config.height = Int(stats.resolution.height)
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
+        config.width = width
+        config.height = height
+        // Frame rate from the quality preset (60, or 30 for Battery Saver)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        // BGRA pixel format — standard for display capture
         config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.showsCursor = true
+        // Left out when the receiver draws the pointer itself
+        config.showsCursor = capturePointer
+        // Bounded queue — if we can't keep up, older frames are dropped
         config.queueDepth = 3
+        return config
+    }
+
+    /// Main thread. Apply the current preset and pointer mode without
+    /// restarting the stream.
+    private func updateStreamConfiguration(what: String) {
+        guard let stream else { return }
+        let config = makeStreamConfiguration(width: captureWidth, height: captureHeight,
+                                             fps: qualityPreset.fps, capturePointer: !receiverDrawsPointer)
         guard config.width > 0, config.height > 0 else { return }
         stream.updateConfiguration(config) { error in
             if let error {
-                Log.warning(.capture, "Could not change the frame rate: \(error.localizedDescription)")
+                Log.warning(.capture, "Could not change \(what): \(error.localizedDescription)")
             }
         }
+    }
+
+    // ── Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1) ──────────
+
+    /// Main thread. RECEIVER_CAPS said whether the receiver draws the pointer:
+    /// then capture leaves it out and PointerMonitor sends shape and position.
+    private func setReceiverDrawsPointer(_ draws: Bool) {
+        if draws {
+            // Every announcement starts afresh (it also comes after a
+            // reconnect), so the receiver gets the current shape and position
+            startPointerMonitor()
+        } else {
+            pointerMonitor?.stop()
+            pointerMonitor = nil
+        }
+        guard draws != receiverDrawsPointer else { return }
+        receiverDrawsPointer = draws
+        Log.info(.input, draws ? "The receiver draws the pointer: captured without it"
+                               : "Pointer captured in the video")
+        updateStreamConfiguration(what: "the pointer capture")
+    }
+
+    /// Main thread
+    private func startPointerMonitor() {
+        pointerMonitor?.stop()
+        let monitor = PointerMonitor(displayID: capturedDisplayID, streamWidth: Int(sender.streamWidth),
+                                     echo: pointerEcho)
+        monitor.onShape = { [weak self] shape in self?.sender.sendCursorShape(shape) }
+        monitor.onPosition = { [weak self] position in self?.sender.sendCursorPosition(position) }
+        monitor.start()
+        pointerMonitor = monitor
     }
 
     // ── Power (Phase 17) ────────────────────────────────────────────────────

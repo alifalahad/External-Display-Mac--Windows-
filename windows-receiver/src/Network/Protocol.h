@@ -57,6 +57,9 @@ enum class MessageType : uint8_t {
     PairAccept    = 0x82,   // Mac → Win: Mac's HMAC; encryption starts after it
     PairReject    = 0x83,   // Mac → Win: handshake refused (reason)
     KeyReveal     = 0x84,   // Win → Mac: our ephemeral key (committed in HELLO)
+    ReceiverCaps  = 0x90,   // Win → Mac: what this receiver can do (ReceiverCapsPayload)
+    CursorShape   = 0x91,   // Mac → Win: pointer image, when it changes
+    CursorPosition = 0x92,  // Mac → Win: pointer moved on the Mac
     Disconnect    = 0xFF,
 
     // Data (UDP)
@@ -234,6 +237,40 @@ struct PairRejectPayload {
     uint8_t reason = 0;
     uint8_t reserved[3] = {};
 };
+
+// ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────────
+
+/// RECEIVER_CAPS payload (Windows → Mac, 8 bytes). Sent once the session is
+/// encrypted, and again whenever it changes.
+struct ReceiverCapsPayload {
+    uint32_t flags = 0;
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(ReceiverCapsPayload) == 8, "ReceiverCapsPayload must be 8 bytes");
+constexpr uint32_t CAP_LOCAL_CURSOR = 1 << 0;   // we draw the pointer: capture without it
+
+/// CURSOR_SHAPE (Mac → Windows): this header, then width × height × 4 bytes
+/// BGRA, premultiplied alpha, top row first
+struct CursorShapeHeader {
+    uint64_t shapeId  = 0;        // same image, same id
+    uint16_t width    = 0;        // bitmap pixels (≤ MAX_CURSOR_SIDE)
+    uint16_t height   = 0;
+    uint16_t hotspotX = 0;        // from the top-left, bitmap pixels
+    uint16_t hotspotY = 0;
+    float    scale    = 1;        // stream pixels per bitmap pixel
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(CursorShapeHeader) == 24, "CursorShapeHeader must be 24 bytes");
+constexpr int MAX_CURSOR_SIDE = 256;
+
+/// CURSOR_POSITION payload (Mac → Windows, 12 bytes)
+struct CursorPositionPayload {
+    float    x = 0;               // 0…1 across the stream, as in INPUT_EVENT
+    float    y = 0;
+    uint32_t flags = 0;           // CURSOR_VISIBLE (else: on another Mac display)
+};
+static_assert(sizeof(CursorPositionPayload) == 12, "CursorPositionPayload must be 12 bytes");
+constexpr uint32_t CURSOR_VISIBLE = 1 << 0;
 
 #pragma pack(pop)
 

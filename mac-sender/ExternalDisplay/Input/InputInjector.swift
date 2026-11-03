@@ -30,8 +30,16 @@ final class InputInjector {
     var displayOriginX: CGFloat = 0
     var displayOriginY: CGFloat = 0
 
+    /// The captured display. When set, its current bounds replace the values
+    /// above, so input follows the display when the displays are rearranged.
+    var displayID: CGDirectDisplayID = 0
+
     /// Track mouse position for delta-based events
     private var lastMousePos = CGPoint(x: 960, y: 600)
+
+    /// Every warp is recorded here, so PointerMonitor does not report the
+    /// PC's own mouse moves back to the PC
+    var echo: PointerEcho?
 
     /// Track button state for drag detection
     private var leftButtonDown = false
@@ -87,16 +95,19 @@ final class InputInjector {
 
     // ── Mouse Handling ──────────────────────────────────────────────────────
 
-    private func handleMouseMove(_ p: InputEventPayload) {
-        let point = normalizedToDisplay(x: p.x, y: p.y)
+    /// For virtual displays, CGEvent alone may not move the cursor:
+    /// CGWarpMouseCursorPosition forces it onto the target display.
+    private func warp(to point: CGPoint) {
         lastMousePos = point
-
-        // For virtual displays, CGEvent alone may not move the cursor.
-        // Use CGWarpMouseCursorPosition to force the cursor to the target display.
+        echo?.record(point)
         CGWarpMouseCursorPosition(point)
-
         // Prevent macOS from suppressing events after warp
         CGAssociateMouseAndMouseCursorPosition(1)
+    }
+
+    private func handleMouseMove(_ p: InputEventPayload) {
+        let point = normalizedToDisplay(x: p.x, y: p.y)
+        warp(to: point)
 
         let type: CGEventType = leftButtonDown ? .leftMouseDragged :
                                 rightButtonDown ? .rightMouseDragged : .mouseMoved
@@ -113,9 +124,7 @@ final class InputInjector {
 
     private func handleMouseDown(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
-        lastMousePos = point
-        CGWarpMouseCursorPosition(point)
-        CGAssociateMouseAndMouseCursorPosition(1)
+        warp(to: point)
 
         let button = p.button
         if button == 0 {
@@ -146,9 +155,7 @@ final class InputInjector {
 
     private func handleMouseUp(_ p: InputEventPayload) {
         let point = normalizedToDisplay(x: p.x, y: p.y)
-        lastMousePos = point
-        CGWarpMouseCursorPosition(point)
-        CGAssociateMouseAndMouseCursorPosition(1)
+        warp(to: point)
 
         let button = p.button
         if button == 0 {
@@ -246,10 +253,15 @@ final class InputInjector {
     /// whatever the receiver sends (NaN counts as 0).
     func normalizedToDisplay(x: Float, y: Float) -> CGPoint {
         func unit(_ v: Float) -> CGFloat { v.isNaN ? 0 : CGFloat(min(max(v, 0), 1)) }
+        var bounds = CGRect(x: displayOriginX, y: displayOriginY, width: displayWidth, height: displayHeight)
+        if displayID != 0 {
+            let live = CGDisplayBounds(displayID)
+            if !live.isEmpty { bounds = live }
+        }
         // The last pixel row/column is width-1 / height-1
         return CGPoint(
-            x: displayOriginX + unit(x) * max(displayWidth - 1, 0),
-            y: displayOriginY + unit(y) * max(displayHeight - 1, 0)
+            x: bounds.minX + unit(x) * max(bounds.width - 1, 0),
+            y: bounds.minY + unit(y) * max(bounds.height - 1, 0)
         )
     }
 

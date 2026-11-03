@@ -26,6 +26,8 @@ add_executable(${PROJECT_NAME} WIN32
     src/Network/StreamReceiver.cpp
     src/Decoder/H264Decoder.cpp
     src/Input/InputCapture.cpp
+    src/Input/Pointer.cpp
+    src/Input/PointerCursor.cpp
     src/Clipboard/ClipboardSync.cpp
     src/Discovery/ServiceDiscovery.cpp
     src/Security/PairingManager.cpp
@@ -79,6 +81,7 @@ endif()
 #   .\build\PipelineMetricsTests.exe   metrics, clock sync, benchmark files, payload layout
 #   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
+#   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
 #   ctest --test-dir build               all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
@@ -100,7 +103,13 @@ if(EXDP_BUILD_TESTS)
         src/Security/SecureChannel.cpp
     )
     target_link_libraries(SecureChannelTests PRIVATE bcrypt crypt32)
-    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests)
+    add_executable(PointerTests
+        tests/PointerTests.cpp
+        src/Input/Pointer.cpp
+        src/Input/PointerCursor.cpp
+    )
+    target_link_libraries(PointerTests PRIVATE user32 gdi32)
+    foreach(test PipelineMetricsTests AppLogicTests SecureChannelTests PointerTests)
         target_include_directories(${test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_compile_definitions(${test} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
         if(MSVC)

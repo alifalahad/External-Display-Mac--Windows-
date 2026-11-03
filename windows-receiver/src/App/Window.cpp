@@ -158,6 +158,26 @@ void Window::ToggleFullscreen() {
     }
 }
 
+void Window::SetClientCursor(HCURSOR cursor, bool hide) {
+    if (cursor == clientCursor_ && hide == hideCursor_) return;
+    clientCursor_ = cursor;
+    hideCursor_ = hide;
+
+    // WM_SETCURSOR only comes with the next mouse move: apply now if the
+    // pointer is over our client area
+    POINT p;
+    if (!GetCursorPos(&p) || WindowFromPoint(p) != hwnd_) return;
+    ScreenToClient(hwnd_, &p);
+    RECT client;
+    GetClientRect(hwnd_, &client);
+    if (PtInRect(&client, p)) SetCursor(CurrentClientCursor());
+}
+
+HCURSOR Window::CurrentClientCursor() const {
+    if (hideCursor_) return nullptr;
+    return clientCursor_ ? clientCursor_ : LoadCursorW(nullptr, IDC_ARROW);
+}
+
 LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Window* self = nullptr;
 
@@ -268,15 +288,14 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == VK_F3 && self && self->inputCapture_) {
+            // Which pointer shows over the window follows from this (ReceiverApp)
             bool newState = !self->inputCapture_->isEnabled();
             self->inputCapture_->setEnabled(newState);
             LOGF_INFO("Input", "Input forwarding %s (F3)", newState ? "enabled" : "disabled");
-            if (newState) {
-                // Hide cursor when input capture is active
-                ShowCursor(FALSE);
-            } else {
-                ShowCursor(TRUE);
-            }
+            return 0;
+        }
+        if (wp == VK_F4 && self) {
+            self->pointerToggle_ = true;
             return 0;
         }
         // Forward to input capture
@@ -292,8 +311,26 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
+    // ── Pointer over the client area (docs/SMOOTHNESS.md, step 1) ─────────
+    case WM_SETCURSOR:
+        if (self && LOWORD(lp) == HTCLIENT) {
+            SetCursor(self->CurrentClientCursor());
+            return TRUE;
+        }
+        break;
+
     // ── Mouse input forwarding ────────────────────────────────────────────
     case WM_MOUSEMOVE:
+        if (self) {
+            // Windows also sends WM_MOUSEMOVE without movement (a window
+            // appearing under the pointer): only real moves count
+            const int x = static_cast<short>(LOWORD(lp)), y = static_cast<short>(HIWORD(lp));
+            if (x != self->mouseX_ || y != self->mouseY_) {
+                self->mouseX_ = x;
+                self->mouseY_ = y;
+                self->mouseMoved_ = true;
+            }
+        }
         if (self && self->inputCapture_) {
             self->inputCapture_->onMouseMove(
                 LOWORD(lp), HIWORD(lp), self->width_, self->height_);

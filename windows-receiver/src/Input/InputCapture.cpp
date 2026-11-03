@@ -33,12 +33,20 @@ void InputCapture::sendEvent(exdp::InputEventPayload& evt) {
 void InputCapture::onMouseMove(int windowX, int windowY, int windowW, int windowH) {
     if (!m_enabled) return;
 
-    // Throttle mouse move events
+    // Throttle mouse move events; the latest held-back one is sent later
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         now - m_lastMouseMove).count();
-    if (elapsed < MOUSE_MOVE_INTERVAL_US) return;
+    if (elapsed < MOUSE_MOVE_INTERVAL_US) {
+        m_movePending = true;
+        m_pendingX = windowX;
+        m_pendingY = windowY;
+        m_pendingW = windowW;
+        m_pendingH = windowH;
+        return;
+    }
     m_lastMouseMove = now;
+    m_movePending = false;
 
     exdp::InputEventPayload evt;
     evt.eventType = (uint8_t)exdp::InputEventType::MouseMove;
@@ -46,9 +54,26 @@ void InputCapture::onMouseMove(int windowX, int windowY, int windowW, int window
     sendEvent(evt);
 }
 
+void InputCapture::flushPendingMove() {
+    if (!m_movePending) return;
+    if (!m_enabled) {
+        m_movePending = false;
+        return;
+    }
+    if (pendingMoveDueInUs() == 0) onMouseMove(m_pendingX, m_pendingY, m_pendingW, m_pendingH);
+}
+
+int64_t InputCapture::pendingMoveDueInUs() const {
+    if (!m_movePending) return -1;
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - m_lastMouseMove).count();
+    return elapsed >= MOUSE_MOVE_INTERVAL_US ? 0 : MOUSE_MOVE_INTERVAL_US - elapsed;
+}
+
 void InputCapture::onMouseDown(int button, int windowX, int windowY,
                                 int windowW, int windowH) {
     if (!m_enabled) return;
+    m_movePending = false;   // the click carries the position
     exdp::InputEventPayload evt;
     evt.eventType = (uint8_t)exdp::InputEventType::MouseDown;
     evt.button = (uint8_t)button;

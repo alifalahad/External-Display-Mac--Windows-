@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstdio>
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -57,6 +58,7 @@ D3D11Renderer::D3D11Renderer(HWND hwnd, int width, int height, GpuPreference gpu
         d2dContext_.Reset();
     }
     CreateNV12Resources();
+    CreatePointerResources();
 }
 
 D3D11Renderer::~D3D11Renderer() {
@@ -480,7 +482,7 @@ void D3D11Renderer::Resize(int width, int height) {
 // =============================================================================
 
 void D3D11Renderer::Render(float time, float frameCount, const std::wstring* overlayText,
-                           const StatusCard* status) {
+                           const StatusCard* status, const PointerSprite* pointer) {
     if (deviceLost_ || !rtv_) return;  // owner recreates the renderer
 
     // ── 1. Update constant buffer ───────────────────────────────────────────
@@ -572,9 +574,136 @@ void D3D11Renderer::Render(float time, float frameCount, const std::wstring* ove
         }
     }
 
-    // ── 5. Present (VSync) ──────────────────────────────────────────────────
+    // ── 5. The Mac's pointer, on top of everything ──────────────────────────
+    if (pointer) DrawPointer(*pointer);
+
+    // ── 6. Present (VSync) ──────────────────────────────────────────────────
     hr = swapChain_->Present(1, 0);  // SyncInterval=1 → VSync
     CheckDeviceLost(hr, "Present");
+}
+
+// =============================================================================
+// Pointer (docs/SMOOTHNESS.md, step 1)
+// =============================================================================
+
+void D3D11Renderer::CreatePointerResources() {
+    // Optional like the overlay: without it the Mac keeps the pointer in the video
+    const char* pointerPS = R"(
+        Texture2D    pointerTex : register(t0);
+        SamplerState samp       : register(s0);
+
+        struct PSInput {
+            float4 pos : SV_Position;
+            float2 uv  : TEXCOORD0;
+        };
+
+        float4 main(PSInput input) : SV_Target {
+            return pointerTex.Sample(samp, input.uv);   // premultiplied
+        }
+    )";
+    ComPtr<ID3DBlob> psBlob, errBlob;
+    HRESULT hr = D3DCompile(pointerPS, strlen(pointerPS), "pointerPS",
+        nullptr, nullptr, "main", ShaderProfile("ps").c_str(), 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr)) {
+        LOGF_WARN("Renderer", "Pointer shader compilation failed: %s — pointer stays in the video",
+                  errBlob ? static_cast<const char*>(errBlob->GetBufferPointer()) : "(no message)");
+        return;
+    }
+
+    // out = pointer + (1 - pointer alpha) × picture
+    D3D11_BLEND_DESC blend = {};
+    blend.RenderTarget[0].BlendEnable           = TRUE;
+    blend.RenderTarget[0].SrcBlend              = D3D11_BLEND_ONE;
+    blend.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    blend.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    blend.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    blend.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
+    blend.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    D3D11_SAMPLER_DESC sampler = {};
+    sampler.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+
+    ComPtr<ID3D11PixelShader> shader;
+    if (FAILED(hr = device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
+                                               nullptr, &shader)) ||
+        FAILED(hr = device_->CreateBlendState(&blend, &pointerBlend_)) ||
+        FAILED(hr = device_->CreateSamplerState(&sampler, &pointerSampler_))) {
+        LOGF_WARN("Renderer", "Pointer resources failed (0x%08lX) — pointer stays in the video",
+                  (unsigned long)hr);
+        return;
+    }
+    pointerPixelShader_ = shader;
+}
+
+void D3D11Renderer::SetPointerImage(const uint8_t* bgra, int width, int height) {
+    pointerSRV_.Reset();
+    pointerWidth_ = pointerHeight_ = 0;
+    if (!bgra || width < 1 || height < 1 || deviceLost_ || !pointerPixelShader_) return;
+
+    // RGBA is sampleable on every feature level
+    std::vector<uint8_t> rgba(bgra, bgra + static_cast<size_t>(width) * height * 4);
+    for (size_t i = 0; i < rgba.size(); i += 4) std::swap(rgba[i], rgba[i + 2]);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = static_cast<UINT>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA init = { rgba.data(), static_cast<UINT>(width * 4), 0 };
+
+    ComPtr<ID3D11Texture2D> texture;
+    HRESULT hr = device_->CreateTexture2D(&desc, &init, &texture);
+    if (SUCCEEDED(hr)) hr = device_->CreateShaderResourceView(texture.Get(), nullptr, &pointerSRV_);
+    if (FAILED(hr)) {
+        CheckDeviceLost(hr, "pointer texture");
+        char code[16];
+        snprintf(code, sizeof(code), "0x%08lX", (unsigned long)hr);
+        LOG_EVERY_MS(5000, LogLevel::Warning, "Renderer") << "Pointer texture failed: " << code;
+        pointerSRV_.Reset();
+        return;
+    }
+    pointerWidth_ = width;
+    pointerHeight_ = height;
+}
+
+void D3D11Renderer::DrawPointer(const PointerSprite& pointer) {
+    if (!pointerSRV_ || !pointerPixelShader_ || pointer.width != pointerWidth_ ||
+        pointer.height != pointerHeight_) {
+        return;
+    }
+    // The fullscreen-triangle vertex shader fills the viewport: a viewport the
+    // size of the image draws it 1:1, also partly outside the window
+    D3D11_VIEWPORT viewport = {};
+    viewport.TopLeftX = static_cast<float>(pointer.x);
+    viewport.TopLeftY = static_cast<float>(pointer.y);
+    viewport.Width    = static_cast<float>(pointer.width);
+    viewport.Height   = static_cast<float>(pointer.height);
+    viewport.MaxDepth = 1.0f;
+
+    const float blendFactor[4] = { 0, 0, 0, 0 };
+    context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);   // Direct2D may have drawn in between
+    context_->OMSetBlendState(pointerBlend_.Get(), blendFactor, 0xFFFFFFFF);
+    context_->RSSetViewports(1, &viewport);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->IASetInputLayout(nullptr);
+    context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
+    context_->PSSetShader(pointerPixelShader_.Get(), nullptr, 0);
+    context_->PSSetShaderResources(0, 1, pointerSRV_.GetAddressOf());
+    context_->PSSetSamplers(0, 1, pointerSampler_.GetAddressOf());
+    context_->Draw(3, 0);
+
+    // The video and test pattern draw opaque
+    ID3D11ShaderResourceView* none = nullptr;
+    context_->PSSetShaderResources(0, 1, &none);
+    context_->OMSetBlendState(nullptr, blendFactor, 0xFFFFFFFF);
 }
 
 // =============================================================================

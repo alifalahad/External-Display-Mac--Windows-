@@ -10,17 +10,22 @@
 //   wrongcode — types a wrong code first: refused, new code, then pairs
 //   rejected  — the Mac user rejects: no session, user told, no retries
 // Streaming runs then check the encrypted stream: frames, timing prefix,
-// H.264 start codes, clock sync, SENDER_STATS, nothing lost.
+// H.264 start codes, clock sync, SENDER_STATS, nothing lost — and the pointer
+// drawn here (docs/SMOOTHNESS.md, step 1): RECEIVER_CAPS asks for it, the Mac
+// sends CURSOR_SHAPE / CURSOR_POSITION, ending with a scripted path. The
+// paired run switches it off and on again (F4); wrongcode never asks.
 //
 //   ReceiverClient <host> <seconds> <code-file> <mode>
 // =============================================================================
 
 #include "Network/StreamReceiver.h"
+#include "Input/Pointer.h"
 #include "Security/PairingManager.h"
 #include "Performance/PipelineMetrics.h"
 #include "Performance/PipelineClock.h"
 #include "App/Log.h"
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <mutex>
@@ -57,9 +62,30 @@ int main(int argc, char** argv) {
         std::printf("[Client] START_STREAM %ux%u @ %u\n", w, h, fps);
         streamStarted = true;
     });
+
+    // Pointer drawn here: every message must parse
+    const bool askPointer = mode != "wrongcode";
+    std::vector<PointerShape> shapes;
+    std::vector<PointerPosition> positions;
+    int malformedPointer = 0;
+    int pointerRequests = askPointer ? 1 : 0;
+    rx.setReceiverCaps(askPointer ? exdp::CAP_LOCAL_CURSOR : 0);
+    rx.setPointerCallbacks(
+        [&](const uint8_t* d, size_t n) {
+            std::lock_guard<std::mutex> lock(m);
+            PointerShape shape;
+            if (ParsePointerShape(d, n, shape)) shapes.push_back(std::move(shape)); else malformedPointer++;
+        },
+        [&](const uint8_t* d, size_t n) {
+            std::lock_guard<std::mutex> lock(m);
+            PointerPosition p;
+            if (ParsePointerPosition(d, n, p)) positions.push_back(p); else malformedPointer++;
+        });
     rx.connect(host);
 
     int codeRequests = 0;
+    int64_t streamStartUs = 0;
+    int pointerToggle = 0;
     bool askedKeyframe = false;
     int64_t end = PipelineClock::NowUs() + (int64_t)seconds * 1000000;
     while (PipelineClock::NowUs() < end) {
@@ -82,6 +108,17 @@ int main(int argc, char** argv) {
                         : result == StreamReceiver::CodeResult::Mismatch ? "mismatch (refused)" : "expired");
         }
         if (streamStarted && !askedKeyframe) { rx.requestKeyframe(); askedKeyframe = true; }
+        // Paired run: F4 off and on again, sent at once over the running session
+        if (streamStarted && !streamStartUs) streamStartUs = PipelineClock::NowUs();
+        const int64_t sinceStartUs = streamStartUs ? PipelineClock::NowUs() - streamStartUs : 0;
+        if (mode == "paired" && pointerToggle == 0 && sinceStartUs > 5'000'000) {
+            rx.setReceiverCaps(0);
+            pointerToggle = 1;
+        } else if (mode == "paired" && pointerToggle == 1 && sinceStartUs > 6'000'000) {
+            rx.setReceiverCaps(exdp::CAP_LOCAL_CURSOR);
+            pointerToggle = 2;
+            pointerRequests++;
+        }
         Sleep(20);
     }
 
@@ -111,6 +148,28 @@ int main(int argc, char** argv) {
                 encode.summary().avgMs, network.summary().avgMs, sync.smoothedRttMs, sync.errorBoundMs,
                 mac.valid ? "ok" : "missing", mac.encodeFps, mac.hardwareEncoder);
 
+    // The scripted path: the last 101 positions (diagonal, then off-display)
+    bool scriptedPath = positions.size() >= 101 && !positions.back().visible;
+    for (size_t i = 0; scriptedPath && i < 100; i++) {
+        const PointerPosition& p = positions[positions.size() - 101 + i];
+        const float t = static_cast<float>(i) / 99.0f;
+        scriptedPath = p.visible && std::fabs(p.x - t) < 1e-6f && std::fabs(p.y - t) < 1e-6f;
+    }
+    bool shapesDrawable = !shapes.empty();
+    for (const PointerShape& s : shapes) {
+        bool opaque = false;
+        for (size_t i = 3; i < s.bgra.size(); i += 4) opaque = opaque || s.bgra[i] == 255;
+        shapesDrawable = shapesDrawable && opaque && s.scale > 0;
+    }
+    if (!shapes.empty()) {
+        const PointerShape& last = shapes.back();
+        std::printf("[Client] pointer: %zu shapes (last %dx%d, hot spot %d,%d, scale %.2f), %zu positions, "
+                    "%d malformed, asked %d time(s)\n", shapes.size(), last.width, last.height,
+                    last.hotspotX, last.hotspotY, last.scale, positions.size(), malformedPointer, pointerRequests);
+    } else {
+        std::printf("[Client] pointer: no shapes, %zu positions, asked %d time(s)\n", positions.size(), pointerRequests);
+    }
+
     int failures = 0;
     auto expect = [&](bool c, const char* what) { if (!c) { failures++; std::printf("  FAIL: %s\n", what); } };
     if (mode == "rejected") {
@@ -134,6 +193,15 @@ int main(int argc, char** argv) {
     expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
     expect(sync.valid && sync.smoothedRttMs < 50, "clock sync converged over the encrypted channel");
     expect(mac.valid && mac.encodeFps > 30, "SENDER_STATS received (encrypted control message)");
+    expect(malformedPointer == 0, "every pointer message parses");
+    if (askPointer) {
+        // Per request: the real monitor's image and the scripted arrow
+        expect(shapes.size() >= static_cast<size_t>(2 * pointerRequests), "pointer images for every request");
+        expect(shapesDrawable, "pointer images have an opaque body");
+        expect(scriptedPath, "scripted pointer path arrived complete and in order");
+    } else {
+        expect(shapes.empty() && positions.empty(), "no pointer messages unless asked for");
+    }
     std::printf("[Client] %s (%d failures)\n", failures ? "FAILED" : "PASSED", failures);
     return failures ? 1 : 0;
 }

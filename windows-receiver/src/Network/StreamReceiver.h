@@ -170,6 +170,19 @@ public:
         }
     }
 
+    // ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────
+
+    /// What we tell the Mac once the session is encrypted (RECEIVER_CAPS,
+    /// exdp::CAP_*). A change during a session is sent at once. Any thread.
+    void setReceiverCaps(uint32_t flags);
+
+    /// CURSOR_SHAPE / CURSOR_POSITION payloads (decrypted), network thread
+    using PointerCallback = std::function<void(const uint8_t* data, size_t len)>;
+    void setPointerCallbacks(PointerCallback shape, PointerCallback position) {
+        m_cursorShapeCallback = std::move(shape);
+        m_cursorPositionCallback = std::move(position);
+    }
+
     // ── Clipboard Sync ──────────────────────────────────────────────────────
 
     using ClipboardCallback = std::function<void(const std::string& utf8Text)>;
@@ -280,6 +293,10 @@ private:
     FrameCallback m_frameCallback;
     StreamInfoCallback m_streamInfoCallback;
     ClipboardCallback m_clipboardCallback;
+    PointerCallback m_cursorShapeCallback;
+    PointerCallback m_cursorPositionCallback;
+    std::atomic<uint32_t> m_receiverCaps{0};
+    void sendReceiverCaps();
 
     std::mutex m_sendMutex;   // TCP sends come from network, UI and UDP threads
     uint32_t m_sequence = 0;  // guarded by m_sendMutex

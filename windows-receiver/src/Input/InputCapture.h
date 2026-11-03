@@ -38,6 +38,12 @@ public:
     void onKeyDown(uint16_t vkCode);
     void onKeyUp(uint16_t vkCode);
 
+    /// A move held back by the 120 Hz limit goes out once it is due, so the
+    /// Mac's pointer ends exactly where ours stopped. Call from the main loop.
+    void flushPendingMove();
+    /// Microseconds until the held-back move is due (-1: none)
+    int64_t pendingMoveDueInUs() const;
+
 private:
     void sendEvent(exdp::InputEventPayload& evt);
     uint32_t getModifiers() const;
@@ -53,6 +59,8 @@ private:
     // Mouse move throttle (max 120 events/sec)
     std::chrono::steady_clock::time_point m_lastMouseMove;
     static constexpr int MOUSE_MOVE_INTERVAL_US = 8333; // ~120 Hz
+    bool m_movePending = false;
+    int m_pendingX = 0, m_pendingY = 0, m_pendingW = 0, m_pendingH = 0;
 
     // Modifier state tracking
     bool m_shiftDown = false;

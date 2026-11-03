@@ -223,6 +223,12 @@ void StreamReceiver::runConnectionLoop(std::string host) {
                         m_clipboardCallback(text);
                     }
                     break;
+                case exdp::MessageType::CursorShape:
+                    if (m_cursorShapeCallback) m_cursorShapeCallback(payload.data(), payload.size());
+                    break;
+                case exdp::MessageType::CursorPosition:
+                    if (m_cursorPositionCallback) m_cursorPositionCallback(payload.data(), payload.size());
+                    break;
                 case exdp::MessageType::KeyExchange:
                     keepConnection = handleKeyExchange(payload);
                     break;
@@ -1040,7 +1046,20 @@ bool StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
     }
     LOG_INFO("Pairing") << (accept.newlyPaired ? "Paired with the Mac" : "Authenticated")
                         << " — connection encrypted (AES-256-GCM)";
+    sendReceiverCaps();
     return true;
+}
+
+void StreamReceiver::setReceiverCaps(uint32_t flags) {
+    if (m_receiverCaps.exchange(flags) == flags) return;
+    if (isSecure()) sendReceiverCaps();
+}
+
+void StreamReceiver::sendReceiverCaps() {
+    exdp::ReceiverCapsPayload caps;
+    caps.flags = m_receiverCaps.load();
+    LOGF_INFO("Net", "Telling the Mac: pointer drawn %s", (caps.flags & exdp::CAP_LOCAL_CURSOR) ? "here" : "in the video");
+    tcpSendMessage(exdp::MessageType::ReceiverCaps, &caps, sizeof(caps));
 }
 
 bool StreamReceiver::handlePairReject(const std::vector<uint8_t>& payload) {

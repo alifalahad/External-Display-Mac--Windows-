@@ -55,6 +55,21 @@ public:
     // Last number key 1-9 pressed (0 = none), cleared on read — picks a Mac
     int TakeDigitKey()           { int d = digitKey_; digitKey_ = 0; return d; }
 
+    // ── Pointer (docs/SMOOTHNESS.md, step 1) ──────────────────────────────────
+    // Over the client area: `cursor`, or Windows' arrow when nullptr; nothing
+    // when hide. Applied at once if the pointer is over the window.
+    void SetClientCursor(HCURSOR cursor, bool hide);
+    // The mouse moved over the client area since the last call (client pixels)
+    bool TakeMouseMove(int& x, int& y) {
+        if (!mouseMoved_) return false;
+        mouseMoved_ = false;
+        x = mouseX_;
+        y = mouseY_;
+        return true;
+    }
+    // F4 pressed: pointer drawn here ↔ pointer in the video
+    bool TakePointerToggle()     { bool t = pointerToggle_; pointerToggle_ = false; return t; }
+
 private:
     void RegisterWindowClass();
     void CreateFullscreenWindow(const wchar_t* title);
@@ -70,6 +85,14 @@ private:
     bool showStats_  = true;
     bool resumed_    = false;
     int  digitKey_   = 0;
+
+    // Pointer over the client area
+    HCURSOR CurrentClientCursor() const;
+    HCURSOR clientCursor_ = nullptr;   // not owned
+    bool hideCursor_      = false;
+    bool mouseMoved_      = false;
+    int  mouseX_ = -1, mouseY_ = -1;
+    bool pointerToggle_   = false;
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;

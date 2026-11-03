@@ -10,6 +10,7 @@
 //     --verbose                              same as --log=debug
 //     --console                              show a console window with the log
 //     --test-pattern                         no network: animated test pattern
+//     --cursor=local|video                   pointer drawn here (default) or in the video
 // =============================================================================
 
 #include "App/Log.h"
@@ -26,6 +27,7 @@ struct Options {
     LogLevel      logLevel = LogLevel::Info;
     bool          showConsole = false;
     bool          testPattern = false;
+    bool          localCursor = true;           // docs/SMOOTHNESS.md, step 1
     std::vector<std::string> warnings;          // unknown / malformed options
 };
 

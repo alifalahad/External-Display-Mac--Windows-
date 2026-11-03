@@ -4,11 +4,12 @@
 
 | Suite | Runs on | Covers |
 |---|---|---|
-| `mac-sender/Tests/ExternalDisplayTests` (XCTest, 28 tests) | Mac | wire layout and malformed input, CRC, version; crypto vectors shared with Windows, invalid keys, tampering, nonce counters; pairing storage (0600, reload, forget, v1 removal) and approval rules; adaptive quality (hysteresis, presets, clamping); rolling statistics; input mapping (clamping, key codes); hardware encoder (keyframes, SPS, timing prefix room) |
+| `mac-sender/Tests/ExternalDisplayTests` (XCTest, 35 tests) | Mac | wire layout and malformed input, CRC, version; crypto vectors shared with Windows, invalid keys, tampering, nonce counters; pairing storage (0600, reload, forget, v1 removal) and approval rules; adaptive quality (hysteresis, presets, clamping); rolling statistics; input mapping (clamping, key codes, live display bounds); hardware encoder (keyframes, SPS, timing prefix room); pointer: payload bytes shared with Windows, bitmaps from real macOS cursors (size, hot spot, orientation, premultiplied), size cap, which moves are reported (echoes, other displays) |
 | `PipelineMetricsTests` (88 checks) | any OS | clock sync, latency stages, percentiles, jitter, rates and drops, benchmark files, overlay text, payload layout |
-| `AppLogicTests` (59 checks) | any OS | command line, status card texts, Mac selection, mouse mapping through letterbox/pillarbox, UTF-8, logging levels/file/rate limit, replay window |
+| `AppLogicTests` (63 checks) | any OS | command line, status card texts, Mac selection, mouse mapping through letterbox/pillarbox, UTF-8, logging levels/file/rate limit, replay window |
 | `SecureChannelTests` (64 checks) | Windows | CNG self-test, HKDF (RFC 5869), HMAC (RFC 4231), ECDH/key schedule/AES-GCM against the Mac's vectors, replay and forgery rejection, DPAPI |
-| `tests/integration/run-loopback.sh` | Mac + MinGW + Wine | the real Mac sender (synthetic 720p60 frames, real VideoToolbox) ↔ the real Windows receiver networking (Windows build under Wine), on test ports: new pairing, paired reconnect, impostor key, wrong code, rejected pairing; encrypted streaming, timing, start codes, clock sync, statistics |
+| `PointerTests` (70 checks) | any OS; Windows for the cursor part | pointer payloads (the Mac's bytes), hostile input, resampling, placement through the letterbox, which pointer shows when (F3, F4, Mac or PC moved last), building the Windows cursor |
+| `tests/integration/run-loopback.sh` | Mac + MinGW + Wine | the real Mac sender (synthetic 720p60 frames, real VideoToolbox) ↔ the real Windows receiver networking (Windows build under Wine), on test ports: new pairing, paired reconnect, impostor key, wrong code, rejected pairing; encrypted streaming, timing, start codes, clock sync, statistics; pointer drawn by the receiver (real pointer image, a scripted path checked point by point, switched off and on, nothing sent unless asked) |
 
 ```bash
 # Mac
@@ -23,7 +24,8 @@ cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build && ctest --test-dir 
 ```
 
 The portable C++ suites also build on macOS/Linux:
-`c++ -std=c++17 -Isrc tests/AppLogicTests.cpp src/App/{Options,StatusText,Log}.cpp`.
+`c++ -std=c++17 -Isrc tests/AppLogicTests.cpp src/App/{Options,StatusText,Log}.cpp`, and
+`c++ -std=c++17 -Isrc tests/PointerTests.cpp src/Input/Pointer.cpp`.
 
 ## What only real hardware can check
 
@@ -37,10 +39,13 @@ each Windows laptop:
    without user action.
 3. **Input:** move the mouse to all four corners of the picture (also in a window, F11) and click
    small targets near the edges. Type in a text field, including Shift/Ctrl/Alt combinations.
-4. **Clipboard:** copy text each way. Then turn "Share clipboard" off and check nothing crosses.
-5. **Quality presets:** switch Battery Saver / Balanced / High while streaming. FPS and bitrate
+4. **Pointer** (F3 on): it follows the mouse with no delay and changes shape over text, links and
+   window edges. Move it with the Mac's trackpad: it shows on the PC. F4 switches to the pointer
+   in the video for comparison. Details: [SMOOTHNESS.md](SMOOTHNESS.md#checklist-for-step-1-on-each-laptop).
+5. **Clipboard:** copy text each way. Then turn "Share clipboard" off and check nothing crosses.
+6. **Quality presets:** switch Battery Saver / Balanced / High while streaming. FPS and bitrate
    follow (F2).
-6. **Benchmark:** `--bench=60` with moving content; keep `bench-*-summary.txt`
+7. **Benchmark:** `--bench=60` with moving content; keep `bench-*-summary.txt`
    ([PERFORMANCE.md](PERFORMANCE.md)).
 
 ## Stress (30 min / 1 h / 4 h)

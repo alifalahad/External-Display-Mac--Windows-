@@ -40,6 +40,12 @@ static void TestOptions() {
     o = ParseOptions("--verbose --renderer=compatible --test-pattern");
     CHECK(o.logLevel == LogLevel::Debug && o.renderer == RendererMode::Compatible && o.testPattern);
 
+    // Pointer drawn here unless asked for the old way (docs/SMOOTHNESS.md, step 1)
+    CHECK(ParseOptions("").localCursor);
+    CHECK(!ParseOptions("--cursor=video").localCursor);
+    CHECK(ParseOptions("--cursor=video --cursor=local").localCursor);
+    CHECK(ParseOptions("--cursor=both").warnings.size() == 1);
+
     o = ParseOptions("--bench=abc --log=loud --frobnicate 10.0.0.1 10.0.0.2");
     CHECK(o.benchSeconds == 0);
     CHECK(o.macAddress == "10.0.0.1");

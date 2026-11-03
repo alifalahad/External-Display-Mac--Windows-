@@ -5,6 +5,8 @@
 #include "App/ReceiverApp.h"
 #include "App/Log.h"
 #include "App/Utf8.h"
+#include "Input/PointerCursor.h"
+#include "Input/VideoViewport.h"
 #include "Performance/PipelineClock.h"
 #include "UI/PinPrompt.h"
 
@@ -71,6 +73,7 @@ ReceiverApp::ReceiverApp(Window& window, const Options& options)
     LOG_INFO("Renderer") << "Rendering on " << WideToUtf8(renderer_->GetAdapterName()) << " ("
                          << RendererModeName(renderer_->GetMode()) << " mode)";
     wakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    localPointerWanted_ = options_.localCursor;
 }
 
 ReceiverApp::~ReceiverApp() {
@@ -78,6 +81,8 @@ ReceiverApp::~ReceiverApp() {
     if (receiver_) receiver_->disconnect();   // joins the network threads
     if (decoder_) decoder_->shutdown();
     window_.SetInputCapture(nullptr);
+    window_.SetClientCursor(nullptr, false);
+    if (macCursor_) DestroyIcon(macCursor_);
     if (wakeEvent_) CloseHandle(wakeEvent_);
 }
 
@@ -144,6 +149,33 @@ void ReceiverApp::connectTo(const std::string& address, const std::string& servi
         renderer_->UpdateFrameNV12(yData, uvData, stride, w, h);
         onPictureDecoded(timeline);
     });
+
+    // Pointer drawn here (docs/SMOOTHNESS.md, step 1): only the newest shape
+    // and position wait for the UI thread
+    receiver_->setReceiverCaps(localPointerWanted_ && renderer_->CanDrawPointer() ? exdp::CAP_LOCAL_CURSOR : 0);
+    receiver_->setPointerCallbacks(
+        [this](const uint8_t* data, size_t len) {
+            auto shape = std::make_unique<PointerShape>();
+            if (!ParsePointerShape(data, len, *shape)) {
+                LOG_EVERY_MS(5000, LogLevel::Warning, "Input") << "Ignoring a malformed CURSOR_SHAPE";
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(pointerMutex_);
+                pendingShape_ = std::move(shape);
+            }
+            SetEvent(wakeEvent_);
+        },
+        [this](const uint8_t* data, size_t len) {
+            PointerPosition position;
+            if (!ParsePointerPosition(data, len, position)) return;
+            {
+                std::lock_guard<std::mutex> lock(pointerMutex_);
+                pendingPosition_ = position;
+                pendingPositionValid_ = true;
+            }
+            SetEvent(wakeEvent_);
+        });
 
     receiver_->setPairingManager(pairing_.get());
     std::string name = serviceName;
@@ -320,11 +352,13 @@ void ReceiverApp::run() {
             if (!message.empty()) setNote(message);
         }
         if (clipboard_) clipboard_->poll();
+        if (input_) input_->flushPendingMove();
         decodePending();
 
         int64_t nowUs = PipelineClock::NowUs();
         updateOverlay(nowUs);
         updateStatus(nowUs);
+        updatePointer();
         renderIfNeeded(nowUs);
         trackScanout(nowUs);
         tickOncePerSecond(nowUs);
@@ -364,8 +398,10 @@ void ReceiverApp::handleRendererLoss() {
     // The new swap chain numbers its presents from scratch
     for (const auto& p : pendingDisplay_) finishFrame(p.timeline);
     pendingDisplay_.clear();
-    // A hardware decoder is bound to the old device
+    // A hardware decoder is bound to the old device, and so was the pointer image
     if (decoder_ && streamWidth_) restartDecoder(streamWidth_, streamHeight_);
+    spriteShapeId_ = 0;
+    spriteW_ = spriteH_ = 0;
     forceRender_ = true;
 }
 
@@ -507,6 +543,97 @@ void ReceiverApp::updateStatus(int64_t nowUs) {
     lastStatusUs_ = nowUs;
 }
 
+void ReceiverApp::updatePointer() {
+    // F4: compare the pointer drawn here with the pointer in the video
+    if (window_.TakePointerToggle()) {
+        localPointerWanted_ = !localPointerWanted_;
+        LOG_INFO("Input") << "Pointer " << (localPointerWanted_ ? "drawn on this PC" : "in the video") << " (F4)";
+        lastOverlayUs_ = 0;   // the overlay names the mode
+    }
+
+    // What the Mac sent since the last loop (only the newest counts)
+    {
+        std::lock_guard<std::mutex> lock(pointerMutex_);
+        if (pendingShape_) {
+            pointer_.onShape(std::move(*pendingShape_));
+            pendingShape_.reset();
+        }
+        if (pendingPositionValid_) {
+            pointer_.onMacPosition(pendingPosition_);
+            pendingPositionValid_ = false;
+        }
+    }
+
+    // Drawn here only if this renderer can; otherwise the Mac keeps it in the video
+    const bool local = localPointerWanted_ && renderer_->CanDrawPointer();
+    if (receiver_) receiver_->setReceiverCaps(local ? exdp::CAP_LOCAL_CURSOR : 0);
+    pointer_.setLocalPointer(local);
+    pointer_.setForwarding(input_ && input_->isEnabled());
+
+    const int w = window_.GetWidth(), h = window_.GetHeight();
+    const float aspect = window_.GetVideoAspectRatio();
+    int mx = 0, my = 0;
+    if (window_.TakeMouseMove(mx, my)) {
+        float u = 0, v = 0;
+        WindowToVideo(mx, my, w, h, aspect, u, v);
+        pointer_.onLocalMove(u, v);
+    }
+
+    // Before the picture (status card, pairing): Windows' normal arrow
+    const bool streaming = !showStatus_ && renderer_->HasVideoFrame();
+    const PointerView view = streaming ? pointer_.view() : PointerView::System;
+    const PointerShape* shape = pointer_.shape();
+
+    // Windows' own pointer, wearing the Mac's image
+    HCURSOR retired = nullptr;
+    if (view == PointerView::MacShape && shape) {
+        const PointerPlacement place = PlacePointer(*shape, 0, 0, w, h, aspect, streamWidth_);
+        if (!macCursor_ || macCursorShapeId_ != shape->id || macCursorW_ != place.width ||
+            macCursorH_ != place.height) {
+            std::vector<uint8_t> pixels = ResampleBgra(shape->bgra, shape->width, shape->height,
+                                                       place.width, place.height);
+            UnpremultiplyBgra(pixels);
+            HCURSOR cursor = pixels.empty() ? nullptr
+                : CreatePointerCursor(pixels.data(), place.width, place.height, place.hotspotX, place.hotspotY);
+            if (cursor) {
+                retired = macCursor_;
+                macCursor_ = cursor;
+                macCursorShapeId_ = shape->id;
+                macCursorW_ = place.width;
+                macCursorH_ = place.height;
+            } else {
+                LOG_EVERY_MS(5000, LogLevel::Warning, "Input") << "Could not make a Windows pointer from the Mac's image";
+            }
+        }
+    }
+    window_.SetClientCursor(view == PointerView::MacShape ? macCursor_ : nullptr, view == PointerView::Hidden);
+    if (retired) DestroyIcon(retired);   // replaced above: no longer set
+
+    // The pointer we draw: where the Mac says it is
+    if (streaming && shape && pointer_.drawPointer()) {
+        const PointerPosition mac = pointer_.macPosition();
+        const PointerPlacement place = PlacePointer(*shape, mac.x, mac.y, w, h, aspect, streamWidth_);
+        if (spriteShapeId_ != shape->id || spriteW_ != place.width || spriteH_ != place.height) {
+            std::vector<uint8_t> pixels = ResampleBgra(shape->bgra, shape->width, shape->height,
+                                                       place.width, place.height);
+            renderer_->SetPointerImage(pixels.empty() ? nullptr : pixels.data(), place.width, place.height);
+            spriteShapeId_ = shape->id;
+            spriteW_ = place.width;
+            spriteH_ = place.height;
+            forceRender_ = true;
+        }
+        const PointerSprite next{ place.x, place.y, place.width, place.height };
+        if (!spriteShown_ || next != sprite_) {
+            sprite_ = next;
+            spriteShown_ = true;
+            forceRender_ = true;
+        }
+    } else if (spriteShown_) {
+        spriteShown_ = false;
+        forceRender_ = true;
+    }
+}
+
 void ReceiverApp::updateOverlay(int64_t nowUs) {
     // Rebuilt 4× per second (DirectWrite layout is not free)
     if (window_.ShowStats() != lastShowStats_) {
@@ -527,9 +654,10 @@ void ReceiverApp::updateOverlay(int64_t nowUs) {
         in.sync = receiver_->clockEstimate();
         in.mac = receiver_->senderStats();
         wchar_t line[160];
-        swprintf(line, 160, L"%ls%ls %ux%u -> window %dx%d", StateName(receiver_->getState()),
+        swprintf(line, 160, L"%ls%ls %ux%u -> window %dx%d | pointer %ls (F4)", StateName(receiver_->getState()),
                  receiver_->isSecure() ? L" (encrypted)" : L"", streamWidth_, streamHeight_,
-                 window_.GetWidth(), window_.GetHeight());
+                 window_.GetWidth(), window_.GetHeight(),
+                 localPointerWanted_ && renderer_->CanDrawPointer() ? L"drawn here" : L"in the video");
         in.connection = line;
     } else {
         in.connection = options_.testPattern ? L"Test pattern (no Mac connection)" : L"Looking for a Mac";
@@ -551,7 +679,8 @@ void ReceiverApp::renderIfNeeded(int64_t& nowUs) {
     const int64_t renderStartUs = PipelineClock::NowUs();
     renderer_->Render(elapsed, static_cast<float>(frameCounter_),
                       window_.ShowStats() ? &overlayText_ : nullptr,
-                      showStatus_ ? &status_ : nullptr);
+                      showStatus_ ? &status_ : nullptr,
+                      spriteShown_ ? &sprite_ : nullptr);
     nowUs = PipelineClock::NowUs();
     metrics_.onRender((nowUs - renderStartUs) / 1000.0);
     frameCounter_++;
@@ -673,6 +802,9 @@ void ReceiverApp::sleepUntilNeeded(int64_t nowUs) {
     // refresh or two: half a refresh period is precise enough.
     if (!decoding_.empty()) waitUs = (std::min)(waitUs, (int64_t)4'000);
     if (!pendingDisplay_.empty()) waitUs = (std::min)(waitUs, (int64_t)8'000);
+    // A mouse move held back by the 120 Hz limit
+    const int64_t moveDueUs = input_ ? input_->pendingMoveDueInUs() : -1;
+    if (moveDueUs >= 0) waitUs = (std::min)(waitUs, moveDueUs);
     if (waitUs > 0) {
         MsgWaitForMultipleObjectsEx(1, &wakeEvent_, static_cast<DWORD>((waitUs + 999) / 1000),
                                     QS_ALLINPUT, MWMO_INPUTAVAILABLE);

@@ -54,6 +54,9 @@ enum MessageType: UInt8 {
     case pairAccept     = 0x82   // Mac → Win: Mac's HMAC; encryption starts after it
     case pairReject     = 0x83   // Mac → Win: handshake refused (reason)
     case keyReveal      = 0x84   // Win → Mac: Windows' ephemeral key (was committed in HELLO)
+    case receiverCaps   = 0x90   // Win → Mac: what the receiver can do (ReceiverCapsPayload)
+    case cursorShape    = 0x91   // Mac → Win: pointer image, when it changes
+    case cursorPosition = 0x92   // Mac → Win: pointer moved on the Mac
     case disconnect     = 0xFF   // Both: clean shutdown
 
     // Data (UDP)
@@ -430,6 +433,88 @@ struct InputEventPayload {
         p.scrollDeltaX = Float(bitPattern: sxBits)
         p.scrollDeltaY = Float(bitPattern: syBits)
         return p
+    }
+}
+
+// ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────────
+
+/// RECEIVER_CAPS payload (Windows → Mac, 8 bytes): flags(4) | reserved(4).
+/// Sent once the session is encrypted, and again whenever it changes.
+struct ReceiverCapsPayload {
+    /// The receiver draws the pointer: capture without it, send CURSOR_SHAPE
+    /// and CURSOR_POSITION instead
+    static let localCursor: UInt32 = 1 << 0
+
+    var flags: UInt32 = 0
+
+    static func deserialize(from data: Data) -> ReceiverCapsPayload? {
+        guard data.count >= 4 else { return nil }
+        var offset = data.startIndex
+        return ReceiverCapsPayload(flags: data.readLE(at: &offset))
+    }
+}
+
+/// CURSOR_SHAPE payload (Mac → Windows): 24-byte header, then the bitmap
+///
+///   shapeId(8) | width(2) | height(2) | hotspotX(2) | hotspotY(2) |
+///   scale(4, float) | reserved(4) | pixels(width × height × 4)
+///
+/// Pixels are BGRA with premultiplied alpha, top row first. The hot spot is
+/// in bitmap pixels from the top-left. scale = stream pixels per bitmap pixel
+/// (the bitmap is drawn at 2× so the receiver can scale it down sharply).
+struct CursorShapePayload: Equatable {
+    static let headerSize = 24
+    static let maxSide = 256
+
+    var id: UInt64 = 0
+    var width: UInt16 = 0
+    var height: UInt16 = 0
+    var hotspotX: UInt16 = 0
+    var hotspotY: UInt16 = 0
+    var scale: Float = 1
+    var pixels = Data()
+
+    func serialize() -> Data {
+        var data = Data(capacity: Self.headerSize + pixels.count)
+        data.appendLE(id)
+        data.appendLE(width)
+        data.appendLE(height)
+        data.appendLE(hotspotX)
+        data.appendLE(hotspotY)
+        data.appendLE(scale.bitPattern)
+        data.appendLE(UInt32(0))
+        data.append(pixels)
+        return data
+    }
+
+    /// FNV-1a over everything except the id: the same image gets the same id
+    func computeId() -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ bytes: Data) {
+            for b in bytes { hash = (hash ^ UInt64(b)) &* 0x100000001b3 }
+        }
+        mix(Data(serialize().dropFirst(8)))
+        return hash
+    }
+}
+
+/// CURSOR_POSITION payload (Mac → Windows, 12 bytes): x(4) | y(4) | flags(4).
+/// x, y are 0…1 across the streamed display, as in INPUT_EVENT. Not visible:
+/// the pointer is on another display (x = y = 0).
+struct CursorPositionPayload: Equatable {
+    static let size = 12
+    static let visible: UInt32 = 1 << 0
+
+    var x: Float = 0
+    var y: Float = 0
+    var flags: UInt32 = 0
+
+    func serialize() -> Data {
+        var data = Data(capacity: Self.size)
+        data.appendLE(x.bitPattern)
+        data.appendLE(y.bitPattern)
+        data.appendLE(flags)
+        return data
     }
 }
 
