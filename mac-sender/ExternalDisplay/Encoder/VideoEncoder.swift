@@ -53,14 +53,18 @@ final class VideoEncoder {
 
     /// Bitrate currently in effect (adaptive quality may change it at runtime)
     private var currentBitrateBps: Int   // guarded by statsLock after init
+    /// Frame rate in effect (encoding thread); a recreated session keeps it
+    private var currentFps: Int
 
     // ── Stats ───────────────────────────────────────────────────────────────
 
     private var encodedFrameCount: UInt64 = 0
     private var encodedByteCount: UInt64 = 0
     private var keyframeCount: UInt64 = 0
-    private var latencies = RollingWindow(capacity: 120)   // ~2 s at 60 FPS
+    private var latencies = RollingWindow(capacity: 240)   // ~2 s at 120 FPS
     private var outputRate = RateMeter()                   // frames + bytes, last second
+    private var load = EncoderLoad()                       // keeps up with the frame rate? (step 7)
+    private var loadIntervalMs: Double                     // one frame at the current rate
     private let statsLock = NSLock()
 
     // ── Initialization ──────────────────────────────────────────────────────
@@ -68,6 +72,8 @@ final class VideoEncoder {
     init(config: EncoderConfig) throws {
         self.config = config
         self.currentBitrateBps = config.bitrateBps
+        self.currentFps = max(1, Int(config.fps.rounded()))
+        self.loadIntervalMs = 1000 / Double(max(1, Int(config.fps.rounded())))
         try createSession()
     }
 
@@ -143,14 +149,11 @@ final class VideoEncoder {
 
         // Keyframes on request (forceKeyframe); both limits apply, whichever
         // comes first. Frames only exist while the screen changes.
-        setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                     value: Int((config.fps * config.keyframeIntervalSeconds).rounded()) as CFNumber)
         setProperty(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                      value: config.keyframeIntervalSeconds as CFNumber)
-
-        // Expected frame rate (helps encoder allocate bits)
-        setProperty(kVTCompressionPropertyKey_ExpectedFrameRate,
-                     value: config.fps as CFNumber)
+        // Also the frame count of the safety keyframe, and the expected frame
+        // rate (helps the encoder allocate bits)
+        applyFrameRate(currentFps)
 
         // Disable B-frames for lowest latency
         if !config.allowFrameReordering {
@@ -209,11 +212,18 @@ final class VideoEncoder {
         Log.every(1, key: "bitrate-updated", .info, .encoder, "Bitrate updated: \(newBps / 1000) kbps")
     }
 
-    /// Quality preset changed the frame rate (helps VT allocate bits)
+    /// New stream frame rate (FrameRate.choose): helps VT allocate bits, and
+    /// keeps the safety keyframe at once a minute
     func updateFrameRate(_ fps: Int) {
         controlLock.lock()
         pendingFps = fps
         controlLock.unlock()
+    }
+
+    private func applyFrameRate(_ fps: Int) {
+        setProperty(kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                     value: Int((Double(fps) * config.keyframeIntervalSeconds).rounded()) as CFNumber)
+        setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
     }
 
     private func applyBitrate(_ bps: Int) {
@@ -244,12 +254,19 @@ final class VideoEncoder {
         pendingFps = nil
         controlLock.unlock()
 
+        if let newFps, newFps != currentFps {
+            currentFps = newFps
+            statsLock.lock()
+            loadIntervalMs = 1000 / Double(newFps)
+            load.reset()             // a new rate: judged afresh
+            statsLock.unlock()
+        }
         if needsReset {
-            recreateSession()        // takes the current bitrate itself
+            recreateSession()        // takes the current bitrate and frame rate itself
             forceKeyframe = true
         } else {
             if let newBitrate { applyBitrate(newBitrate) }
-            if let newFps { setProperty(kVTCompressionPropertyKey_ExpectedFrameRate, value: newFps as CFNumber) }
+            if newFps != nil { applyFrameRate(currentFps) }
         }
         guard let session = session else { return }
 
@@ -278,6 +295,19 @@ final class VideoEncoder {
         if status != noErr {
             handleEncodeFailure(status)
         }
+        // Above some size the call itself waits until the frame is encoded
+        let callMs = Double(HostClock.nowUs() - timing.encodeStartUs) / 1000
+        statsLock.lock()
+        load.recordCall(ms: callMs, intervalMs: loadIntervalMs)
+        statsLock.unlock()
+    }
+
+    /// Once a second (step 7): did the encoder fall behind the frame rate for
+    /// two seconds in a row? With the last second's figures.
+    func loadSecond() -> (behind: Bool, last: EncoderLoad.Second) {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return load.secondElapsed()
     }
 
     /// Phase 15: the hardware encoder session can be invalidated (sleep/wake,
@@ -348,6 +378,7 @@ final class VideoEncoder {
         if isKeyframe { keyframeCount += 1 }
         latencies.add(timing.encodeLatencyMs)
         outputRate.record(at: CACurrentMediaTime(), bytes: dataSize)
+        load.recordOutput(latencyMs: timing.encodeLatencyMs, intervalMs: loadIntervalMs)
         statsLock.unlock()
 
         // ── Notify listener ─────────────────────────────────────────────────

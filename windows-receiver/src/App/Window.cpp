@@ -220,6 +220,20 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
 
+    // Step 7: another monitor, or a new display mode, may have another refresh rate
+    case WM_DISPLAYCHANGE:
+        if (self) self->screenChange_ = true;
+        break;
+    case WM_MOVE:
+        if (self) {
+            HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (monitor != self->monitor_) {
+                self->monitor_ = monitor;
+                self->screenChange_ = true;
+            }
+        }
+        break;
+
     case WM_SIZE:
         if (self && wp != SIZE_MINIMIZED) {
             int newWidth  = LOWORD(lp);

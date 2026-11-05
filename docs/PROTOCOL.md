@@ -38,7 +38,7 @@ Integers are **little-endian**, except the two security fields marked *big-endia
 | 0x82 | PAIR_ACCEPT | Mac → PC | 40 bytes: newlyPaired u8, 7 reserved, HMAC(confirm-mac, TH) | no |
 | 0x83 | PAIR_REJECT | Mac → PC | 4 bytes: reason u8 (0 generic, 1 user rejected, 2 unknown device, 3 version, 4 bad handshake) | no |
 | 0x02 | WELCOME | Mac → PC | — | yes |
-| 0x10 | START_STREAM | Mac → PC | width, height, fps, bitrate, codec (u32 each) | yes |
+| 0x10 | START_STREAM | Mac → PC | width, height, fps, bitrate, codec (u32 each). fps is the rate at the start: the Mac may change it later without a new START_STREAM (step 7) | yes |
 | 0x11 | STOP_STREAM | Mac → PC | — | yes |
 | 0x20 / 0x21 | PING / PONG | both | PONG: the PING's timestamp (u64), so the PC can sync clocks | after auth |
 | 0x30 | KEYFRAME_REQ | PC → Mac | — (the Mac makes keyframes only when asked, plus one a minute) | yes |
@@ -47,7 +47,7 @@ Integers are **little-endian**, except the two security fields marked *big-endia
 | 0x52 | RATE_FEEDBACK | PC → Mac | 16 bytes every 100 ms while streaming: how long packets wait on the way (below) | yes |
 | 0x60 | INPUT_EVENT | PC → Mac | 24 bytes: type, button, key code, modifiers, x, y, scroll x, scroll y (x, y are 0…1 across the video) | yes |
 | 0x70 | CLIPBOARD | both | UTF-8 text (≤ 1 MB) | yes |
-| 0x90 | RECEIVER_CAPS | PC → Mac | 8 bytes: flags u32 (bit 0: the PC draws the pointer; bit 1: send VIDEO_PARITY; bit 2: pace datagrams), reserved u32. Sent after PAIR_ACCEPT and whenever it changes (F4) | yes |
+| 0x90 | RECEIVER_CAPS | PC → Mac | 8 bytes: flags u32 (bit 0: the PC draws the pointer; bit 1: send VIDEO_PARITY; bit 2: pace datagrams), refresh rate u32 (Hz of the screen showing the picture, 0 = unknown: the Mac streams at most that many frames per second, step 7). Sent after PAIR_ACCEPT and whenever it changes (F4, another monitor, a new display mode) | yes |
 | 0x91 | CURSOR_SHAPE | Mac → PC | pointer image, when it changes (below) | yes |
 | 0x92 | CURSOR_POSITION | Mac → PC | 12 bytes: x, y (f32, 0…1 across the video), flags u32 (bit 0: visible) | yes |
 | 0x40 | VIDEO_FRAME | Mac → PC (UDP) | one encrypted datagram: the whole frame | yes |

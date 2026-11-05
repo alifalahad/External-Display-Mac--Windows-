@@ -13,6 +13,8 @@
 //
 //   CGVirtualDisplayMode:
 //     - initWithWidth:height:refreshRate:
+//     (step 7: a 120 Hz and a 60 Hz mode; setRefreshRate switches between
+//     them with the public CGConfigureDisplayWithDisplayMode)
 //
 //   CGVirtualDisplaySettings:
 //     - modes (NSArray of CGVirtualDisplayMode)
@@ -42,6 +44,8 @@ final class VirtualDisplayManager: ObservableObject {
     /// Resolution of the virtual display
     @Published var width: Int = 1920
     @Published var height: Int = 1080
+    /// Refresh rate in effect (docs/SMOOTHNESS.md, step 7: 120 Hz for 120 FPS)
+    @Published private(set) var refreshHz: Double = 60
 
     // ── Private State ───────────────────────────────────────────────────────
 
@@ -56,8 +60,10 @@ final class VirtualDisplayManager: ObservableObject {
 
     // ── Create Virtual Display ──────────────────────────────────────────────
 
+    /// refreshHz: 120 for a stream at up to 120 FPS (step 7), else 60. Both
+    /// modes are offered, so setRefreshRate() can switch later.
     @discardableResult
-    func createDisplay(width: Int, height: Int) -> Bool {
+    func createDisplay(width: Int, height: Int, refreshHz: Double = 60) -> Bool {
         guard !isActive else {
             Log.debug(.display, "Already active")
             return false
@@ -134,9 +140,12 @@ final class VirtualDisplayManager: ObservableObject {
         if let settings = objcAllocInit(settingsClass) {
             // Create display mode using initWithWidth:height:refreshRate:
             // Since perform() can't pass primitive args, we use NSInvocation
-            if let mode = createMode(modeClass: modeClass, w: width, h: height, hz: 60.0) {
-                settings.setValue([mode], forKey: "modes")
-                Log.debug(.display, "Mode set: \(width)×\(height) @ 60Hz")
+            // The wanted refresh rate first: the display starts in it
+            let rates = refreshHz > 60 ? [refreshHz, 60.0] : [60.0, 120.0]
+            let modes = rates.compactMap { createMode(modeClass: modeClass, w: width, h: height, hz: $0) }
+            if !modes.isEmpty {
+                settings.setValue(modes, forKey: "modes")
+                Log.debug(.display, "Modes: \(width)×\(height) @ " + rates.map { "\(Int($0)) Hz" }.joined(separator: ", "))
             } else {
                 Log.warning(.display, "Could not create display mode, continuing without explicit modes")
             }
@@ -182,12 +191,14 @@ final class VirtualDisplayManager: ObservableObject {
         }
 
         if foundID != 0 {
+            let hz = Self.switchRefresh(of: foundID, to: refreshHz)
             DispatchQueue.main.async {
                 self.virtualDisplayID = foundID
                 self.isActive = true
                 self.errorMessage = nil
+                self.refreshHz = hz
             }
-            Log.info(.display, "Created: \(width)×\(height) @ 60Hz, ID=\(foundID)")
+            Log.info(.display, "Created: \(width)×\(height) @ \(Int(hz.rounded())) Hz, ID=\(foundID)")
             return true
         }
 
@@ -197,12 +208,14 @@ final class VirtualDisplayManager: ObservableObject {
         let finalIDs = getCurrentDisplayIDs()
         let finalNewIDs = finalIDs.subtracting(preExistingDisplayIDs)
         if let newID = finalNewIDs.first {
+            let hz = Self.switchRefresh(of: newID, to: refreshHz)
             DispatchQueue.main.async {
                 self.virtualDisplayID = newID
                 self.isActive = true
                 self.errorMessage = nil
+                self.refreshHz = hz
             }
-            Log.info(.display, "Created (delayed detection): \(width)×\(height), ID=\(newID)")
+            Log.info(.display, "Created (delayed detection): \(width)×\(height) @ \(Int(hz.rounded())) Hz, ID=\(newID)")
             return true
         }
 
@@ -221,6 +234,47 @@ final class VirtualDisplayManager: ObservableObject {
             self.errorMessage = nil
         }
         Log.info(.display, "Destroyed virtual display")
+    }
+
+    // ── Refresh rate (docs/SMOOTHNESS.md, step 7) ───────────────────────────
+
+    /// Main thread. Switch the virtual display to `hz` (60 or 120); returns the
+    /// refresh rate in effect afterwards.
+    @discardableResult
+    func setRefreshRate(_ hz: Double) -> Double {
+        guard isActive, virtualDisplayID != 0 else { return refreshHz }
+        refreshHz = Self.switchRefresh(of: virtualDisplayID, to: hz)
+        return refreshHz
+    }
+
+    /// The refresh rate a display runs at (0: unknown)
+    static func refreshRate(of id: CGDirectDisplayID) -> Double {
+        CGDisplayCopyDisplayMode(id)?.refreshRate ?? 0
+    }
+
+    /// Switch `id` to the mode of the same size at `hz`, if it has one
+    private static func switchRefresh(of id: CGDirectDisplayID, to hz: Double) -> Double {
+        guard let current = CGDisplayCopyDisplayMode(id) else { return 0 }
+        if abs(current.refreshRate - hz) < 1 { return current.refreshRate }
+        let modes = (CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode]) ?? []
+        guard let mode = modes.first(where: {
+            $0.width == current.width && $0.height == current.height && abs($0.refreshRate - hz) < 1
+        }) else {
+            Log.warning(.display, "No \(Int(hz)) Hz mode (this display offers "
+                        + modes.map { "\($0.width)×\($0.height) @ \(Int($0.refreshRate)) Hz" }.joined(separator: ", ")
+                        + "): staying at \(Int(current.refreshRate)) Hz")
+            return current.refreshRate
+        }
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let config else { return current.refreshRate }
+        CGConfigureDisplayWithDisplayMode(config, id, mode, nil)
+        guard CGCompleteDisplayConfiguration(config, .forSession) == .success else {
+            Log.warning(.display, "Could not switch to \(Int(hz)) Hz: staying at \(Int(current.refreshRate)) Hz")
+            return current.refreshRate
+        }
+        let now = refreshRate(of: id)
+        Log.info(.display, "Refresh rate \(Int(current.refreshRate)) → \(Int(now.rounded())) Hz")
+        return now
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────

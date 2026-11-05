@@ -171,6 +171,27 @@ Same benchmark after the changes below. Compare against the table above. The ben
 now records the decoder (hardware/software), the renderer mode and 32/64-bit, so runs on
 different laptops can be compared.
 
+### 120 Hz (smoothness step 7)
+
+The encoder on an M2, 2026-11-05: the app's VideoEncoder settings (hardware, low-latency rate
+control), synthetic content scrolling like a web page, 6 s per row:
+
+| Size | 60 FPS: per frame | 120 FPS: per frame | 120 FPS: frames a second |
+|---|---|---|---|
+| 1920×1080 | 8.3–8.5 ms | 8.1–8.2 ms | 119.7 |
+| 1920×1200 | 7.3 ms | 7.0 ms | 118.8 |
+| 2560×1440 | 10.2–10.4 ms | 9.8–10.0 ms | 92–95 (too slow: 60 FPS) |
+| 2560×1600 | 10.7–11.2 ms | 10.6–10.8 ms | 85–87 (too slow: 60 FPS) |
+
+At 1920×1080 the encode call returns at once; from 1920×1200 up it blocks until the frame is
+done. A frame does not take longer at 120 FPS, but at 1920×1080 the encoder is busy nearly all
+the time, so the Mac uses more power on High at 120 FPS.
+
+What 120 Hz should save on a 120 Hz screen: about 4 ms of waiting before capture and 4 ms before
+the frame shows, on average. That is not measured yet (it needs the real app and a 120 Hz PC).
+Compare `--bench=60` with `--bench=60 --max-fps=60` on the same laptop. The summary records the
+screen's refresh rate.
+
 ### Bitrate that follows the delay (smoothness step 6)
 
 Loopback, 2026-11-03: the real Mac sender and VideoToolbox encoder against the real Windows

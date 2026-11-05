@@ -81,6 +81,8 @@ private:
     void updateDisplayPath();
     /// RECEIVER_CAPS: pointer drawn here, parity, pacing
     uint32_t wantedCaps() const;
+    /// RECEIVER_CAPS: this screen's refresh rate, at most --max-fps (step 7)
+    uint32_t reportedRefreshHz() const { return ReportedRefreshHz(screenHz_, options_.maxFps); }
     void renderIfNeeded(int64_t& nowUs);
     void trackScanout(int64_t nowUs);
     void tickOncePerSecond(int64_t nowUs);
@@ -173,6 +175,7 @@ private:
     PointerModel pointer_;
     bool localPointerWanted_ = true;         // --cursor, F4
     bool presentImmediately_ = false;        // --present, F5 (docs/SMOOTHNESS.md, step 3)
+    uint32_t screenHz_ = 0;                  // refresh rate of the window's monitor (step 7)
     HCURSOR macCursor_ = nullptr;            // Windows pointer with the Mac's image
     uint64_t macCursorShapeId_ = 0;
     int macCursorW_ = 0, macCursorH_ = 0;

@@ -481,8 +481,9 @@ struct InputEventPayload {
 
 // ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────────
 
-/// RECEIVER_CAPS payload (Windows → Mac, 8 bytes): flags(4) | reserved(4).
+/// RECEIVER_CAPS payload (Windows → Mac, 8 bytes): flags(4) | refreshHz(4).
 /// Sent once the session is encrypted, and again whenever it changes.
+/// refreshHz: the screen showing the picture (step 7); 0 from older receivers.
 struct ReceiverCapsPayload {
     /// The receiver draws the pointer: capture without it, send CURSOR_SHAPE
     /// and CURSOR_POSITION instead
@@ -493,11 +494,14 @@ struct ReceiverCapsPayload {
     static let pacing: UInt32 = 1 << 2
 
     var flags: UInt32 = 0
+    var refreshHz: UInt32 = 0
 
     static func deserialize(from data: Data) -> ReceiverCapsPayload? {
         guard data.count >= 4 else { return nil }
         var offset = data.startIndex
-        return ReceiverCapsPayload(flags: data.readLE(at: &offset))
+        var caps = ReceiverCapsPayload(flags: data.readLE(at: &offset))
+        if data.count >= 8 { caps.refreshHz = data.readLE(at: &offset) }
+        return caps
     }
 }
 

@@ -3,7 +3,8 @@
 // =============================================================================
 // The adaptive controller (AdaptiveQuality.swift) still follows the network,
 // but never above the preset's ceiling. Battery Saver also halves the frame
-// rate: half the capture, encode and Wi-Fi work.
+// rate: half the capture, encode and Wi-Fi work. High streams 120 FPS where
+// the PC's screen and the encoder can (FrameRate.swift, step 7).
 // =============================================================================
 
 import Foundation
@@ -15,7 +16,14 @@ enum QualityPreset: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var fps: Int { self == .batterySaver ? 30 : 60 }
+    /// The most frames per second; FrameRate.choose() decides what runs
+    var maxFps: Int {
+        switch self {
+        case .batterySaver: return 30
+        case .balanced:     return 60
+        case .high:         return 120
+        }
+    }
 
     var minBitrateBps: Int { self == .batterySaver ? 4_000_000 : 8_000_000 }
 
@@ -37,7 +45,7 @@ enum QualityPreset: String, CaseIterable, Identifiable {
     }
 
     var summary: String {
-        "\(fps) FPS · up to \(maxBitrateBps / 1_000_000) Mbps"
+        (maxFps > 60 ? "up to \(maxFps)" : "\(maxFps)") + " FPS · up to \(maxBitrateBps / 1_000_000) Mbps"
     }
 
     private static let key = "qualityPreset"

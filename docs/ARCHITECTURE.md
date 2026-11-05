@@ -6,7 +6,7 @@
 MAC (Swift)                                             WINDOWS (C++)
 ───────────────────────────────────────────────         ───────────────────────────────────────────────
 VirtualDisplayManager   CGVirtualDisplay (2nd monitor)
-ScreenCaptureEngine     ScreenCaptureKit, BGRA IOSurface
+ScreenCaptureEngine     ScreenCaptureKit, NV12 IOSurface, 60 or 120 FPS
         │ CVPixelBuffer (stays on the GPU)
 VideoEncoder            VideoToolbox H.264, low-latency RC
         │ AVCC → Annex B (H264Converter) + timing prefix
@@ -33,7 +33,7 @@ BitrateGovernor   bitrate follows the delay ◀───────────
 |---|---|
 | `Capture/` | `ScreenCaptureEngine`: capture, encoder wiring, preview, quality presets, recovery, diagnostics tick |
 | `Display/` | `VirtualDisplayManager`: creates and removes the virtual monitor |
-| `Encoder/` | `VideoEncoder` (VideoToolbox), `H264Converter`, `DelayRateController` and `BitrateGovernor` (bitrate from the PC's delay reports), `AdaptiveQuality` (loss/RTT tiers), `QualityPreset`, `EncoderConfig` |
+| `Encoder/` | `VideoEncoder` (VideoToolbox), `H264Converter`, `FrameRate` and `EncoderLoad` (60 or 120 FPS, and whether the encoder keeps up), `DelayRateController` and `BitrateGovernor` (bitrate from the PC's delay reports), `AdaptiveQuality` (loss/RTT tiers), `QualityPreset`, `EncoderConfig` |
 | `Network/` | `Protocol` (wire format), `StreamSender` (listener, handshake, encryption, video packets), `FrameParity` (parity packets, pacing) |
 | `Security/` | `SecureChannel` (key agreement, AES-GCM), `PairingManager` (pairings, approval) |
 | `Input/`, `Clipboard/` | Injecting Windows input with CGEvent; pasteboard sync |
@@ -79,7 +79,8 @@ It renders only when the picture, the overlay or the status card changed.
 
 1. **Capture:** ScreenCaptureKit delivers only changed frames, as IOSurface-backed buffers in
    full-range NV12 (BT.709), the encoder's input format. `displayTime` is when the frame was
-   on screen.
+   on screen. At 120 FPS when the preset, the PC's screen, the display and the encoder allow it
+   (`FrameRate`, [SMOOTHNESS.md](SMOOTHNESS.md) step 7), else 60 (30 for Battery Saver).
 2. **Encode:** VideoToolbox H.264 in hardware, *low-latency rate control*, Constrained High, no
    B-frames. Keyframes only on request, plus one a minute as a safety net
    ([SMOOTHNESS.md](SMOOTHNESS.md), step 2). The bitrate follows the PC's reports of how long

@@ -26,3 +26,7 @@ LOGFONTW MessageFontForDpi(UINT dpi);
 
 /// AdjustWindowRectEx with the frame sizes of `dpi`
 void AdjustWindowRectForDpi(RECT& rect, DWORD style, DWORD exStyle, UINT dpi);
+
+/// Refresh rate of the monitor the window is on, in Hz (0: unknown). Step 7:
+/// the Mac streams at most that many frames per second.
+UINT RefreshHzForWindow(HWND hwnd);

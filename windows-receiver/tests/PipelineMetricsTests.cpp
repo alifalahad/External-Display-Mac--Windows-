@@ -378,6 +378,10 @@ static void TestOverlayText() {
     CHECK(text.find(L"27.5") != std::wstring::npos);
     CHECK(text.find(L"GPU 3D") != std::wstring::npos);
     CHECK(text.find(L"Test GPU") != std::wstring::npos);
+    // Step 7: the screen's refresh rate next to what was shown, when known
+    CHECK(text.find(L" Hz screen") == std::wstring::npos);
+    in.screenHz = 120;
+    CHECK(FormatDiagnostics(in).find(L"shown 0.0 on a 120 Hz screen\n") != std::wstring::npos);
 }
 
 // ── Wire layout (must match Protocol.swift) ─────────────────────────────────

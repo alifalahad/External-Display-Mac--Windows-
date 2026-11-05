@@ -291,6 +291,7 @@ struct OverlayInputs {
     std::wstring gpuName;
     bool   hardwareDecode = false;
     bool   benchmarking = false;
+    uint32_t screenHz = 0;           // step 7: refresh rate of the window's monitor (0: unknown)
 };
 
 std::wstring FormatDiagnostics(const OverlayInputs& in);

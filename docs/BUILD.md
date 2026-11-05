@@ -71,6 +71,8 @@ ExternalDisplayReceiver.exe [mac-ip] [options]
                                   older loss/RTT tiers, to compare
   --simulate-link=KBPS[:QUEUEMS]  a narrow link with a queue in front of the receiver, to test
                                   --adapt (e.g. 8000: 8 Mbps with a 200 ms queue)
+  --max-fps=N                     ask the Mac for at most N frames per second (default: this
+                                  screen's refresh rate; the Mac streams 120 at most)
 ```
 
 Files next to the exe:
@@ -88,11 +90,11 @@ Files next to the exe:
 See [TESTING.md](TESTING.md).
 
 ```bash
-# Mac (54 tests)
+# Mac (63 tests)
 cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
 ```
 ```bat
-:: Windows (6 suites, 509 checks)
+:: Windows (6 suites, 518 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build

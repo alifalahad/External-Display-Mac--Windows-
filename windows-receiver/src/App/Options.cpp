@@ -57,6 +57,12 @@ Options ParseOptions(const std::string& commandLine) {
                 o.simulatedLinkQueueMs = 200;
                 o.warnings.push_back("--simulate-link needs KBPS (500-1000000) and optionally :QUEUEMS (10-2000), e.g. 8000");
             }
+        } else if (arg.rfind("--max-fps=", 0) == 0) {
+            o.maxFps = std::atoi(arg.c_str() + 10);
+            if (o.maxFps < 24 || o.maxFps > 240) {
+                o.maxFps = 0;
+                o.warnings.push_back("--max-fps needs a frame rate (24-240), e.g. --max-fps=60");
+            }
         } else if (arg.rfind("--bench=", 0) == 0) {
             o.benchSeconds = std::atoi(arg.c_str() + 8);
             if (o.benchSeconds <= 0) {

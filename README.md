@@ -26,6 +26,8 @@ copy and paste between the two machines.
   Saver / Balanced / High) sets how high it goes.
 - Lost packets are rebuilt on the PC from parity packets, so a single lost packet causes no
   freeze.
+- 120 FPS to a PC screen at 120 Hz or more (High preset, where the Mac's encoder keeps up at the
+  display's size).
 - Mouse, keyboard and clipboard (text) forwarding. Windows draws the Mac's pointer itself, so
   the mouse feels local: no video round trip ([docs/SMOOTHNESS.md](docs/SMOOTHNESS.md)).
 - Automatic discovery (Bonjour/mDNS), automatic reconnection and recovery after sleep.

@@ -105,6 +105,23 @@ lags.
 - If the target never changes while `Net wait` says overuse, the Mac app is older than step 6:
   it ignores the PC's reports and keeps the tiers.
 
+**No 120 FPS on a 120 Hz screen.** The Mac's window says why next to the preset
+([SMOOTHNESS.md](SMOOTHNESS.md), step 7):
+- `High streams 120 to this PC's 120 Hz screen`: choose the High preset.
+- `the PC's screen runs at 60 Hz`: Windows runs the screen at 60. Change it in Settings → System
+  → Display → Advanced display. `receiver.log` says `Screen refresh rate: … Hz`. Was the receiver
+  started with `--max-fps=60`?
+- `the PC has not said its screen's refresh rate`: the receiver is older than step 7. Update it.
+- `the captured display refreshes at 60 Hz`: the virtual display has no 120 Hz mode. The Mac's
+  log lists the modes it offers (`No 120 Hz mode (this display offers …)`). Create the virtual
+  display again with High selected.
+- `the encoder cannot keep up with 120 at this size`: this Mac encodes a frame of this size in
+  more than 8.3 ms. On an M2 that happens at 2560×1440 and larger. Use 1920×1080 or 1920×1200
+  for 120 FPS. The log line says how long a frame took.
+- `receiver.log` shows `START_STREAM … @ 60 FPS` even when it then runs at 120. The PC's refresh
+  rate arrives a moment after the stream starts, and the frame rate changes without a new
+  START_STREAM. F2's FPS line shows the real rate.
+
 **Two pointers, no pointer, or the pointer looks wrong.** Since step 1 of
 [SMOOTHNESS.md](SMOOTHNESS.md), Windows draws the Mac's pointer. With F3 off you see Windows'
 own arrow *and* the Mac's pointer: that is intended. Press **F4** (or start with

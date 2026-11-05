@@ -3,6 +3,7 @@
 // =============================================================================
 
 #include "App/ReceiverApp.h"
+#include "App/Dpi.h"
 #include "App/Log.h"
 #include "App/Utf8.h"
 #include "Input/PointerCursor.h"
@@ -155,7 +156,12 @@ void ReceiverApp::connectTo(const std::string& address, const std::string& servi
 
     // Pointer drawn here (docs/SMOOTHNESS.md, step 1): only the newest shape
     // and position wait for the UI thread
-    receiver_->setReceiverCaps(wantedCaps());
+    // Step 7: the Mac streams at up to 120 FPS if this screen shows that many
+    screenHz_ = RefreshHzForWindow(window_.GetHandle());
+    LOGF_INFO("Main", "Screen refresh rate: %u Hz%s", screenHz_,
+              options_.maxFps > 0 ? (" (asking the Mac for at most " + std::to_string(options_.maxFps) +
+                                     " FPS: --max-fps)").c_str() : "");
+    receiver_->setReceiverCaps(wantedCaps(), reportedRefreshHz());
     receiver_->enableRateFeedback(options_.adaptToDelay);
     if (options_.simulatedLinkKbps > 0) {
         LOGF_WARN("Net", "Simulating a %.0f kbps link with a %.0f ms queue (--simulate-link)",
@@ -356,7 +362,10 @@ void ReceiverApp::finishFrame(const FrameTimeline& t) {
                            std::to_string(window_.GetHeight()) + (window_.IsFullscreen() ? " full screen" : " windowed") +
                            " at " + std::to_string(MulDiv(100, static_cast<int>(window_.GetDpi()), 96)) +
                            "% scale; present " + (renderer_->PresentsImmediately() ? "at once (tearing allowed)"
-                                                                                   : "on the refresh"));
+                                                                                   : "on the refresh") +
+                           "; screen " + std::to_string(screenHz_) + " Hz" +
+                           (options_.maxFps > 0 ? ", at most " + std::to_string(options_.maxFps) + " FPS asked for"
+                                                : std::string()));
         } else {
             LOGF_ERROR("Bench", "Cannot create %s-*.csv — benchmark disabled", base.c_str());
             options_.benchSeconds = 0;
@@ -626,6 +635,16 @@ void ReceiverApp::updateDisplayPath() {
         lastOverlayUs_ = 0;   // the overlay names the mode
     }
     renderer_->SetPresentImmediately(presentImmediately_);
+    // Step 7: on another monitor, or in another display mode, the refresh rate
+    // may differ: the Mac is told (RECEIVER_CAPS, from updatePointer)
+    if (window_.TakeScreenChange()) {
+        const uint32_t hz = RefreshHzForWindow(window_.GetHandle());
+        if (hz != screenHz_) {
+            LOGF_INFO("Main", "Screen refresh rate now %u Hz (was %u)", hz, screenHz_);
+            screenHz_ = hz;
+            lastOverlayUs_ = 0;   // the overlay names it
+        }
+    }
     // Real pixels (per-monitor DPI): the status card and overlay scale themselves
     if (renderer_->SetUiScale(static_cast<float>(window_.GetDpi()) / 96.0f)) forceRender_ = true;
 }
@@ -653,7 +672,7 @@ void ReceiverApp::updatePointer() {
 
     // Drawn here only if this renderer can; otherwise the Mac keeps it in the video
     const bool local = localPointerWanted_ && renderer_->CanDrawPointer();
-    if (receiver_) receiver_->setReceiverCaps(wantedCaps());
+    if (receiver_) receiver_->setReceiverCaps(wantedCaps(), reportedRefreshHz());
     pointer_.setLocalPointer(local);
     pointer_.setForwarding(input_ && input_->isEnabled());
 
@@ -736,6 +755,7 @@ void ReceiverApp::updateOverlay(int64_t nowUs) {
     in.pc = systemMonitor_.latest();
     in.gpuName = renderer_->GetAdapterName();
     in.hardwareDecode = decoder_ && decoder_->isHardwareAccelerated();
+    in.screenHz = screenHz_;
     in.benchmarking = bench_.active();
     if (receiver_) {
         in.sync = receiver_->clockEstimate();

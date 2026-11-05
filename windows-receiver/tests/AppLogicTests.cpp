@@ -70,6 +70,16 @@ static void TestOptions() {
     o = ParseOptions("--simulate-link=10 --simulate-link=8000:5");
     CHECK(o.simulatedLinkKbps == 0 && o.warnings.size() == 2);
 
+    // 120 Hz (step 7): what the Mac is told about this screen
+    o = ParseOptions("");
+    CHECK(o.maxFps == 0 && ReportedRefreshHz(120, o.maxFps) == 120 && ReportedRefreshHz(0, o.maxFps) == 0);
+    o = ParseOptions("--max-fps=60");
+    CHECK(o.maxFps == 60 && o.warnings.empty());
+    CHECK(ReportedRefreshHz(144, o.maxFps) == 60 && ReportedRefreshHz(50, o.maxFps) == 50);
+    CHECK(ReportedRefreshHz(0, o.maxFps) == 60);          // unknown screen: the limit asked for
+    o = ParseOptions("--max-fps=10 --max-fps=fast");
+    CHECK(o.maxFps == 0 && o.warnings.size() == 2);
+
     o = ParseOptions("--bench=abc --log=loud --frobnicate 10.0.0.1 10.0.0.2");
     CHECK(o.benchSeconds == 0);
     CHECK(o.macAddress == "10.0.0.1");

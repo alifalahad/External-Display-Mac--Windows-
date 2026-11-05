@@ -77,6 +77,11 @@ public:
     // F5 pressed: present on the next refresh ↔ at once
     bool TakePresentToggle()     { bool t = presentToggle_; presentToggle_ = false; return t; }
 
+    // ── 120 Hz (docs/SMOOTHNESS.md, step 7) ─────────────────────────────────────
+    // True once after the window moved to another monitor or a display's mode
+    // changed: its refresh rate may be different
+    bool TakeScreenChange()      { bool c = screenChange_; screenChange_ = false; return c; }
+
 private:
     void RegisterWindowClass();
     void CreateFullscreenWindow(const wchar_t* title);
@@ -103,6 +108,9 @@ private:
 
     UINT dpi_             = 96;
     bool presentToggle_   = false;
+
+    HMONITOR monitor_     = nullptr;   // the window's monitor at the last move
+    bool screenChange_    = false;
 
     // Video aspect ratio for resize constraint (0 = unconstrained)
     float videoAspect_ = 0.0f;

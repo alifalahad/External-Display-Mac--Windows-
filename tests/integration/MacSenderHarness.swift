@@ -70,12 +70,31 @@ governor.sentBps = { Int(sender.statsSnapshot().sendMbps * 1_000_000) }
 sender.onQualityReport = { governor.onQualityReport($0) }
 sender.onRateFeedback = { governor.onRateFeedback($0) }
 
+let captureQueue = DispatchQueue(label: "capture", qos: .userInteractive)
+var harnessFps = 60                      // captureQueue
+let frameTimer = DispatchSource.makeTimerSource(queue: captureQueue)
+/// Step 7: synthetic frames at the frame rate the app would stream at
+func setFrameRate(_ fps: Int) {
+    captureQueue.async {
+        guard fps != harnessFps else { return }
+        print("[Harness] frame rate \(harnessFps) -> \(fps) FPS")
+        harnessFps = fps
+        encoder.updateFrameRate(fps)
+        frameTimer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / fps), leeway: .microseconds(500))
+    }
+}
+
 // Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1)
 var pointerMonitor: PointerMonitor?
 var pointerScript: DispatchSourceTimer?
-sender.onReceiverCaps = { flags in
+sender.onReceiverCaps = { caps in
+    let flags = caps.flags
+    // 120 Hz (docs/SMOOTHNESS.md, step 7): the frame rate the app would choose
+    // on High, with a 120 Hz display and an encoder that keeps up
+    setFrameRate(FrameRate.choose(preset: .high, receiverRefreshHz: caps.refreshHz,
+                                  displayRefreshHz: 120, encoderKeepsUp: true))
     DispatchQueue.main.async {
-        print("[Harness] RECEIVER_CAPS 0x\(String(flags, radix: 16))")
+        print("[Harness] RECEIVER_CAPS 0x\(String(flags, radix: 16)), screen \(caps.refreshHz) Hz")
         pointerMonitor?.stop()
         pointerMonitor = nil
         pointerScript?.cancel()
@@ -127,11 +146,9 @@ let attrs: [CFString: Any] = [
 var pool: CVPixelBufferPool?
 CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
 
-let captureQueue = DispatchQueue(label: "capture", qos: .userInteractive)
 var frameIndex: Int64 = 0
 var rng = SystemRandomNumberGenerator()
-let frameTimer = DispatchSource.makeTimerSource(queue: captureQueue)
-frameTimer.schedule(deadline: .now(), repeating: .nanoseconds(16_666_667), leeway: .microseconds(500))
+frameTimer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / harnessFps), leeway: .microseconds(500))
 frameTimer.setEventHandler {
     var pbOut: CVPixelBuffer?
     CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &pbOut)
@@ -152,9 +169,11 @@ frameTimer.setEventHandler {
     }
     for y in 0..<height / 2 { memset(chroma + y * chromaBpr, 128, width) }   // grey: no colour
     CVPixelBufferUnlockBaseAddress(pb, [])
-    let pts = CMTime(value: frameIndex, timescale: 60)
+    // Host-clock timestamps, as ScreenCaptureKit's: they keep rising when the rate changes
+    let pts = CMClockGetTime(CMClockGetHostTimeClock())
     frameIndex += 1
-    encoder.encode(pixelBuffer: pb, presentationTime: pts, duration: CMTime(value: 1, timescale: 60),
+    encoder.encode(pixelBuffer: pb, presentationTime: pts,
+                   duration: CMTime(value: 1, timescale: CMTimeScale(harnessFps)),
                    captureUs: HostClock.nowUs(), captureIsReal: true)
 }
 frameTimer.resume()
@@ -167,7 +186,7 @@ statTimer.setEventHandler {
     let es = encoder.currentStats(), u = metrics.sample()
     guard sender.state.isStreaming else { return }
     var p = SenderStatsPayload()
-    p.captureFps100 = 6000
+    p.captureFps100 = UInt32(captureQueue.sync { harnessFps } * 100)
     p.encodeFps100 = UInt32(es.encodedFps * 100)
     p.cpuPercent100 = UInt32(u.cpuPercent * 100)
     p.memoryMB = UInt32(u.memoryMB)

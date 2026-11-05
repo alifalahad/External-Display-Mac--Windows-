@@ -126,9 +126,10 @@ final class StreamSender: ObservableObject {
     /// Called when clipboard data is received from the Windows receiver
     var onClipboardData: ((Data) -> Void)?
 
-    /// Called when the receiver announces what it can do (RECEIVER_CAPS
-    /// flags, after authentication). Invoked on the network queue.
-    var onReceiverCaps: ((UInt32) -> Void)?
+    /// Called when the receiver announces what it can do (RECEIVER_CAPS: flags
+    /// and its screen's refresh rate, after authentication). Invoked on the
+    /// network queue.
+    var onReceiverCaps: ((ReceiverCapsPayload) -> Void)?
 
     /// Queuing delay and received rate, every 100 ms (step 6). Network queue.
     var onRateFeedback: ((RateFeedbackPayload) -> Void)?
@@ -508,8 +509,9 @@ final class StreamSender: ObservableObject {
                 sendParity = caps.flags & ReceiverCapsPayload.parity != 0
                 pacePackets = caps.flags & ReceiverCapsPayload.pacing != 0
                 Log.info(.net, "Receiver capabilities: 0x\(String(caps.flags, radix: 16)) — parity "
-                         + (sendParity ? "on" : "off") + ", pacing " + (pacePackets ? "on" : "off"))
-                onReceiverCaps?(caps.flags)
+                         + (sendParity ? "on" : "off") + ", pacing " + (pacePackets ? "on" : "off")
+                         + ", screen \(caps.refreshHz) Hz")
+                onReceiverCaps?(caps)
             }
         case .keyReveal:
             handleKeyReveal(payload)

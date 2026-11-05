@@ -65,3 +65,16 @@ UINT DpiForWindow(HWND hwnd) {
     if (screen) ReleaseDC(nullptr, screen);
     return dpi > 0 ? static_cast<UINT>(dpi) : 96;
 }
+
+UINT RefreshHzForWindow(HWND hwnd) {
+    HMONITOR monitor = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY)
+                            : MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return 0;
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0;
+    // 0 and 1 mean "the hardware's default": unknown
+    return mode.dmDisplayFrequency > 1 ? mode.dmDisplayFrequency : 0;
+}

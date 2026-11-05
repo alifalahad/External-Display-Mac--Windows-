@@ -43,7 +43,7 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 | 4 | Capture in the encoder's format | **done here, to test on the PCs** | correct colours (the picture was washed out); no conversion pass before encoding |
 | 5 | Packet pacing and loss repair | **done here, to test on the PCs** | a lost packet is rebuilt on the PC (at 1 % loss 98.7 % of frames arrive, was 74 %); packets paced over ~1 ms |
 | 6 | Bitrate that follows the delay | **done here, to test on the PCs** | the bitrate goes down as soon as a queue builds, before packets are lost (8 Mbps test link: below it within 1 s, 99.5 % of frames arrive, was 17–20 %) |
-| 7 | 120 Hz | to do | halves every refresh wait |
+| 7 | 120 Hz | **done here, to test on the PCs** | 120 FPS to a 120 Hz screen (High preset, where the encoder keeps up: on an M2 up to 1920×1200); halves both refresh waits |
 | 8 | Network setup | checklist (no code) | removes regular spikes the code cannot fix |
 
 Every step is checked in the same way:
@@ -463,18 +463,75 @@ frame and the ones after it.
 
 ### Step 7 — 120 Hz
 
-**Why.** Every wait for a refresh (capture on the Mac, display on the PC) is about 8 ms on average
-at 60 Hz and 4 ms at 120 Hz.
+**Why.** Every wait for a refresh is half a frame on average: about 8 ms at 60 Hz and 4 ms at
+120 Hz. There are two such waits: on the Mac before capture, and on the PC before the frame
+shows. Motion is also twice as smooth.
 
-**How.**
-- Virtual display at 120 Hz.
-- Capture `minimumFrameInterval` 1/120.
-- Offer a 120 FPS quality preset when the PC's screen runs at 120 Hz (the receiver reports its
-  refresh rate).
+**How (implemented).**
+- **The PC says how fast its screen is:** RECEIVER_CAPS now carries the refresh rate of the
+  monitor the receiver's window is on (it used 4 spare bytes; older Macs ignore them). The
+  receiver checks it again when the window moves to another monitor or a display mode changes,
+  and tells the Mac at once. `--max-fps=60` on the PC asks for 60 at most, to compare.
+- **The Mac streams 120 FPS only when every part can** (`FrameRate`):
+  - the **High** preset (Balanced stays at 60, Battery Saver at 30);
+  - a PC screen at 119 Hz or more (144 Hz gets 120; a 48 Hz power-saving panel still gets 60);
+  - a captured display that refreshes at 120 Hz. The virtual display now has a 120 Hz and a 60 Hz
+    mode, and High switches it to 120 Hz;
+  - an **encoder that keeps up** at this size (`EncoderLoad`). Every encode call and every output
+    is timed. If it falls behind for two seconds in a row, the stream drops to 60 FPS at this
+    size and the log says why.
+- **No restart:** a new frame rate only changes the capture interval and the encoder, so the PC
+  keeps its decoder. That happens when the PC connects or moves, when the preset changes, or when
+  the encoder drops back. START_STREAM therefore still says the rate the stream started with (60):
+  the PC's caps arrive a moment after it.
+- **The Mac window says why:** next to the preset, for example `now 120 FPS`,
+  `now 60 FPS — the PC's screen runs at 60 Hz`, or `now 60 FPS — the encoder cannot keep up with
+  120 at this size`.
+- **F2 overlay:** `shown 119.8 on a 120 Hz screen`; the FPS line shows what the Mac captures and
+  encodes. The benchmark summary records the screen's refresh rate.
 
-The encoder does twice the work, so enable it only when both sides support it.
+**Check.**
+- **The encoder on an M2** (2026-11-05): the app's VideoEncoder settings, synthetic content
+  scrolling like a web page, 6 s per row:
 
-**Check.** The benchmark at 120 Hz: Capture + Display stages, and the encoder keeps up.
+  | Size | Encode time per frame | At 120 FPS |
+  |---|---|---|
+  | 1920×1080 | 8.1 ms (the call returns at once; VideoToolbox overlaps frames) | keeps up: 119.7 FPS |
+  | 1920×1200 | 7.0 ms (the call blocks until the frame is done) | keeps up: 118.8 FPS |
+  | 2560×1440 | 9.8–10.0 ms (blocks) | 92–95 FPS: too slow, drops to 60 |
+  | 2560×1600 | 10.6–10.8 ms (blocks) | 85–87 FPS: too slow, drops to 60 |
+
+  The time per frame is the same at 60 FPS. So 120 FPS does not make a frame slower to encode,
+  but at 1920×1080 the encoder is busy almost all the time.
+- **Loopback** (the real Mac sender and VideoToolbox against the real Windows receiver
+  networking, 720p, 20 s): told of a 120 Hz screen, the Mac switched as soon as the caps
+  arrived, 2 ms after the stream started. 2,399 frames arrived, captured 8.30 ms apart, with none
+  lost. Every run that says 60 Hz stays at 16.67 ms.
+- **Not measured here:** the Capture and Display stages on a real 120 Hz screen. This Mac
+  cannot run ScreenCaptureKit from the test tools (no Screen Recording permission), and the
+  virtual display's 120 Hz mode can only be seen in the app. Its log says
+  `Created: 1920×1080 @ 120 Hz` and `Frame rate 60 → 120 FPS`.
+- Automated, all passing:
+  - Mac: 63 XCTests. New `FrameRateTests` (9) cover the choice for every preset, PC screen,
+    display and encoder, the window's text, the two-second rule for a slow encoder (with the M2's
+    measured times), late output, a still screen, the RECEIVER_CAPS bytes shared with Windows,
+    and an encoder switched to 120 FPS without a new session.
+  - Windows: 518 checks on x64 and x86. They cover `--max-fps` and what the Mac is told, the
+    overlay text, the RECEIVER_CAPS bytes, and the refresh rate Windows reports.
+  - The loopback's `fps120` run must deliver ~120 FPS, 7–9.5 ms apart. The others must stay
+    at ~60.
+
+#### Checklist for step 7 (on a laptop with a 120 Hz or faster screen)
+1. Windows: Settings → System → Display → Advanced display → refresh rate 120 Hz or more.
+   `receiver.log` says `Screen refresh rate: 120 Hz`.
+2. Mac: choose **High**, create the virtual display at 1920×1080 or 1920×1200, and start. The window
+   says `now 120 FPS`. The Mac's log says `Created: … @ 120 Hz` (or `Refresh rate 60 → 120 Hz`
+   for a display made before you chose High) and `Frame rate 60 → 120 FPS`.
+3. F2 on the PC: capture and encode near 120, `shown … on a 120 Hz screen`. Scroll a long page:
+   motion is smoother than with Balanced.
+4. `--bench=60`, then `--bench=60 --max-fps=60`: compare Capture, Display and Total.
+5. At 2560×1440 the Mac should say `the encoder cannot keep up with 120 at this size` after a
+   few seconds of motion (on an M2). Tell me what yours says.
 
 ### Step 8 — Network setup (no code)
 

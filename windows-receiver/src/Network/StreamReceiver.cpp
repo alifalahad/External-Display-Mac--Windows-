@@ -1108,15 +1108,18 @@ bool StreamReceiver::handlePairAccept(const std::vector<uint8_t>& payload) {
     return true;
 }
 
-void StreamReceiver::setReceiverCaps(uint32_t flags) {
-    if (m_receiverCaps.exchange(flags) == flags) return;
-    if (isSecure()) sendReceiverCaps();
+void StreamReceiver::setReceiverCaps(uint32_t flags, uint32_t refreshHz) {
+    const bool flagsChanged = m_receiverCaps.exchange(flags) != flags;
+    const bool refreshChanged = m_refreshHz.exchange(refreshHz) != refreshHz;
+    if ((flagsChanged || refreshChanged) && isSecure()) sendReceiverCaps();
 }
 
 void StreamReceiver::sendReceiverCaps() {
     exdp::ReceiverCapsPayload caps;
     caps.flags = m_receiverCaps.load();
-    LOGF_INFO("Net", "Telling the Mac: pointer drawn %s", (caps.flags & exdp::CAP_LOCAL_CURSOR) ? "here" : "in the video");
+    caps.refreshHz = m_refreshHz.load();
+    LOGF_INFO("Net", "Telling the Mac: pointer drawn %s, screen %u Hz",
+              (caps.flags & exdp::CAP_LOCAL_CURSOR) ? "here" : "in the video", caps.refreshHz);
     tcpSendMessage(exdp::MessageType::ReceiverCaps, &caps, sizeof(caps));
 }
 

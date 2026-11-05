@@ -84,6 +84,11 @@ static void TestWireLayout() {
     exdp::ReceiverCapsPayload caps;
     caps.flags = exdp::CAP_LOCAL_CURSOR;
     CHECK(ToHex(&caps, sizeof(caps)) == kCapsHex);
+    // Step 7: the screen's refresh rate in the second word (the Mac's
+    // testReceiverCapsCarryTheRefreshRate reads these bytes)
+    caps.flags = exdp::CAP_LOCAL_CURSOR | exdp::CAP_PARITY | exdp::CAP_PACING;
+    caps.refreshHz = 120;
+    CHECK(ToHex(&caps, sizeof(caps)) == std::string("07000000" "78000000"));
     CHECK(static_cast<int>(exdp::MessageType::ReceiverCaps) == 0x90);
     CHECK(static_cast<int>(exdp::MessageType::CursorShape) == 0x91);
     CHECK(static_cast<int>(exdp::MessageType::CursorPosition) == 0x92);

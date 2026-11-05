@@ -301,6 +301,11 @@ static void TestDpi() {
     CHECK(r100.right - r100.left > 360 && r100.bottom - r100.top > 170);   // frame and title bar added
     // At 200 % the frame is at least as large (Windows doubles it; Wine keeps it)
     CHECK((r200.bottom - r200.top) - 340 >= (r100.bottom - r100.top) - 170);
+
+    // Step 7: the primary screen's refresh rate, told to the Mac (0: Windows cannot say)
+    const UINT hz = RefreshHzForWindow(nullptr);
+    std::printf("  primary screen: %u Hz\n", hz);
+    CHECK(hz == 0 || (hz >= 24 && hz <= 500));
 }
 #endif
 

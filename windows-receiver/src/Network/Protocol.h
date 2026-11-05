@@ -274,7 +274,8 @@ struct PairRejectPayload {
 /// encrypted, and again whenever it changes.
 struct ReceiverCapsPayload {
     uint32_t flags = 0;
-    uint32_t reserved = 0;
+    uint32_t refreshHz = 0;          // the screen showing the picture (step 7): the Mac streams
+                                     // at most this many frames per second; 0 = unknown
 };
 static_assert(sizeof(ReceiverCapsPayload) == 8, "ReceiverCapsPayload must be 8 bytes");
 constexpr uint32_t CAP_LOCAL_CURSOR = 1 << 0;   // we draw the pointer: capture without it

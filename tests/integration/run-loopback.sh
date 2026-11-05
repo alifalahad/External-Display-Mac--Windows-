@@ -20,6 +20,8 @@
 #   lossy-nofec the same without parity or pacing, for comparison
 #   narrow     an 8 Mbps link with a 200 ms queue: the bitrate follows the delay
 #   narrow-tiers the same with the old loss/RTT tiers, for comparison
+#   fps120     paired, the receiver says its screen runs at 120 Hz: the Mac
+#              must stream ~120 FPS (every other run says 60 Hz: ~60 FPS)
 # keyframes only on request: one frame is dropped on purpose and must be
 # repaired by a keyframe within 300 ms. The harness feeds full-range NV12 like
 # the app's capture, and the stream must say full-range BT.709 in its SPS.
@@ -41,7 +43,7 @@ fi
 # ── Mac side (Swift) ──
 mkdir -p "$WORK/mac" "$WORK/home" "$WORK/pairings"
 cp "$MAC"/Network/{Protocol,FrameParity}.swift "$MAC"/Security/{PairingManager,SecureChannel}.swift "$MAC"/Input/PointerMonitor.swift \
-   "$MAC"/Encoder/{VideoEncoder,EncoderConfig,H264Converter,DelayRateController,AdaptiveQuality,QualityPreset}.swift \
+   "$MAC"/Encoder/{VideoEncoder,EncoderConfig,H264Converter,DelayRateController,AdaptiveQuality,QualityPreset,FrameRate}.swift \
    "$MAC"/Performance/{HostClock,RollingWindow,ProcessMetrics}.swift "$MAC"/App/Log.swift "$WORK/mac/"
 sed -i '' -e 's/tcpPort: UInt16 = 9876/tcpPort: UInt16 = 19876/' -e 's/udpPort: UInt16 = 9877/udpPort: UInt16 = 19877/' "$WORK/mac/Protocol.swift"
 sed -e 's/            listener.service = NWListener.Service(/            _ = NWListener.Service(/' \
@@ -67,7 +69,7 @@ CODEFILE_WIN="Z:$(echo "$WORK/code.txt" | tr / '\\')"
 result=0
 # EXDP_MODES="narrow narrow-tiers" runs only those; logs: <work>/{harness,client,sender}-<n>-<mode>.log
 run=0
-for mode in ${EXDP_MODES:-pair paired lossy lossy-nofec narrow narrow-tiers impostor wrongcode rejected}; do
+for mode in ${EXDP_MODES:-pair paired lossy lossy-nofec fps120 narrow narrow-tiers impostor wrongcode rejected}; do
     run=$((run + 1))
     echo; echo "=== Run: $mode ==="
     rm -f "$WORK/code.txt"

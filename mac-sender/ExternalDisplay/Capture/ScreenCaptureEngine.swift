@@ -1,7 +1,7 @@
 // =============================================================================
 // ScreenCaptureEngine.swift — ScreenCaptureKit capture engine + H.264 encoder
 // =============================================================================
-// Captures a selected display at up to 60 FPS via ScreenCaptureKit, then
+// Captures a selected display at up to 120 FPS via ScreenCaptureKit, then
 // feeds CVPixelBuffer frames to:
 //   1. VideoToolbox H.264 hardware encoder (GPU→GPU, all frames)
 //   2. CIContext → CGImage preview (≤ 10 FPS, downscaled; paused while streaming)
@@ -58,6 +58,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             applyQualityPreset()
         }
     }
+    /// Frames per second streamed now, and why (docs/SMOOTHNESS.md, step 7)
+    @Published private(set) var streamFps = 60
+    @Published private(set) var frameRateNote = "60 FPS"
     @Published var isCapturing = false
     @Published var isEncoding = false
     @Published var availableDisplays: [SCDisplay] = []
@@ -81,9 +84,12 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         pairingManager.onDecision = { [weak self] deviceId, approved in
             self?.sender.resolvePairing(deviceId: deviceId, approved: approved)
         }
-        sender.onReceiverCaps = { [weak self] flags in
+        sender.onReceiverCaps = { [weak self] caps in
             DispatchQueue.main.async {
-                self?.setReceiverDrawsPointer(flags & ReceiverCapsPayload.localCursor != 0)
+                guard let self else { return }
+                self.setReceiverDrawsPointer(caps.flags & ReceiverCapsPayload.localCursor != 0)
+                self.receiverRefreshHz = caps.refreshHz
+                self.updateFrameRate()
             }
         }
 
@@ -157,6 +163,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     private var captureWidth = 0
     private var captureHeight = 0
 
+    // ── Frame rate (docs/SMOOTHNESS.md, step 7) ──
+    /// Main thread. The PC's screen (RECEIVER_CAPS; 0 = not said), the captured
+    /// display, and sizes at which the encoder could not keep up with 120 FPS.
+    private var receiverRefreshHz: UInt32 = 0
+    private var displayRefreshHz: Double = 60
+    private var encoderTooSlowAt = Set<String>()
+    /// Capture queue: the frame duration handed to the encoder
+    private var encodeFps = 60
+
     // ── Pointer drawn by the receiver (docs/SMOOTHNESS.md, step 1) ──
     /// Main thread. Set by RECEIVER_CAPS for the current connection.
     private var receiverDrawsPointer = false
@@ -165,15 +180,15 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
 
     // ── Encoder Control ─────────────────────────────────────────────────────
 
-    /// Start the H.264 encoder with the given resolution
-    func startEncoder(width: Int, height: Int) {
+    /// Start the H.264 encoder with the given resolution and frame rate
+    func startEncoder(width: Int, height: Int, fps: Int) {
         stopEncoder()
         do {
             let preset = qualityPreset
             var config = EncoderConfig()
             config.width = Int32(width)
             config.height = Int32(height)
-            config.fps = Double(preset.fps)
+            config.fps = Double(fps)
             config.bitrateBps = preset.startBitrateBps
             let enc = try VideoEncoder(config: config)
 
@@ -194,8 +209,9 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             // Configure sender with stream parameters
             sender.streamWidth = UInt32(width)
             sender.streamHeight = UInt32(height)
-            sender.streamFPS = UInt32(preset.fps)
+            sender.streamFPS = UInt32(fps)
             sender.streamBitrate = UInt32(preset.startBitrateBps)
+            captureQueue.async { [weak self] in self?.encodeFps = fps }
 
             // Adaptive bitrate (within the preset's bounds): reports from the receiver → governor
             let governor = BitrateGovernor(preset: preset)
@@ -381,13 +397,19 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 excludingWindows: excludedWindows
             )
 
-            // Capture at the display's point resolution
-            let drawsPointer = await MainActor.run { self.receiverDrawsPointer }
-            let config = Self.streamConfiguration(width: display.width, height: display.height,
-                                                  fps: qualityPreset.fps, capturePointer: !drawsPointer)
+            // Capture at the display's point resolution, at the frame rate this
+            // display, the preset, the PC and the encoder allow (step 7)
             capturedDisplayID = display.displayID
             captureWidth = display.width
             captureHeight = display.height
+            let displayHz = VirtualDisplayManager.refreshRate(of: display.displayID)
+            let (drawsPointer, fps) = await MainActor.run { () -> (Bool, Int) in
+                self.displayRefreshHz = displayHz
+                self.updateFrameRate()
+                return (self.receiverDrawsPointer, self.streamFps)
+            }
+            let config = Self.streamConfiguration(width: display.width, height: display.height,
+                                                  fps: fps, capturePointer: !drawsPointer)
 
             // Create and configure the stream
             let stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -410,7 +432,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             }
 
             // Auto-start encoder with capture resolution
-            startEncoder(width: display.width, height: display.height)
+            startEncoder(width: display.width, height: display.height, fps: fps)
 
             // Start network listener (Windows receiver will connect here)
             sender.startListening()
@@ -431,8 +453,8 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
             await MainActor.run { self.captureRestartAttempts = 0 }
 
             let modeStr = virtualDisplayManager.isActive ? "Virtual" : "Physical"
-            Log.info(.capture, "Started (\(modeStr)): \(display.width)×\(display.height) @ \(qualityPreset.fps) FPS, "
-                     + "quality \(qualityPreset.rawValue)")
+            Log.info(.capture, "Started (\(modeStr)): \(display.width)×\(display.height) @ \(fps) FPS "
+                     + "(display \(Int(displayHz.rounded())) Hz), quality \(qualityPreset.rawValue)")
             return true
 
         } catch {
@@ -503,8 +525,11 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
                 case .streaming:
                     break
                 default:
-                    // No receiver: the next one may not draw the pointer
+                    // No receiver: the next one may not draw the pointer, or
+                    // have a 120 Hz screen
                     self?.setReceiverDrawsPointer(false)
+                    self?.receiverRefreshHz = 0
+                    self?.updateFrameRate()
                 }
                 self?.updatePreviewGate(streaming: newState.isStreaming)
             }
@@ -537,7 +562,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         if lastEncodedPTS.isValid && CMTimeCompare(pts, lastEncodedPTS) <= 0 { return }
         lastEncodedPTS = pts
         encoder?.encode(pixelBuffer: pixelBuffer, presentationTime: pts,
-                        duration: CMTime(value: 1, timescale: 60),
+                        duration: CMTime(value: 1, timescale: CMTimeScale(encodeFps)),
                         captureUs: captureUs, captureIsReal: captureIsReal)
     }
 
@@ -549,8 +574,45 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         let preset = qualityPreset
         Log.info(.quality, "Quality preset: \(preset.rawValue) (\(preset.summary))")
         bitrateGovernor?.apply(preset)
-        encoder?.updateFrameRate(preset.fps)
-        sender.streamFPS = UInt32(preset.fps)
+        // Step 7: the virtual display refreshes at 120 Hz only for High (also
+        // before capture starts: it then captures at the rate set here)
+        let vdm = virtualDisplayManager
+        if vdm.isActive {
+            let hz = vdm.setRefreshRate(Self.displayRefreshHz(for: preset))
+            if capturedDisplayID == vdm.virtualDisplayID { displayRefreshHz = hz }
+        }
+        updateFrameRate()
+    }
+
+    /// Refresh rate for a virtual display: 120 Hz for a preset that streams 120 FPS
+    static func displayRefreshHz(for preset: QualityPreset) -> Double {
+        preset.maxFps > 60 ? 120 : 60
+    }
+
+    /// Main thread. A virtual display at the size asked for, refreshing at the
+    /// rate the preset streams at
+    @discardableResult
+    func createVirtualDisplay(width: Int, height: Int) -> Bool {
+        virtualDisplayManager.createDisplay(width: width, height: height,
+                                            refreshHz: Self.displayRefreshHz(for: qualityPreset))
+    }
+
+    /// Main thread. The frame rate FrameRate.choose() allows now; capture,
+    /// encoder and sender follow without restarting the stream (the receiver
+    /// needs no new START_STREAM for it)
+    private func updateFrameRate() {
+        let keepsUp = !encoderTooSlowAt.contains("\(captureWidth)x\(captureHeight)")
+        let fps = FrameRate.choose(preset: qualityPreset, receiverRefreshHz: receiverRefreshHz,
+                                   displayRefreshHz: displayRefreshHz, encoderKeepsUp: keepsUp)
+        frameRateNote = FrameRate.describe(preset: qualityPreset, receiverRefreshHz: receiverRefreshHz,
+                                           displayRefreshHz: displayRefreshHz, encoderKeepsUp: keepsUp)
+        guard fps != streamFps else { return }
+        Log.info(.capture, "Frame rate \(streamFps) → \(fps) FPS (\(frameRateNote); PC screen "
+                 + "\(receiverRefreshHz) Hz, display \(Int(displayRefreshHz.rounded())) Hz)")
+        streamFps = fps
+        encoder?.updateFrameRate(fps)
+        sender.streamFPS = UInt32(fps)
+        captureQueue.async { [weak self] in self?.encodeFps = fps }
         updateStreamConfiguration(what: "the frame rate")
     }
 
@@ -560,7 +622,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
-        // Frame rate from the quality preset (60, or 30 for Battery Saver)
+        // Frame rate from FrameRate.choose(): 120, 60, or 30 for Battery Saver
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         // YCbCr 4:2:0 in full range, BT.709 (step 4): the H.264 encoder's input
         // format, so it needs no conversion pass — and exactly what the
@@ -583,7 +645,7 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
     private func updateStreamConfiguration(what: String) {
         guard let stream else { return }
         let config = Self.streamConfiguration(width: captureWidth, height: captureHeight,
-                                              fps: qualityPreset.fps, capturePointer: !receiverDrawsPointer)
+                                              fps: streamFps, capturePointer: !receiverDrawsPointer)
         guard config.width > 0, config.height > 0 else { return }
         stream.updateConfiguration(config) { error in
             if let error {
@@ -676,6 +738,17 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         networkStats = sender.statsSnapshot()
         processUsage = usage
 
+        // Step 7: an encoder that falls behind 120 FPS at this size streams 60
+        if let load = encoder?.loadSecond(), load.behind, streamFps > 60 {
+            Log.warning(.encoder, "The encoder cannot keep up with \(streamFps) FPS at \(captureWidth)×\(captureHeight) "
+                        + String(format: "(encode calls %.1f ms on average, %.0f%% of them a frame interval or longer; "
+                                 + "%.0f%% of frames out three intervals late)",
+                                 load.last.avgCallMs, load.last.slowShare * 100, load.last.lateShare * 100)
+                        + ": 60 FPS at this size")
+            encoderTooSlowAt.insert("\(captureWidth)x\(captureHeight)")
+            updateFrameRate()
+        }
+
         guard sender.state.isStreaming else { return }
         var payload = SenderStatsPayload()
         payload.captureFps100 = UInt32(max(captureStats.fps, 0) * 100)
@@ -727,10 +800,10 @@ final class ScreenCaptureEngine: NSObject, ObservableObject {
         }
         if vdMissing {
             Log.warning(.capture, "Virtual display missing — recreating")
-            let (w, h) = await MainActor.run { (vdm.width, vdm.height) }
+            let (w, h, hz) = await MainActor.run { (vdm.width, vdm.height, vdm.refreshHz) }
             await MainActor.run {
                 vdm.destroyDisplay()
-                _ = vdm.createDisplay(width: w, height: h)
+                _ = vdm.createDisplay(width: w, height: h, refreshHz: hz)
             }
             try? await Task.sleep(nanoseconds: 1_000_000_000)  // let WindowServer register it
             await refreshDisplays()

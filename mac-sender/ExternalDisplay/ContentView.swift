@@ -86,6 +86,14 @@ struct ContentView: View {
             Text(engine.qualityPreset.summary)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
+            if engine.isCapturing {
+                // What runs now, and why (docs/SMOOTHNESS.md, step 7)
+                Text("now " + engine.frameRateNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help("120 FPS needs the High preset, a PC screen at 120 Hz or more, and an encoder that keeps up at this size")
+            }
 
             Spacer()
 
@@ -190,9 +198,7 @@ struct ContentView: View {
 
                 Button {
                     let preset = resolutionPresets[selectedResolution]
-                    if engine.virtualDisplayManager.createDisplay(
-                        width: preset.1, height: preset.2
-                    ) {
+                    if engine.createVirtualDisplay(width: preset.1, height: preset.2) {
                         // Wait a bit for macOS to register the display, then refresh
                         Task {
                             try? await Task.sleep(nanoseconds: 1_000_000_000)

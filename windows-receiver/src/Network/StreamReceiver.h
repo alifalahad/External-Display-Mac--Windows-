@@ -183,8 +183,9 @@ public:
     // ── Pointer (docs/SMOOTHNESS.md, step 1) ────────────────────────────────
 
     /// What we tell the Mac once the session is encrypted (RECEIVER_CAPS,
-    /// exdp::CAP_*). A change during a session is sent at once. Any thread.
-    void setReceiverCaps(uint32_t flags);
+    /// exdp::CAP_*, and the screen's refresh rate: step 7). A change during a
+    /// session is sent at once. Any thread.
+    void setReceiverCaps(uint32_t flags, uint32_t refreshHz);
 
     /// Drop incoming video packets on purpose (--simulate-loss: tests loss
     /// repair on a good network). Call before connect().
@@ -325,6 +326,7 @@ private:
     PointerCallback m_cursorShapeCallback;
     PointerCallback m_cursorPositionCallback;
     std::atomic<uint32_t> m_receiverCaps{0};
+    std::atomic<uint32_t> m_refreshHz{0};
     void sendReceiverCaps();
 
     std::mutex m_sendMutex;   // TCP sends come from network, UI and UDP threads

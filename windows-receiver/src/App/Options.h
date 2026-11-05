@@ -17,11 +17,15 @@
 //     --simulate-loss=PERCENT[:BURST]        drop packets on purpose (tests loss repair)
 //     --adapt=delay|tiers                    bitrate follows the delay (default) or loss/RTT tiers
 //     --simulate-link=KBPS[:QUEUEMS]         a narrow link with a queue (tests --adapt)
+//     --max-fps=N                            ask the Mac for at most N FPS (default: the
+//                                            screen's refresh rate, up to 120)
 // =============================================================================
 
 #include "App/Log.h"
 #include "Renderer/RendererTypes.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -42,7 +46,15 @@ struct Options {
     bool          adaptToDelay = true;          // step 6
     double        simulatedLinkKbps = 0;        // 0 = off
     double        simulatedLinkQueueMs = 200;
+    int           maxFps = 0;                   // step 7: 0 = the screen's refresh rate
     std::vector<std::string> warnings;          // unknown / malformed options
 };
 
 Options ParseOptions(const std::string& commandLine);
+
+/// Step 7: the refresh rate the Mac is told — the screen's (0: unknown), at
+/// most --max-fps
+inline uint32_t ReportedRefreshHz(uint32_t screenHz, int maxFps) {
+    if (maxFps <= 0) return screenHz;
+    return screenHz == 0 ? static_cast<uint32_t>(maxFps) : std::min(screenHz, static_cast<uint32_t>(maxFps));
+}

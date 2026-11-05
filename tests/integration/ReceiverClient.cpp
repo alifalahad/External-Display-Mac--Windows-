@@ -30,6 +30,9 @@
 //   narrow        delay feedback: the Mac must go below the link within 3 s
 //                 and keep the queue short
 //   narrow-tiers  the old loss/RTT tiers, for comparison
+// 120 Hz (step 7): every run tells the Mac its screen runs at 60 Hz, and the
+// stream must stay at ~60 FPS; except
+//   fps120        a 120 Hz screen: ~120 FPS, captured ~8.3 ms apart
 //
 //   ReceiverClient <host> <seconds> <code-file> <mode>
 // =============================================================================
@@ -43,6 +46,7 @@
 #include "Performance/PipelineClock.h"
 #include "App/Log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -58,6 +62,7 @@ int main(int argc, char** argv) {
     const bool lossy = mode == "lossy" || mode == "lossy-nofec";
     const bool repair = mode != "lossy-nofec";             // parity + pacing asked for
     const bool narrow = mode == "narrow" || mode == "narrow-tiers";
+    const uint32_t screenHz = mode == "fps120" ? 120 : 60;  // what RECEIVER_CAPS says
     const bool drowning = mode == "narrow-tiers";   // the old tiers drown the narrow link: that is the comparison
     setvbuf(stdout, nullptr, _IONBF, 0);
     Log::Init("", LogLevel::Info);
@@ -112,7 +117,7 @@ int main(int argc, char** argv) {
     int malformedPointer = 0;
     int pointerRequests = askPointer ? 1 : 0;
     rx.setReceiverCaps((askPointer ? exdp::CAP_LOCAL_CURSOR : 0) |
-                       (repair ? exdp::CAP_PARITY | exdp::CAP_PACING : 0));
+                       (repair ? exdp::CAP_PARITY | exdp::CAP_PACING : 0), screenHz);
     if (lossy) rx.simulateLoss(1.0, 1);
     if (narrow) rx.simulateLink(8000, 200);
     rx.enableRateFeedback(mode != "narrow-tiers");
@@ -175,10 +180,10 @@ int main(int argc, char** argv) {
         if (streamStarted && !streamStartUs) streamStartUs = PipelineClock::NowUs();
         const int64_t sinceStartUs = streamStartUs ? PipelineClock::NowUs() - streamStartUs : 0;
         if (mode == "paired" && pointerToggle == 0 && sinceStartUs > 5'000'000) {
-            rx.setReceiverCaps(exdp::CAP_PARITY | exdp::CAP_PACING);
+            rx.setReceiverCaps(exdp::CAP_PARITY | exdp::CAP_PACING, screenHz);
             pointerToggle = 1;
         } else if (mode == "paired" && pointerToggle == 1 && sinceStartUs > 6'000'000) {
-            rx.setReceiverCaps(exdp::CAP_LOCAL_CURSOR | exdp::CAP_PARITY | exdp::CAP_PACING);
+            rx.setReceiverCaps(exdp::CAP_LOCAL_CURSOR | exdp::CAP_PARITY | exdp::CAP_PACING, screenHz);
             pointerToggle = 2;
             pointerRequests++;
         }
@@ -286,6 +291,25 @@ int main(int argc, char** argv) {
                 keyframes, (unsigned long long)gate.requests(), lostAtUs ? "yes" : "no",
                 recoveryUs >= 0 ? recoveryUs / 1000.0 : -1.0, (unsigned long long)heldAfterLoss);
 
+    // Step 7: how far apart the Mac captured frames (median step, last 10 s)
+    double frameSpacingMs = 0;
+    {
+        std::vector<double> steps;
+        for (size_t i = 1; i < frames.size(); i++) {
+            const FrameTimeline& a = frames[i - 1];
+            const FrameTimeline& b = frames[i];
+            if (!a.captureTimeValid || !b.captureTimeValid || b.captureUs <= a.captureUs) continue;
+            if (b.completeUs < frames.back().completeUs - 10'000'000) continue;
+            steps.push_back((b.captureUs - a.captureUs) / 1000.0);
+        }
+        if (!steps.empty()) {
+            std::nth_element(steps.begin(), steps.begin() + steps.size() / 2, steps.end());
+            frameSpacingMs = steps[steps.size() / 2];
+        }
+        std::printf("[Client] frame rate: screen %u Hz told, frames captured %.2f ms apart, Mac captures %.0f FPS, "
+                    "encodes %.0f FPS\n", screenHz, frameSpacingMs, mac.captureFps, mac.encodeFps);
+    }
+
     int failures = 0;
     auto expect = [&](bool c, const char* what) { if (!c) { failures++; std::printf("  FAIL: %s\n", what); } };
     if (mode == "rejected") {
@@ -304,8 +328,19 @@ int main(int argc, char** argv) {
     if (mode == "wrongcode") expect(codeRequests == 2, "wrong code refused, a new code issued");
     // A drowning link delivers few frames, and keyframes (the largest) rarely complete
     if (!drowning) {
-        expect(streams && frames.size() > (size_t)(seconds - 8) * 40, "encrypted frames received (~60 FPS)");
+        if (screenHz == 120) {
+            expect(streams && frames.size() > (size_t)(seconds - 8) * 80, "encrypted frames received (~120 FPS)");
+        } else {
+            expect(streams && frames.size() > (size_t)(seconds - 8) * 40, "encrypted frames received (~60 FPS)");
+        }
         expect(keyframes >= 2, "keyframes on request: stream start and after the lost frame");
+    }
+    // Step 7: the Mac streams at what this screen shows
+    if (streams && screenHz == 120) {
+        expect(frameSpacingMs > 7.0 && frameSpacingMs < 9.5, "frames captured ~8.3 ms apart (120 FPS)");
+        expect(mac.captureFps >= 100 && mac.encodeFps >= 100, "the Mac captures and encodes at ~120 FPS");
+    } else if (streams) {
+        expect(frames.size() < (size_t)seconds * 66, "no more than ~60 FPS for a 60 Hz screen");
     }
     expect(withTiming == frames.size(), "every frame carries the timing prefix");
     expect(badStartCodes == 0, "decrypted frames start with an H.264 start code");

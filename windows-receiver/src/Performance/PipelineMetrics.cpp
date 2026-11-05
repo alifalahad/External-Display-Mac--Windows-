@@ -470,8 +470,10 @@ std::wstring FormatDiagnostics(const OverlayInputs& in) {
     } else {
         Appendf(out, L"FPS      recv %.1f\n", m.receivedFps);
     }
-    Appendf(out, L"         decode %.1f (%ls)  shown %.1f\n", m.decodedFps,
+    Appendf(out, L"         decode %.1f (%ls)  shown %.1f", m.decodedFps,
             in.hardwareDecode ? L"GPU" : L"CPU", m.presentedFps);
+    if (in.screenHz) Appendf(out, L" on a %u Hz screen", in.screenHz);
+    out += L"\n";
     Appendf(out, L"Render   %.1f/s, %.2f ms CPU avg, %.2f max\n", m.renderedFps,
             m.renderCall.avgMs, m.renderCall.maxMs);
 
