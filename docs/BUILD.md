@@ -111,6 +111,10 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\make-zip.ps1
   `cmake --build build-release --config Release`.
 - **Your own files stay out:** both packages are built from scratch, so none of your pairings or
   logs are in them.
+- **Publish them** where the README's download link points, on GitHub: the repository's
+  **Releases** → **Draft a new release** → a tag such as `v0.1.0` → attach the `.dmg` and the
+  `.zip` → **Publish release**. Others can only see it if the repository is public, or if they
+  are added to it. Otherwise send the two files directly.
 
 ## Tests
 

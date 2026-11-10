@@ -37,13 +37,38 @@ copy and paste between the two machines.
   CPU/GPU. A benchmark mode writes CSV files.
 - Structured logs on both sides.
 
-## Quick start
+## Download and install
 
-**Just want to use it** (no Xcode or Visual Studio)? Download the `.dmg` for the Mac and the
-`.zip` for the PC, and follow [docs/INSTALL.md](docs/INSTALL.md). To make those two files:
-[docs/BUILD.md](docs/BUILD.md#packages-for-others).
+No Xcode or Visual Studio needed. From the
+[latest release](https://github.com/alifalahad/External-Display-Mac--Windows-/releases/latest),
+download:
 
-**To build it yourself:**
+| For | File |
+|---|---|
+| the Mac: macOS 13 or newer, Apple Silicon or Intel | `ExternalDisplay-<version>.dmg` |
+| the PC: Windows 10 or 11, 64-bit | `ExternalDisplayReceiver-<version>-win64.zip` |
+
+Both machines must be on the same network, and not a guest Wi-Fi.
+
+**Mac**
+1. Open the `.dmg` and drag **External Display** onto **Applications**.
+2. Open it. The first time, macOS blocks it, because the app is not signed by a registered
+   Apple developer. Click **Done**, then go to System Settings → Privacy & Security and click
+   **Open Anyway**.
+3. Allow **Screen Recording**, **Accessibility** and **Local Network** when asked. After
+   allowing Screen Recording, quit and reopen the app.
+4. Click **Create Virtual Display**, then **Start Capture**.
+
+**Windows**
+1. Unzip the folder somewhere of your own, such as Documents (not Program Files).
+2. Run **ExternalDisplayReceiver.exe**.
+   - If Windows says "Windows protected your PC", click **More info** → **Run anyway**.
+   - When the firewall asks, allow it on **Private networks**.
+
+Then pair the two machines (below). Step by step, and what to do when something does not work:
+[docs/INSTALL.md](docs/INSTALL.md).
+
+## Build it yourself
 
 **Mac** (macOS 13+, Apple silicon recommended):
 1. Open `mac-sender/Package.swift` in Xcode and run.
@@ -58,6 +83,10 @@ cmake -B build
 cmake --build build --config Release
 .\build\ExternalDisplayReceiver.exe
 ```
+To make the two downloads for other people: [docs/BUILD.md](docs/BUILD.md#packages-for-others).
+
+## Pair and use
+
 The receiver finds the Mac on its own. If several Macs answer, press the number of the one to use.
 
 **The first time, pair the two machines:**
@@ -94,5 +123,7 @@ Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diag
 - The virtual display uses `CGVirtualDisplay`, a private macOS API: there is no public API for
   virtual displays (see [ARCHITECTURE.md](docs/ARCHITECTURE.md#virtual-display)).
 - No audio.
+- The downloads are not signed by a registered developer yet: macOS and Windows each ask once
+  before the first start (see Download and install).
 - Performance targets: measured results are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
   Numbers that have not been measured are not claimed.
