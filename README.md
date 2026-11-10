@@ -75,6 +75,7 @@ Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diag
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, pairing, encryption, limitations |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | What is measured, benchmarks, results |
 | [docs/SMOOTHNESS.md](docs/SMOOTHNESS.md) | Roadmap to lower latency: the steps, their status, how each is checked |
+| [docs/NETWORK.md](docs/NETWORK.md) | Wi-Fi and network setup for the smoothest picture (AWDL on the Mac, power saving on the PC) |
 | [docs/TESTING.md](docs/TESTING.md) | Unit, integration and stress tests |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes, where the logs are |
 

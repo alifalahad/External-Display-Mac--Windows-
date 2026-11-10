@@ -53,6 +53,8 @@ each Windows laptop:
    follow (F2).
 7. **Benchmark:** `--bench=60` with moving content; keep `bench-*-summary.txt`
    ([PERFORMANCE.md](PERFORMANCE.md)).
+8. **Network:** on the Mac, `tests/network/ping-spikes.sh` (p95 close to the median, no spikes
+   1 s apart). If not, see [NETWORK.md](NETWORK.md).
 
 ## Stress (30 min / 1 h / 4 h)
 

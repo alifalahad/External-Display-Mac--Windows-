@@ -44,7 +44,7 @@ event-driven loop) are in the code but have not been measured on a PC yet: that 
 | 5 | Packet pacing and loss repair | **done here, to test on the PCs** | a lost packet is rebuilt on the PC (at 1 % loss 98.7 % of frames arrive, was 74 %); packets paced over ~1 ms |
 | 6 | Bitrate that follows the delay | **done here, to test on the PCs** | the bitrate goes down as soon as a queue builds, before packets are lost (8 Mbps test link: below it within 1 s, 99.5 % of frames arrive, was 17–20 %) |
 | 7 | 120 Hz | **done here, to test on the PCs** | 120 FPS to a 120 Hz screen (High preset, where the encoder keeps up: on an M2 up to 1920×1200); halves both refresh waits |
-| 8 | Network setup | checklist (no code) | removes regular spikes the code cannot fix |
+| 8 | Network setup | **written ([NETWORK.md](NETWORK.md)), to do on the Mac and the PCs** | removes regular spikes the code cannot fix (this Mac: 14–20 % of pings 20–190 ms late, 1 s apart: AWDL) |
 
 Every step is checked in the same way:
 1. Automated tests on the Mac, with the Windows tests run under Wine.
@@ -61,7 +61,7 @@ On each Windows laptop, using the newest code:
 git pull
 cd windows-receiver
 cmake -B build && cmake --build build --config Release
-.\build\Release\ExternalDisplayReceiver.exe --bench=60
+.\build\ExternalDisplayReceiver.exe --bench=60     :: .\build\Release\… with the Visual Studio generator
 ```
 Show moving content on the Mac's virtual display (a video, or https://www.testufo.com). Use
 5 GHz Wi-Fi. Keep `bench-*-summary.txt`.
@@ -535,14 +535,49 @@ shows. Motion is also twice as smooth.
 
 ### Step 8 — Network setup (no code)
 
-- Use 5 GHz or 6 GHz Wi-Fi, close to the router, or Ethernet on one side.
-- On the Mac, turn off AirDrop and Handoff while streaming. They use AWDL, which regularly
-  switches the Wi-Fi radio to another channel and causes latency spikes at regular intervals.
-- On the PC, set the Wi-Fi adapter's power saving to maximum performance (Power Options →
-  Wireless Adapter Settings).
-- Check: the benchmark's Network p95 before and after each change.
+**Why.** Regular delay spikes from the machines' own Wi-Fi features show as regular hitches
+that no code on our side can remove.
+
+**What (written).** [NETWORK.md](NETWORK.md) covers, in order of effect:
+- the Mac's AWDL (AirDrop, Handoff, Universal Control);
+- the Wi-Fi network: band, channel, Ethernet on one side, no guest network;
+- the PC: Wi-Fi power saving, the adapter's settings, Windows' own scans;
+- how to check each change.
+
+`tests/network/ping-spikes.sh` measures the Mac's side in a minute.
+
+**Found on this Mac** (2026-11-10). The link is excellent: 5 GHz channel 161, 80 MHz, 866 Mbps,
+median ping to the router 2.9 ms. But 14–20 % of the pings took 20–190 ms. They came in groups
+exactly 1.0 s apart, which is the pattern of AWDL, and AWDL was active. For the stream that
+means a hitch of up to a few frames every second or so.
+
+#### Checklist for step 8
+1. Mac: `tests/network/ping-spikes.sh`, note the p95. Turn off AirDrop (No One), Handoff,
+   AirPlay Receiver and Universal Control (NETWORK.md, section 1). Run it again.
+2. PC: Wi-Fi power saving to Maximum Performance, and the adapter's settings (section 3).
+3. If possible, Ethernet on one side (section 2).
+4. `--bench=60` before and after: compare Network p95, p99 and max, and `Net wait`.
 
 ---
+
+## What comes next
+
+Steps 1–8 are done here and pass every test that runs without the real machines. What only the
+real machines can show comes next, in this order:
+
+1. **Test on the Mac and the PCs.**
+   - Update both apps (`git pull`, build; the Mac app from Xcode).
+   - Step 8 first ([NETWORK.md](NETWORK.md)): regular network spikes would hide every other
+     gain.
+   - Step 0: `--bench=60` on each laptop. This is now the "after" measurement; the Phase 16
+     benchmark (Total 188 ms on average) is the "before".
+   - The checklists of steps 1–7.
+   - Keep the `bench-*-summary.txt` files, and for anything wrong `receiver.log` and the Mac's
+     `sender.log` (menu 🔍 → Show Log).
+2. **Fix what those tests show.** Likely candidates: step 6's delay thresholds on real Wi-Fi,
+   the virtual display's 120 Hz mode (step 7), and the laptops' graphics drivers.
+3. **Make it feel native** (below): N1 and N4 first. N5 then builds the `.app` bundle that N2 and
+   N3 need.
 
 ## After the smoothness steps: making it feel native
 
@@ -552,4 +587,4 @@ shows. Motion is also twice as smooth.
 | N2 | Start at login, connect to the paired PC on its own | the `.app` bundle (`SMAppService`) |
 | N3 | Control Center button (macOS 26+) | the `.app` bundle and a widget extension |
 | N4 | Windows: tray icon, start with Windows, connect on its own | — |
-| N5 | `.app` / `.dmg` and a Windows installer | planned separately |
+| N5 | `.app` / `.dmg` and a Windows installer | an Apple Developer Program membership for signing and notarization (without it, macOS asks to confirm the first start); a code-signing certificate on Windows (without it, SmartScreen warns on the first start) |

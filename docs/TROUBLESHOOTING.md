@@ -54,8 +54,10 @@ changes; move a window.
 ([PERFORMANCE.md](PERFORMANCE.md)):
 - **Decode (CPU)** in the FPS line means software decoding: check the `[Decoder]` lines in the
   log.
-- **Network** spikes point to Wi-Fi: use 5 GHz, stay near the access point, or use Ethernet;
-  lower the quality preset.
+- **Network** spikes point to Wi-Fi. Regular hitches about once a second usually come from AWDL
+  on the Mac (AirDrop, Handoff, Universal Control). [NETWORK.md](NETWORK.md) shows how to measure
+  it (`tests/network/ping-spikes.sh`) and what to turn off. Also: 5 GHz, near the access point,
+  or Ethernet on one side.
 - **Display n/a** means the driver gives no frame statistics. Total is then measured to
   Present().
 
