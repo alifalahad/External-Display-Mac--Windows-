@@ -154,6 +154,14 @@ void D3D11Renderer::CreateDeviceAndSwapChain(HWND hwnd, int width, int height,
         );
     };
     HRESULT hr = createDevice(flags);
+    // A Debug build asks for the debug layer, which only PCs with Windows'
+    // optional "Graphics Tools" have; without it every device fails with this
+    if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING && (flags & D3D11_CREATE_DEVICE_DEBUG)) {
+        LOGF_WARN("Renderer", "Direct3D debug layer not installed (optional feature \"Graphics Tools\") "
+                  "— continuing without it. Build Release for normal use.");
+        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+        hr = createDevice(flags);
+    }
     bool videoDevice = SUCCEEDED(hr) && full;
     if (FAILED(hr) && full) {
         LOGF_WARN("Renderer", "No video support on this adapter (0x%08lX) — software decoding",

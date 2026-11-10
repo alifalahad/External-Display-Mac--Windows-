@@ -24,7 +24,7 @@ EXDP_MODES="narrow narrow-tiers" tests/integration/run-loopback.sh 20   # only s
 ```bat
 :: Windows
 cd windows-receiver
-cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build && ctest --test-dir build
+cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build --config Release && ctest --test-dir build -C Release
 ```
 
 The portable C++ suites also build on macOS/Linux:

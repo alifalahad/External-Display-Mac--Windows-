@@ -9,6 +9,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# A Release build lands in build\ with every generator. Visual Studio's own
+# generator would use build\Release\, and builds Debug unless given
+# --config Release. Debug builds land in build\Debug\.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR})
+
 # Windows subsystem app (WinMain entry point)
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
@@ -82,14 +87,14 @@ if(MSVC)
 endif()
 
 # Tests (Phase 20):
-#   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build
+#   cmake -B build -DEXDP_BUILD_TESTS=ON && cmake --build build --config Release
 #   .\build\PipelineMetricsTests.exe   metrics, clock sync, benchmark files, payload layout
 #   .\build\AppLogicTests.exe          options, status texts, Mac choice, logging, replay window, keyframe gate
 #   .\build\SecureChannelTests.exe     protocol v2 crypto against the Mac's vectors (Windows only)
 #   .\build\PointerTests.exe           pointer drawn here: wire layout, scaling, rules, Windows cursor
 #   .\build\DisplayTests.exe           swap chain plan, present mode, DPI awareness, stream colours
 #   .\build\NetworkTests.exe           loss repair, delay monitor, network simulators
-#   ctest --test-dir build               all of them
+#   ctest --test-dir build -C Release    all of them
 option(EXDP_BUILD_TESTS "Build unit tests" OFF)
 if(EXDP_BUILD_TESTS)
     enable_testing()

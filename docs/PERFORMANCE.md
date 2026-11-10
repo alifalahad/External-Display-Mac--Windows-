@@ -69,8 +69,7 @@ Clock offset cancels out, so it needs no sync.
 cd windows-receiver
 cmake -B build
 cmake --build build --config Release
-.\build\Release\ExternalDisplayReceiver.exe --bench=60      # Visual Studio generator
-# or .\build\ExternalDisplayReceiver.exe --bench=60         # single-config generators
+.\build\ExternalDisplayReceiver.exe --bench=60
 ```
 
 Recording starts with the first displayed frame and runs for 60 s. The receiver then prints a

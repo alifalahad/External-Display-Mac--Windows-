@@ -61,7 +61,7 @@ On each Windows laptop, using the newest code:
 git pull
 cd windows-receiver
 cmake -B build && cmake --build build --config Release
-.\build\ExternalDisplayReceiver.exe --bench=60     :: .\build\Release\… with the Visual Studio generator
+.\build\ExternalDisplayReceiver.exe --bench=60
 ```
 Show moving content on the Mac's virtual display (a video, or https://www.testufo.com). Use
 5 GHz Wi-Fi. Keep `bench-*-summary.txt`.

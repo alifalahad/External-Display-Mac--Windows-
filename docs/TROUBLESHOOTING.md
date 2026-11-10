@@ -46,6 +46,14 @@ Protocol 2 does not talk to protocol 1.
 the Mac. If capture is running and the Mac's screen is static, nothing is sent until something
 changes; move a window.
 
+**"Direct3D 11 could not be initialised" with HRESULT 0x887A002D in all three modes.** That
+receiver was a Debug build. A Debug build asks Windows for the Direct3D debug layer, which only
+PCs with the optional "Graphics Tools" have. The receiver now continues without it, but build
+Release anyway (Debug is several times slower): delete the `build` folder, then
+`cmake -B build` and `cmake --build build --config Release`, and run
+`.\build\ExternalDisplayReceiver.exe`. Other HRESULTs in that message point to the graphics
+driver; `receiver.log` has the details.
+
 **Status card says "Graphics: compatible / software mode".** The GPU refused the full mode
 (details in `receiver.log`). Everything works, with more latency (compatible) or much more CPU
 (software).

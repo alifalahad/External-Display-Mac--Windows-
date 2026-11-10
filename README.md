@@ -49,7 +49,7 @@ copy and paste between the two machines.
 ```bat
 cd windows-receiver
 cmake -B build
-cmake --build build
+cmake --build build --config Release
 .\build\ExternalDisplayReceiver.exe
 ```
 The receiver finds the Mac on its own. If several Macs answer, press the number of the one to use.

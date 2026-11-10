@@ -40,12 +40,13 @@ crash reports include stack traces.
 ```bat
 cd windows-receiver
 cmake -B build
-cmake --build build
+cmake --build build --config Release
 .\build\ExternalDisplayReceiver.exe
 ```
 
-- With the Visual Studio generator the exe is in `build\Release\` or `build\Debug\`.
-- If a build fails after pulling, delete the `build` folder and run both commands again.
+- Always `--config Release`. Without it, Visual Studio's generator builds Debug, which is several
+  times slower and lands in `build\Debug\`. A Release build lands in `build\` with every generator.
+- If a build fails after pulling, delete the `build` folder and run the commands again.
 
 ### Command line
 
@@ -96,8 +97,8 @@ cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=
 ```bat
 :: Windows (6 suites, 518 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
-cmake --build build
-ctest --test-dir build
+cmake --build build --config Release
+ctest --test-dir build -C Release
 ```
 
 ## Updating from protocol v1
