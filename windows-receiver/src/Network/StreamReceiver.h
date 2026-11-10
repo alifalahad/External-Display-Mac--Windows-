@@ -192,7 +192,10 @@ public:
     void simulateLoss(double percent, int burst) { m_lossSimulator.configure(percent, burst); }
     /// A narrow link in front of the receiver (--simulate-link): tests the
     /// bitrate that follows the delay. Call before connect().
-    void simulateLink(double kbps, double bufferMs) { m_linkSimulator.configure(kbps, bufferMs); }
+    void simulateLink(double kbps, double bufferMs, double pausePeriodMs = 0, double pauseMs = 0) {
+        m_linkSimulator.configure(kbps, bufferMs);
+        m_linkSimulator.configurePauses(pausePeriodMs, pauseMs);
+    }
 
     /// Report the queuing delay to the Mac every 100 ms (RATE_FEEDBACK,
     /// docs/SMOOTHNESS.md step 6). Off: the Mac keeps its loss/RTT tiers.

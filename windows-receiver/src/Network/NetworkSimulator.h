@@ -60,6 +60,12 @@ public:
         reset();
     }
     bool active() const { return bytesPerUs_ > 0; }
+    /// Radio pauses, like AWDL on a Mac: every `periodMs` the link sends
+    /// nothing for `pauseMs` (packets wait, then leave at the link's rate)
+    void configurePauses(double periodMs, double pauseMs) {
+        pausePeriodUs_ = static_cast<int64_t>(periodMs * 1000);
+        pauseUs_ = pausePeriodUs_ > 0 ? static_cast<int64_t>(pauseMs * 1000) : 0;
+    }
     /// An empty link (a new connection)
     void reset() {
         busyUntilUs_ = 0;
@@ -68,7 +74,10 @@ public:
     /// A packet of `bytes` arrives at `nowUs`. False: dropped. Otherwise
     /// `exitUs` = when it leaves the link (its arrival time from now on).
     bool pass(int64_t nowUs, size_t bytes, int64_t& exitUs) {
-        const int64_t start = std::max(nowUs, busyUntilUs_);
+        int64_t start = std::max(nowUs, busyUntilUs_);
+        if (pauseUs_ > 0 && start % pausePeriodUs_ < pauseUs_) {
+            start += pauseUs_ - start % pausePeriodUs_;   // waits for the pause to end
+        }
         if (start - nowUs > bufferUs_) return false;
         busyUntilUs_ = start + static_cast<int64_t>(static_cast<double>(bytes) / bytesPerUs_);
         exitUs = busyUntilUs_;
@@ -102,5 +111,6 @@ private:
     double bytesPerUs_ = 0;
     int64_t bufferUs_ = 0;
     int64_t busyUntilUs_ = 0;
+    int64_t pausePeriodUs_ = 0, pauseUs_ = 0;
     std::deque<Held> held_;                        // in exit order: the link is first in, first out
 };

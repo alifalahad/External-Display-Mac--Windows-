@@ -20,6 +20,8 @@
 #   lossy-nofec the same without parity or pacing, for comparison
 #   narrow     an 8 Mbps link with a 200 ms queue: the bitrate follows the delay
 #   narrow-tiers the same with the old loss/RTT tiers, for comparison
+#   pauses     a nearly idle desktop over a fast link that stops for 100 ms
+#              every second (AWDL on a Mac): the bitrate must not collapse
 #   fps120     paired, the receiver says its screen runs at 120 Hz: the Mac
 #              must stream ~120 FPS (every other run says 60 Hz: ~60 FPS)
 # keyframes only on request: one frame is dropped on purpose and must be
@@ -69,7 +71,7 @@ CODEFILE_WIN="Z:$(echo "$WORK/code.txt" | tr / '\\')"
 result=0
 # EXDP_MODES="narrow narrow-tiers" runs only those; logs: <work>/{harness,client,sender}-<n>-<mode>.log
 run=0
-for mode in ${EXDP_MODES:-pair paired lossy lossy-nofec fps120 narrow narrow-tiers impostor wrongcode rejected}; do
+for mode in ${EXDP_MODES:-pair paired lossy lossy-nofec fps120 narrow narrow-tiers pauses impostor wrongcode rejected}; do
     run=$((run + 1))
     echo; echo "=== Run: $mode ==="
     rm -f "$WORK/code.txt"
@@ -79,6 +81,7 @@ for mode in ${EXDP_MODES:-pair paired lossy lossy-nofec fps120 narrow narrow-tie
     [ "$mode" = rejected ] && export EXDP_REJECT=1 || unset EXDP_REJECT
     # Started directly (not in a subshell) so that kill reaches the harness itself
     CFFIXED_USER_HOME="$WORK/home" HOME="$WORK/home" \
+        EXDP_CONTENT=$([ "$mode" = pauses ] && echo still || echo moving) \
         "$WORK/harness" $((duration + 25)) "$WORK/code.txt" "$WORK/pairings" > "$WORK/harness-$run-$mode.log" 2>&1 &
     HARNESS=$!
     for _ in $(seq 1 50); do   # wait until it listens

@@ -148,8 +148,13 @@ CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
 
 var frameIndex: Int64 = 0
 var rng = SystemRandomNumberGenerator()
+// EXDP_CONTENT=still: a nearly idle desktop. ScreenCaptureKit delivers a frame
+// only when something changes: here 20 a second, small changes as when typing.
+// The encoder then sends far less than its target, as in the app most of the time.
+let stillContent = ProcessInfo.processInfo.environment["EXDP_CONTENT"] == "still"
 frameTimer.schedule(deadline: .now(), repeating: .nanoseconds(1_000_000_000 / harnessFps), leeway: .microseconds(500))
 frameTimer.setEventHandler {
+    if stillContent && frameIndex % Int64(max(1, harnessFps / 20)) != 0 { frameIndex += 1; return }
     var pbOut: CVPixelBuffer?
     CVPixelBufferPoolCreatePixelBuffer(nil, pool!, &pbOut)
     guard let pb = pbOut else { return }
@@ -161,6 +166,11 @@ frameTimer.setEventHandler {
     let barX = Int(frameIndex * 8) % (width - 64)
     for y in 0..<height {
         let row = luma + y * lumaBpr
+        if stillContent {
+            memset(row, Int32(y & 0xFF), width)
+            if y >= 100 && y < 116 { memset(row + 100 + Int(frameIndex % 600), 0xFF, 8) }   // "typing"
+            continue
+        }
         memset(row, Int32(truncatingIfNeeded: (y + Int(frameIndex)) & 0xFF), width)
         memset(row + barX, 0xFF, 64)
         if y >= 300 && y < 420 {

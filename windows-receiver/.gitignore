@@ -1,3 +1,4 @@
 build/
+build-release/
 bench-*.csv
 bench-*.txt

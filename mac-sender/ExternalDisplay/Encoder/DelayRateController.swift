@@ -5,10 +5,14 @@
 // arrive. The receiver measures that queuing delay and reports it every 100 ms
 // (RATE_FEEDBACK). This controller:
 //   overuse on a full link (delay high,   → 85 % of what got through while it was
-//   not falling, no frame without wait)    full (its video share: parity and
-//                                          headers travel too), at most every 0.3 s
-//   overuse that drained again            → nothing: a burst (a keyframe), the
-//                                          link had room
+//   not falling, no frame without wait,    full (its video share: parity and
+//   two reports in a row)                  headers travel too), at most every 0.3 s
+//   … while the encoder sends under half  → 85 % of the target: what arrived then
+//   its target (a still screen)            says nothing about the link
+//   overuse in one report only, or that   → nothing: a burst (a keyframe) or a
+//   drained again                          radio pause (AWDL on the Mac stops
+//                                          the Wi-Fi for tens of ms about once a
+//                                          second, and almost nothing arrives)
 //   loss above 10 % otherwise             → lower in proportion to the loss, at
 //                                          most once a second
 //   normal (delay low, loss < 2 %)        → +25 % per second while far (< 70 %)
@@ -33,6 +37,8 @@ final class DelayRateController {
     static let minLossDecreaseInterval = 1.0  // s: the loss figure covers 500 ms
     static let increaseHoldAfterDecrease = 1.0
     static let minChange = 0.03               // smaller changes are not passed to the encoder
+    static let overuseReportsToCut = 2        // in a row, ~200 ms: a radio pause drains sooner
+    static let appLimitedBelow = 0.5          // encoder output under half the target
 
     private(set) var targetBps: Int
     private(set) var floorBps: Int
@@ -40,7 +46,8 @@ final class DelayRateController {
     private var appliedBps: Int
     private var lastDecrease = -Double.infinity
     private var lastIncrease: Double?
-    private var capacityBps = 0               // what arrived when the link was last full
+    private(set) var capacityBps = 0          // what arrived when the link was last full
+    private var overuseStreak = 0             // overuse reports in a row
 
     init(preset: QualityPreset) {
         targetBps = preset.startBitrateBps
@@ -63,14 +70,21 @@ final class DelayRateController {
     func onFeedback(_ f: RateFeedbackPayload, encoderBps: Int, videoShare: Double = 1, now: Double) -> Int? {
         guard f.samples > 0 else { return nil }   // no frames: no information
         let loss = Double(f.lossPercent100) / 100
+        overuseStreak = f.state == .overuse ? overuseStreak + 1 : 0
 
-        if f.state == .overuse && f.linkKbps > 0 {
+        if f.state == .overuse && f.linkKbps > 0 && overuseStreak >= Self.overuseReportsToCut {
             guard now - lastDecrease >= Self.minDecreaseInterval else { return nil }
-            // What a full link carried is its capacity; what arrived over 500 ms
-            // would be the encoder's own (lower) output whenever the link had room
-            let link = Double(f.linkKbps) * 1000 * min(max(videoShare, 0.6), 1)
-            capacityBps = Int(link)
-            targetBps = max(floorBps, Int(min(Double(targetBps), link) * Self.decreaseFactor))
+            if Double(encoderBps) < Self.appLimitedBelow * Double(targetBps) {
+                // We send little: the queue is someone else's, and what arrived
+                // is our own small output, not what the link can carry
+                targetBps = max(floorBps, Int(Double(targetBps) * Self.decreaseFactor))
+            } else {
+                // What a full link carried is its capacity; what arrived over 500 ms
+                // would be the encoder's own (lower) output whenever the link had room
+                let link = Double(f.linkKbps) * 1000 * min(max(videoShare, 0.6), 1)
+                capacityBps = Int(link)
+                targetBps = max(floorBps, Int(min(Double(targetBps), link) * Self.decreaseFactor))
+            }
             lastDecrease = now
             lastIncrease = nil
         } else if loss > 10 {

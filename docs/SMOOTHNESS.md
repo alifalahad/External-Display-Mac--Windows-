@@ -438,6 +438,22 @@ frame and the ones after it.
     high priority to make such stalls rare. Whether that helps can only be seen on the PCs.
   - A keyframe that keeps the link busy for more than 100 ms counts as a full link, and the Mac
     cuts once (the 4.8 Mbps dip after the frame the test drops on purpose).
+- **Fixed after the first run on real Wi-Fi** (2026-11-10). The Mac's log showed
+  `Bitrate down to 2000 kbps (overuse, queue 89 ms, … link full at 413 kbps)` right at the start,
+  and the bitrate then stayed at 2–5 Mbps instead of 8–25.
+  - Two things together caused it. A short radio pause (AWDL, measured on that Mac) delays every
+    frame for a moment while almost nothing arrives. And on a nearly still desktop only a few
+    small frames are sent. So "every frame waited" and "what arrived" looked like a full link of
+    0.4 Mbps.
+  - Now a cut needs overuse in **two reports in a row** (~200 ms): a real overload keeps the delay
+    rising, a pause drains within one report.
+  - While the encoder sends less than half its target, a cut takes **15 % of the target** and
+    teaches nothing about the link's capacity: what arrived is then the encoder's own small
+    output.
+  - New loopback run `pauses`: a nearly idle desktop (20 small frames a second) on a 100 Mbps link
+    that stops for 100 ms every second. The old controller reproduced the problem
+    (`link full at 55 kbps`, 20 → 2 Mbps for good). The new one stays at 20 Mbps, and every frame
+    arrives.
 - Automated, all passing:
   - Mac: 54 XCTests. New `RateControlTests` (11) cover the cut to 85 % of what a full link
     carried, only its video share, no cut for a queue that emptied again, the floor, slow and fast
@@ -587,4 +603,4 @@ real machines can show comes next, in this order:
 | N2 | Start at login, connect to the paired PC on its own | the `.app` bundle (`SMAppService`) |
 | N3 | Control Center button (macOS 26+) | the `.app` bundle and a widget extension |
 | N4 | Windows: tray icon, start with Windows, connect on its own | — |
-| N5 | `.app` / `.dmg` and a Windows installer | an Apple Developer Program membership for signing and notarization (without it, macOS asks to confirm the first start); a code-signing certificate on Windows (without it, SmartScreen warns on the first start) |
+| N5 | `.app` / `.dmg` and a Windows installer | **first version done:** `packaging/mac/make-app.sh` (a .dmg, signed ad hoc) and `packaging/windows/make-zip.ps1` (a .zip); [INSTALL.md](INSTALL.md) for the people who get them. Still to do: an Apple Developer Program membership for signing and notarization (without it, macOS asks to confirm the first start), a code-signing certificate on Windows (without it, SmartScreen warns on the first start), and an installer |

@@ -39,6 +39,12 @@ copy and paste between the two machines.
 
 ## Quick start
 
+**Just want to use it** (no Xcode or Visual Studio)? Download the `.dmg` for the Mac and the
+`.zip` for the PC, and follow [docs/INSTALL.md](docs/INSTALL.md). To make those two files:
+[docs/BUILD.md](docs/BUILD.md#packages-for-others).
+
+**To build it yourself:**
+
 **Mac** (macOS 13+, Apple silicon recommended):
 1. Open `mac-sender/Package.swift` in Xcode and run.
 2. Allow **Screen Recording** when asked. Also allow **Accessibility**, so the PC can control
@@ -75,6 +81,7 @@ Controls on Windows: **Esc** quit · **F11** full screen / window · **F2** diag
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, pairing, encryption, limitations |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | What is measured, benchmarks, results |
 | [docs/SMOOTHNESS.md](docs/SMOOTHNESS.md) | Roadmap to lower latency: the steps, their status, how each is checked |
+| [docs/INSTALL.md](docs/INSTALL.md) | Install and first start for people who only use the app (the .dmg and the .zip) |
 | [docs/NETWORK.md](docs/NETWORK.md) | Wi-Fi and network setup for the smoothest picture (AWDL on the Mac, power saving on the PC) |
 | [docs/TESTING.md](docs/TESTING.md) | Unit, integration and stress tests |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptoms, causes, fixes, where the logs are |

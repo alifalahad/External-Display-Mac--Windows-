@@ -30,6 +30,9 @@
 //   narrow        delay feedback: the Mac must go below the link within 3 s
 //                 and keep the queue short
 //   narrow-tiers  the old loss/RTT tiers, for comparison
+//   pauses        a nearly idle desktop (20 small frames a second) over a fast
+//                 link (100 Mbps) that stops for 100 ms every second, as AWDL
+//                 does on a Mac: the bitrate must not collapse
 // 120 Hz (step 7): every run tells the Mac its screen runs at 60 Hz, and the
 // stream must stay at ~60 FPS; except
 //   fps120        a 120 Hz screen: ~120 FPS, captured ~8.3 ms apart
@@ -62,6 +65,7 @@ int main(int argc, char** argv) {
     const bool lossy = mode == "lossy" || mode == "lossy-nofec";
     const bool repair = mode != "lossy-nofec";             // parity + pacing asked for
     const bool narrow = mode == "narrow" || mode == "narrow-tiers";
+    const bool pauses = mode == "pauses";
     const uint32_t screenHz = mode == "fps120" ? 120 : 60;  // what RECEIVER_CAPS says
     const bool drowning = mode == "narrow-tiers";   // the old tiers drown the narrow link: that is the comparison
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -120,6 +124,7 @@ int main(int argc, char** argv) {
                        (repair ? exdp::CAP_PARITY | exdp::CAP_PACING : 0), screenHz);
     if (lossy) rx.simulateLoss(1.0, 1);
     if (narrow) rx.simulateLink(8000, 200);
+    if (pauses) rx.simulateLink(100000, 200, 1000, 100);
     rx.enableRateFeedback(mode != "narrow-tiers");
     struct RateSample { double sinceStartS, targetMbps, queueMs; uint64_t lost; };
     std::vector<RateSample> rateSamples;
@@ -255,18 +260,19 @@ int main(int argc, char** argv) {
                 "(10+ packet frames arrive here over %.0f us)\n",
                 lossPercent, (unsigned long long)st.fragmentsRebuilt, (unsigned long long)st.parityPackets,
                 (unsigned long long)st.framesRebuilt, delivered, mac.pacingSpreadUs, spreadUs);
-    double belowLinkS = -1, queueSum = 0, startTarget = 0, endTarget = 0;
+    double belowLinkS = -1, queueSum = 0, startTarget = 0, endTarget = 0, lowestTarget = 0;
     size_t queueN = 0;
     uint64_t lostAtStart = 0;                            // packets lost in the first 2 s
     for (const RateSample& r : rateSamples) {
         if (r.sinceStartS <= 2.0) lostAtStart = r.lost;
         if (r.targetMbps > 0 && startTarget == 0) startTarget = r.targetMbps;
         if (r.targetMbps > 0) endTarget = r.targetMbps;
+        if (r.targetMbps > 0 && (lowestTarget == 0 || r.targetMbps < lowestTarget)) lowestTarget = r.targetMbps;
         if (belowLinkS < 0 && r.targetMbps > 0 && r.targetMbps <= 8.0) belowLinkS = r.sinceStartS;
         if (r.sinceStartS >= seconds - 12) { queueSum += r.queueMs; queueN++; }
     }
     const double queueAvgMs = queueN ? queueSum / queueN : 0;
-    if (narrow) {
+    if (narrow || pauses) {
         std::string timeline;
         double nextS = 0;
         for (const RateSample& r : rateSamples) {
@@ -277,6 +283,13 @@ int main(int argc, char** argv) {
             nextS += 2;
         }
         std::printf("[Client] timeline (s:Mbps/queue):%s\n", timeline.c_str());
+    }
+    if (pauses) {
+        std::printf("[Client] radio pauses (100 ms every second, 100 Mbps link, idle desktop): Mac target %.1f -> %.1f Mbps, "
+                    "lowest %.1f, the encoder sent %.1f Mbps; %.1f%% of frames arrived\n",
+                    startTarget, endTarget, lowestTarget, mac.encoderMbps, delivered);
+    }
+    if (narrow) {
         std::printf("[Client] narrow link 8 Mbps: Mac target %.1f -> %.1f Mbps, below the link after %.1f s; "
                     "queue %.1f ms on average in the last 10 s; %.1f%% of frames arrived; "
                     "packets lost: %llu in the first 2 s, %llu after\n",
@@ -327,7 +340,7 @@ int main(int argc, char** argv) {
     if (mode == "paired") expect(codeRequests == 0, "no code asked (already paired)");
     if (mode == "wrongcode") expect(codeRequests == 2, "wrong code refused, a new code issued");
     // A drowning link delivers few frames, and keyframes (the largest) rarely complete
-    if (!drowning) {
+    if (!drowning && !pauses) {
         if (screenHz == 120) {
             expect(streams && frames.size() > (size_t)(seconds - 8) * 80, "encrypted frames received (~120 FPS)");
         } else {
@@ -346,7 +359,7 @@ int main(int argc, char** argv) {
     expect(badStartCodes == 0, "decrypted frames start with an H.264 start code");
     // Every KEYFRAME_REQ the receiver sent (the gate's, and its own after a lost frame)
     expect(keyframes <= st.keyframeRequests + 1, "no periodic keyframes (one per second before)");
-    if (!lossy && !narrow) {   // under simulated loss the gate is busy with other gaps
+    if (!lossy && !narrow && !pauses) {   // under simulated loss the gate is busy with other gaps
         expect(lostAtUs > 0 && recoveryAskedUs > lostAtUs && recoveryAskedUs - lostAtUs < 100'000,
                "the missing frame was noticed and a keyframe asked for at once");
         expect(recoveryUs >= 0 && recoveryUs < 300'000, "the Mac's keyframe arrived within 300 ms");
@@ -356,6 +369,10 @@ int main(int argc, char** argv) {
         expect(streamColor.fullRange && streamColor.matrix == 1, "the stream says full-range BT.709 (what the shader uses)");
     }
     if (!lossy && !narrow) expect(st.packetsLost == 0, "no packet lost or rejected on localhost");
+    if (pauses) {
+        expect(lowestTarget >= startTarget * 0.6, "radio pauses do not collapse the bitrate (stays above 60 % of the start)");
+        expect(delivered >= 95, "at least 95 % of the frames arrived despite the pauses");
+    }
     if (mode == "narrow") {
         expect(belowLinkS >= 0 && belowLinkS < 3.0, "the Mac went below the 8 Mbps link within 3 s");
         expect(queueN > 0 && queueAvgMs < 40, "the queue on the link stays short (under 40 ms on average)");
@@ -365,7 +382,7 @@ int main(int argc, char** argv) {
     if (repair) {
         expect(st.parityPackets > 0, "parity packets arrive (asked for in RECEIVER_CAPS)");
         // (On the narrow link the bitrate is low: frames of up to 8 packets are not paced)
-        if (!narrow) expect(mac.pacingSpreadUs > 0 && mac.pacingSpreadUs < 5000, "the Mac paces frames (reported spread)");
+        if (!narrow && !pauses) expect(mac.pacingSpreadUs > 0 && mac.pacingSpreadUs < 5000, "the Mac paces frames (reported spread)");
         else expect(mac.pacingSpreadUs < 5000, "pacing spread stays small");
     } else {
         expect(st.parityPackets == 0, "no parity packets unless asked for");

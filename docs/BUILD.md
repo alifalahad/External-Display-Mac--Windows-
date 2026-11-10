@@ -86,16 +86,42 @@ Files next to the exe:
 | `receiver-settings.txt` | the last Mac used |
 | `receiver-crash.txt/.dmp` | written after a crash |
 
+## Packages for others
+
+For people who don't have Xcode or Visual Studio ([INSTALL.md](INSTALL.md) is their guide):
+
+```bash
+# Mac → dist/ExternalDisplay-<version>.dmg (Apple Silicon and Intel)
+packaging/mac/make-app.sh
+```
+```bat
+:: Windows, in the x64 Native Tools Command Prompt → dist\ExternalDisplayReceiver-<version>-win64.zip
+powershell -ExecutionPolicy Bypass -File packaging\windows\make-zip.ps1
+```
+
+- **Signing:** the Mac app is signed ad hoc, not notarized, so its first start needs
+  *Open Anyway* in System Settings → Privacy & Security. The Windows exe is unsigned, so
+  SmartScreen asks once (*More info* → *Run anyway*). Removing those steps needs an Apple
+  Developer ID and a Windows code-signing certificate ([SMOOTHNESS.md](SMOOTHNESS.md), N5).
+- **What the exe needs:** the C++ runtime is linked into it, so it runs without Visual Studio or
+  the Visual C++ Redistributable.
+- **If the PowerShell script does not run:** build Release in `windows-receiver`, then zip
+  `build-release\ExternalDisplayReceiver.exe` together with `docs\INSTALL.md`:
+  `cmake -B build-release -DCMAKE_BUILD_TYPE=Release` and
+  `cmake --build build-release --config Release`.
+- **Your own files stay out:** both packages are built from scratch, so none of your pairings or
+  logs are in them.
+
 ## Tests
 
 See [TESTING.md](TESTING.md).
 
 ```bash
-# Mac (63 tests)
+# Mac (65 tests)
 cd mac-sender && xcodebuild test -scheme ExternalDisplay -destination 'platform=macOS'
 ```
 ```bat
-:: Windows (6 suites, 518 checks)
+:: Windows (6 suites, 522 checks)
 cmake -B build -DEXDP_BUILD_TESTS=ON
 cmake --build build --config Release
 ctest --test-dir build -C Release

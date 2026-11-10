@@ -369,6 +369,16 @@ static void TestLinkSimulator() {
     CHECK(kept > 70 && kept < 75);                        // a full queue drops, as pass() does
     held.reset();                                         // a new connection: an empty link
     CHECK(held.nextExitUs() == INT64_MAX && held.hold(1'000, a, 3));
+
+    // Radio pauses (AWDL): 80 ms of every second nothing leaves; packets wait,
+    // then go at the link's rate
+    LinkSimulator paused;
+    paused.configure(8000, 200);
+    paused.configurePauses(1000, 80);
+    CHECK(paused.pass(10'000, 1000, exit) && exit == 80'000 + 1000);      // in the pause: after it
+    CHECK(paused.pass(10'000, 1000, exit) && exit == 82'000);             // behind the first
+    CHECK(paused.pass(500'000, 1000, exit) && exit == 501'000);           // between pauses: at once
+    CHECK(paused.pass(1'050'000, 1000, exit) && exit == 1'081'000);       // the next pause
 }
 
 int main() {

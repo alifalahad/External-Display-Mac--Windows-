@@ -37,11 +37,41 @@ final class RateControlTests: XCTestCase {
 
     func testOveruseCutsTo85PercentOfWhatTheFullLinkCarried() throws {
         let c = DelayRateController(preset: .balanced)            // starts at 20 Mbps
+        XCTAssertNil(c.onFeedback(feedback(.overuse, receivedKbps: 8_000), encoderBps: 20_000_000, now: 9.9),
+                     "one report could be a radio pause")
         let cut = try XCTUnwrap(c.onFeedback(feedback(.overuse, receivedKbps: 8_000), encoderBps: 20_000_000, now: 10))
         XCTAssertEqual(cut, 6_800_000, "85 % of the 8 Mbps the link carried, not of the 20 asked for")
+        XCTAssertEqual(c.capacityBps, 8_000_000)
         // The queue needs time to drain: no second cut within 0.3 s
         XCTAssertNil(c.onFeedback(feedback(.overuse, receivedKbps: 6_000), encoderBps: 6_800_000, now: 10.1))
         XCTAssertEqual(c.onFeedback(feedback(.overuse, receivedKbps: 6_000), encoderBps: 6_800_000, now: 10.35), 5_100_000)
+    }
+
+    func testARadioPauseIsNoReasonToCut() {
+        // Real Wi-Fi with AWDL on (2026-11-10): one report says overuse with
+        // almost nothing arrived ("link full at 413 kbps"); in the next the
+        // queue drains. That cut the bitrate to the floor; now it is ignored.
+        let c = DelayRateController(preset: .balanced)
+        var now = 10.0
+        for _ in 0..<5 {
+            XCTAssertNil(c.onFeedback(feedback(.overuse, receivedKbps: 632, linkKbps: 413),
+                                      encoderBps: 20_000_000, now: now))
+            now += 0.1
+            XCTAssertNil(c.onFeedback(feedback(.hold), encoderBps: 20_000_000, now: now))
+            now += 0.9
+        }
+        XCTAssertEqual(c.targetBps, QualityPreset.balanced.startBitrateBps)
+        XCTAssertEqual(c.capacityBps, 0, "nothing learnt about the link")
+    }
+
+    func testWhileTheEncoderSendsLittleTheCutIsGentle() {
+        // A still screen: 0.6 Mbps of a 20 Mbps target. A lasting queue then is
+        // someone else's traffic, and what arrived says nothing about the link
+        let c = DelayRateController(preset: .balanced)
+        _ = c.onFeedback(feedback(.overuse, receivedKbps: 632, linkKbps: 413), encoderBps: 600_000, now: 10)
+        XCTAssertEqual(c.onFeedback(feedback(.overuse, receivedKbps: 632, linkKbps: 413), encoderBps: 600_000, now: 10.1),
+                       17_000_000, "85 % of the target, not of the 0.4 Mbps that arrived")
+        XCTAssertEqual(c.capacityBps, 0)
     }
 
     func testQueueThatEmptiedAgainIsNoReasonToCut() {
@@ -58,6 +88,7 @@ final class RateControlTests: XCTestCase {
     func testCutCountsOnlyTheVideoShare() {
         // The receiver measures everything that arrived; 12 % of it was parity and headers
         let c = DelayRateController(preset: .balanced)
+        _ = c.onFeedback(feedback(.overuse, receivedKbps: 10_000), encoderBps: 20_000_000, videoShare: 0.88, now: 9.9)
         let cut = c.onFeedback(feedback(.overuse, receivedKbps: 10_000), encoderBps: 20_000_000,
                                videoShare: 0.88, now: 10)
         XCTAssertEqual(cut, 7_480_000)                 // 0.85 × 10 Mbps × 0.88
@@ -75,6 +106,7 @@ final class RateControlTests: XCTestCase {
 
     func testRisesSlowlyOnlyWhileUsed() {
         let c = DelayRateController(preset: .balanced)
+        _ = c.onFeedback(feedback(.overuse, receivedKbps: 10_000), encoderBps: 20_000_000, now: -0.1)
         _ = c.onFeedback(feedback(.overuse, receivedKbps: 10_000), encoderBps: 20_000_000, now: 0)   // → 8.5 Mbps
         XCTAssertEqual(c.targetBps, 8_500_000)
         // Normal reports every 100 ms: nothing for 1 s after the cut, then ≈ 8 % per second
@@ -102,6 +134,7 @@ final class RateControlTests: XCTestCase {
     func testRecoversFastWhenFarBelowTheLastCapacity() {
         // A keyframe-sized dip cut the bitrate to 3.4 Mbps, but the link carried 10
         let c = DelayRateController(preset: .high)
+        _ = c.onFeedback(feedback(.overuse, receivedKbps: 4_000), encoderBps: 25_000_000, now: -0.1)
         _ = c.onFeedback(feedback(.overuse, receivedKbps: 4_000), encoderBps: 25_000_000, now: 0)   // capacity 4 Mbps
         _ = c.onFeedback(feedback(.overuse, receivedKbps: 10_000), encoderBps: 3_400_000, now: 0.5) // capacity 10
         XCTAssertEqual(c.targetBps, 2_890_000)        // 85 % of the 3.4 asked for (received was higher)
@@ -163,8 +196,9 @@ final class RateControlTests: XCTestCase {
         g.onQualityReport(bad)
         XCTAssertEqual(applied.count, 1, "tiers in charge before any RATE_FEEDBACK")
 
-        g.onRateFeedback(feedback(.overuse, receivedKbps: 10_000), now: 100)
+        g.onRateFeedback(feedback(.overuse, receivedKbps: 10_000), now: 99.9)
         XCTAssertEqual(g.mode, "delay")
+        g.onRateFeedback(feedback(.overuse, receivedKbps: 10_000), now: 100)
         XCTAssertEqual(applied.last, 8_500_000)
         let count = applied.count
         g.onQualityReport(bad)

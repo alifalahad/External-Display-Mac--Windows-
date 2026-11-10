@@ -14,6 +14,10 @@ endif()
 # --config Release. Debug builds land in build\Debug\.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR})
 
+# The C++ runtime inside the .exe: it runs on PCs without Visual Studio or the
+# Visual C++ Redistributable (docs/INSTALL.md)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Windows subsystem app (WinMain entry point)
 add_executable(${PROJECT_NAME} WIN32
     src/main.cpp
